@@ -40,7 +40,7 @@ class ParTauModule(L.LightningModule):
         #     reduction="none", gamma=0.0, alpha=0.5
         # )  # class balance, so one could use BCE with sigmoid also.
         self.tagging_loss = SigmoidFocalLoss(
-            alpha=0.75, gamma=2.0, reduction="none"
+            alpha=0.75, gamma=0.5, reduction="none"
         )  # class imbalance
         self.decay_mode_loss = nn.CrossEntropyLoss(reduction="none")
         self.kinematics_loss = nn.HuberLoss(reduction="none", delta=1.0)
@@ -232,57 +232,53 @@ class ParTauModule(L.LightningModule):
     def calculate_metrics(
         self, targets, predictions, weights, w_kin=1, w_dm=1, w_tag=1, w_charge=1
     ):
-        # TODO: Account for weights.
         is_tau_mask = targets["is_tau"].bool()
-        # Tau ID
-        tau_id_loss = self.tagging_loss_fn(
+
+        # Per-jet losses — shape [N]
+        tau_id_loss_per_jet = self.tagging_loss_fn(
             predictions["is_tau"], targets["is_tau"]
-        ).mean()
+        )
+
+        # Start combined per-jet loss with tagging term
+        combined_per_jet = w_tag * tau_id_loss_per_jet
 
         if not is_tau_mask.any():
-            # Pure-background batch (e.g. entire qq row group): signal-only losses undefined
-            zero = tau_id_loss.new_zeros(())
             return {
-                "tau_id_loss": tau_id_loss,
-                "charge_loss": zero,
-                "decay_mode_loss": zero,
-                "kinematics_loss": zero,
-                "loss": tau_id_loss,
+                "tau_id_loss": tau_id_loss_per_jet.mean(),
+                "charge_loss": combined_per_jet.new_zeros(()),
+                "decay_mode_loss": combined_per_jet.new_zeros(()),
+                "kinematics_loss": combined_per_jet.new_zeros(()),
+                "loss": (combined_per_jet * weights).mean(),
             }
 
-        # Decay mode
-        decay_mode_loss = self.decay_mode_loss_fn(
+        # Per-jet losses for signal-only heads — shape [N_signal]
+        dm_loss_per_jet = self.decay_mode_loss_fn(
             predictions["decay_mode"][is_tau_mask], targets["decay_mode"][is_tau_mask]
-        ).mean()
-
-        # Charge
-        charge_loss = self.charge_loss_fn(
+        )
+        charge_loss_per_jet = self.charge_loss_fn(
             predictions["charge"][is_tau_mask], targets["charge"][is_tau_mask]
-        ).mean()
-
-        # Kinematics
-        kinematics_loss = self.kinematics_loss_fn(
+        )
+        kin_loss_per_jet = self.kinematics_loss_fn(
             predictions["kinematics"][is_tau_mask], targets["kinematics"][is_tau_mask]
-        ).mean()
+        )
 
-        combined_loss = (
-            w_tag * tau_id_loss
-            + w_dm * decay_mode_loss
-            + w_charge * charge_loss
-            + w_kin * kinematics_loss
-        )  # Here use all losses only if signal sample.
+        # Add signal-only terms into combined per-jet loss
+        combined_per_jet[is_tau_mask] += (
+            w_dm * dm_loss_per_jet
+            + w_charge * charge_loss_per_jet
+            + w_kin * kin_loss_per_jet
+        )
 
-        metrics = {
-            "tau_id_loss": tau_id_loss,
-            "charge_loss": charge_loss,
-            "decay_mode_loss": decay_mode_loss,
-            "kinematics_loss": kinematics_loss,
-            "loss": combined_loss,
+        # Multiply each jet's combined loss by its cls_weight, then average
+        loss = (combined_per_jet * weights).mean()
+
+        return {
+            "tau_id_loss": tau_id_loss_per_jet.mean(),
+            "charge_loss": charge_loss_per_jet.mean(),
+            "decay_mode_loss": dm_loss_per_jet.mean(),
+            "kinematics_loss": kin_loss_per_jet.mean(),
+            "loss": loss,
         }
-
-        # TODO: Calculate additional metrics
-
-        return metrics
 
     def validation_step(self, batch, _batch_idx):
         predictions, targets, weights = self.forward(batch)

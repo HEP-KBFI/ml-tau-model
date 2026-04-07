@@ -87,9 +87,7 @@ def log_charge_id_performance(
     # Add confusion matrix metrics
     confusion_matrix = evaluator.confusion_matrix
     charge_scalars["TP"] = confusion_matrix["TP"]
-    charge_scalars["TN"] = confusion_matrix["TN"]
     charge_scalars["FP"] = confusion_matrix["FP"]
-    charge_scalars["FN"] = confusion_matrix["FN"]
 
     # Calculate and add derived metrics from confusion matrix
     total = (

@@ -49,9 +49,9 @@ class ParticleTransformerDataset(IterableDataset):
 
     def build_tensors(self, data: ak.Array):
         jet_constituent_p4s = g.reinitialize_p4(data.reco_cand_p4s)
-        gen_jet_tau_p4s = g.reinitialize_p4(data.gen_jet_tau_p4s)
-        jet_p4s = g.reinitialize_p4(data.reco_jet_p4s)
-        gen_jet_p4s = g.reinitialize_p4(data.gen_jet_p4s)
+        gen_jet_tau_p4s = g.reinitialize_p4(data.gen_jet_tau_p4)
+        jet_p4s = g.reinitialize_p4(data.reco_jet_p4)
+        gen_jet_p4s = g.reinitialize_p4(data.gen_jet_p4)
 
         # ParticleTransformer features from https://arxiv.org/pdf/2202.03772, table 2
         # Add small epsilon to avoid log(0) issues
@@ -74,18 +74,24 @@ class ParticleTransformerDataset(IterableDataset):
                     jet_p4s.eta,
                     jet_p4s.phi,
                 ),
-                "cand_charge": data.reco_cand_charge,
+                "cand_charge": data.reco_cand_charges,
                 "isElectron": ak.values_astype(
-                    abs(data.reco_cand_pdg) == 11, np.float32
+                    abs(data.reco_cand_pdgs) == 11, np.float32
                 ),
-                "isMuon": ak.values_astype(abs(data.reco_cand_pdg) == 13, np.float32),
-                "isPhoton": ak.values_astype(abs(data.reco_cand_pdg) == 22, np.float32),
+                "isMuon": ak.values_astype(abs(data.reco_cand_pdgs) == 13, np.float32),
+                "isPhoton": ak.values_astype(
+                    abs(data.reco_cand_pdgs) == 22, np.float32
+                ),
                 "isChargedHadron": ak.values_astype(
-                    abs(data.reco_cand_pdg) == 211, np.float32
+                    abs(data.reco_cand_pdgs) == 211, np.float32
                 ),
                 "isNeutralHadron": ak.values_astype(
-                    abs(data.reco_cand_pdg) == 130, np.float32
+                    abs(data.reco_cand_pdgs) == 130, np.float32
                 ),
+                "cand_dz": data.reco_cand_dz,
+                "cand_dz_error": data.reco_cand_dz_error,
+                "cand_dxy": data.reco_cand_dxy,
+                "cand_dxy_error": data.reco_cand_dxy_error,
             }
         )
 
@@ -98,12 +104,14 @@ class ParticleTransformerDataset(IterableDataset):
             }
         )
 
-        if not "weight" in data.fields:
+        if not "cls_weight" in data.fields:
             weight_tensors = torch.tensor(
                 ak.ones_like(data.gen_jet_tau_decaymode), dtype=torch.float32
             )
         else:
-            weight_tensors = torch.tensor(ak.to_numpy(data.weight), dtype=torch.float32)
+            weight_tensors = torch.tensor(
+                ak.to_numpy(data.cls_weight), dtype=torch.float32
+            )
 
         gen_jet_tau_decaymode = ak.to_numpy(data.gen_jet_tau_decaymode)
         reduced_gen_decay_modes = g.get_reduced_decaymodes(gen_jet_tau_decaymode)
@@ -171,7 +179,7 @@ class ParticleTransformerDataset(IterableDataset):
 
         # Create padded mask
         mask = self._pad_and_convert_to_tensor(
-            ak.ones_like(data.reco_cand_pdg),
+            ak.ones_like(data.reco_cand_pdgs),
             dtype=torch.bool,
             fill_value=0,
             unsqueeze_dim=1,
