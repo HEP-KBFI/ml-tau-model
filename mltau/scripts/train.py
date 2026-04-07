@@ -15,10 +15,10 @@ def train(cfg: DictConfig):
     datamodule = dl.ParTDataModule(cfg=cfg, debug_run=cfg.training.debug_run)
     model_name = cfg.training.model.name
     if model_name == "MultiParTau":
-        model = MultiParTau_module.ParTauModule(cfg=cfg, input_dim=13, num_dm_classes=6)
+        model = MultiParTau_module.ParTauModule(cfg=cfg, input_dim=17, num_dm_classes=6)
     elif model_name == "SingleParTau":
         model = SingleParTau_module.ParTauModule(
-            cfg=cfg, input_dim=13, num_dm_classes=6, task=cfg.training.model.task
+            cfg=cfg, input_dim=17, num_dm_classes=6, task=cfg.training.model.task
         )
     else:
         raise ValueError(

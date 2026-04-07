@@ -106,42 +106,54 @@ class DecayModeEvaluator:
             return fig, ax
 
     def _calculate_performance_metrics(self):
-        class_FPR = (
-            self.confusion_matrix.sum(axis=0) - np.diag(self.confusion_matrix)
-        ) / self.confusion_matrix.sum()
-        class_FNR = (
-            self.confusion_matrix.sum(axis=1) - np.diag(self.confusion_matrix)
-        ) / self.confusion_matrix.sum()
-        class_TPR = (np.diag(self.confusion_matrix)) / self.confusion_matrix.sum()
-        class_TNR = (
-            self.confusion_matrix.sum() - (class_FPR + class_FNR + class_TPR)
-        ) / self.confusion_matrix.sum()
-        denom_prec = class_TPR + class_FPR
-        denom_rec = class_TPR + class_FNR
+        cm = self.confusion_matrix
+        total = cm.sum()
+
+        # Per-class counts using standard one-vs-rest definitions
+        class_TP = np.diag(cm).astype(float)
+        class_FP = (cm.sum(axis=0) - np.diag(cm)).astype(
+            float
+        )  # predicted i but not true i
+        class_FN = (cm.sum(axis=1) - np.diag(cm)).astype(
+            float
+        )  # true i but not predicted i
+        class_TN = (total - class_TP - class_FP - class_FN).astype(float)
+
+        # Per-class rates
         with np.errstate(divide="ignore", invalid="ignore"):
-            class_precision = np.where(denom_prec > 0, class_TPR / denom_prec, 0.0)
-            class_recall = np.where(denom_rec > 0, class_TPR / denom_rec, 0.0)
+            class_TPR = np.where(
+                class_TP + class_FN > 0, class_TP / (class_TP + class_FN), 0.0
+            )
+            class_FPR = np.where(
+                class_FP + class_TN > 0, class_FP / (class_FP + class_TN), 0.0
+            )
+            class_FNR = np.where(
+                class_TP + class_FN > 0, class_FN / (class_TP + class_FN), 0.0
+            )
+            class_TNR = np.where(
+                class_TN + class_FP > 0, class_TN / (class_TN + class_FP), 0.0
+            )
+            class_precision = np.where(
+                class_TP + class_FP > 0, class_TP / (class_TP + class_FP), 0.0
+            )
+            class_recall = class_TPR
             denom_f1 = class_precision + class_recall
             class_F1 = np.where(
                 denom_f1 > 0, 2 * class_precision * class_recall / denom_f1, 0.0
             )
-        class_accuracy = (class_TPR + class_TNR) / (
-            class_TPR + class_TNR + class_FPR + class_FNR
-        )
+            class_accuracy = (class_TP + class_TN) / total
 
-        FPR = np.sum(class_FPR) / len(class_FPR)
-        FNR = np.sum(class_FNR) / len(class_FNR)
-        TPR = np.sum(class_TPR) / len(class_TPR)
-        TNR = np.sum(class_TNR) / len(class_TNR)
+        # Macro-averaged overall metrics
+        TPR = float(np.mean(class_TPR))
+        FPR = float(np.mean(class_FPR))
+        FNR = float(np.mean(class_FNR))
+        TNR = float(np.mean(class_TNR))
+        precision = float(np.mean(class_precision))
+        recall = float(np.mean(class_recall))
+        denom_f1 = precision + recall
+        F1 = 2 * precision * recall / denom_f1 if denom_f1 > 0 else 0.0
+        accuracy = float(np.sum(class_TP) / total) if total > 0 else 0.0
 
-        precision = TPR / (TPR + FPR) if (TPR + FPR) > 0 else 0.0
-        recall = TPR / (TPR + FNR) if (TPR + FNR) > 0 else 0.0
-        F1 = (
-            2 * precision * recall / (precision + recall)
-            if (precision + recall) > 0
-            else 0.0
-        )
-        accuracy = (TPR + TNR) / (TPR + TNR + FPR + FNR)
         class_metrics = {
             "class_FPR": class_FPR,
             "class_FNR": class_FNR,
