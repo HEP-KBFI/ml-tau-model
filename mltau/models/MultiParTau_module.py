@@ -239,16 +239,15 @@ class ParTauModule(L.LightningModule):
             predictions["is_tau"], targets["is_tau"]
         )
 
-        # Start combined per-jet loss with tagging term
-        combined_per_jet = w_tag * tau_id_loss_per_jet
-
         if not is_tau_mask.any():
+            # Only tagging loss when no tau jets present
+            weighted_tagging_loss = (w_tag * tau_id_loss_per_jet * weights).mean()
             return {
                 "tau_id_loss": tau_id_loss_per_jet.mean(),
-                "charge_loss": combined_per_jet.new_zeros(()),
-                "decay_mode_loss": combined_per_jet.new_zeros(()),
-                "kinematics_loss": combined_per_jet.new_zeros(()),
-                "loss": (combined_per_jet * weights).mean(),
+                "charge_loss": tau_id_loss_per_jet.new_zeros(()),
+                "decay_mode_loss": tau_id_loss_per_jet.new_zeros(()),
+                "kinematics_loss": tau_id_loss_per_jet.new_zeros(()),
+                "loss": weighted_tagging_loss,
             }
 
         # Per-jet losses for signal-only heads — shape [N_signal]
@@ -262,15 +261,17 @@ class ParTauModule(L.LightningModule):
             predictions["kinematics"][is_tau_mask], targets["kinematics"][is_tau_mask]
         )
 
-        # Add signal-only terms into combined per-jet loss
-        combined_per_jet[is_tau_mask] += (
+        # Apply classification weights only to tagging task
+        weighted_tagging_loss = (w_tag * tau_id_loss_per_jet * weights).mean()
+
+        # Signal tasks get only their task weights (no classification weights)
+        signal_losses = (
             w_dm * dm_loss_per_jet
             + w_charge * charge_loss_per_jet
             + w_kin * kin_loss_per_jet
-        )
+        ).mean()
 
-        # Multiply each jet's combined loss by its cls_weight, then average
-        loss = (combined_per_jet * weights).mean()
+        loss = weighted_tagging_loss + signal_losses
 
         return {
             "tau_id_loss": tau_id_loss_per_jet.mean(),
