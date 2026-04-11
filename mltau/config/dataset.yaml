@@ -1,6 +1,6 @@
 dataset:
   max_cands: 20
-  data_dir: /home/laurits/0407_lifetime_ntuples
+  data_dir: /home/laurits/0409_lifetime_ntuples_pt0
   relative_sizes:
     train: 0.7
     val: 0.1

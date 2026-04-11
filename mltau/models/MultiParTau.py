@@ -1,3 +1,4 @@
+import contextlib
 import torch
 import torch.nn as nn
 from mltau.models.ParticleTransformer import ParticleTransformer
@@ -68,7 +69,9 @@ class ParTau(ParticleTransformer):
         # Classification head for decay mode classification
         self.classification_head = nn.Linear(embed_dim, num_dm_classes)
         # Regression head kinematic reconstruction [pT_vis, theta, phi, m_vis]
-        self.regression_head = nn.Linear(embed_dim, 5)  # [log_pt, deta, sin(dphi), cos(dphi), log_m]
+        self.regression_head = nn.Linear(
+            embed_dim, 5
+        )  # [log_pt, deta, sin(dphi), cos(dphi), log_m]
         # Binary heads for tau-tagging and charge reco
         self.tau_id_head = nn.Linear(embed_dim, 1)
         self.tau_charge_head = nn.Linear(embed_dim, 1)
@@ -84,7 +87,10 @@ class ParTau(ParticleTransformer):
         # cand_mask: (N, 1, P) -- real particle = 1, padded = 0
         cand_mask = cand_mask.type(torch.bool)
         padding_mask = ~cand_mask.squeeze(1)  # (N, 1, P) -> (N, P)
-        with torch.amp.autocast("cuda", enabled=self.use_amp):
+        amp_ctx = (
+            torch.amp.autocast("cuda") if self.use_amp else contextlib.nullcontext()
+        )
+        with amp_ctx:
             num_particles = cand_features.size(-1)
 
             # input embedding
@@ -126,7 +132,9 @@ class ParTau(ParticleTransformer):
                 "decay_mode": self.classification_head(
                     x_cls
                 ),  # (N, num_dm_classes) - raw logits
-                "kinematics": self.regression_head(x_cls),  # (N, 5) - [log_pt, deta, sin(dphi), cos(dphi), log_m]
+                "kinematics": self.regression_head(
+                    x_cls
+                ),  # (N, 5) - [log_pt, deta, sin(dphi), cos(dphi), log_m]
             }
 
             return output

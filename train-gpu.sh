@@ -15,5 +15,5 @@
 
 env | grep CUDA
 nvidia-smi -L
-
+export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 ./run.sh python3 mltau/scripts/train.py "$@"

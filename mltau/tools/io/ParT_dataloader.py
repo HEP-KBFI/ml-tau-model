@@ -18,187 +18,209 @@ np.random.seed(42)
 
 
 class ParticleTransformerDataset(IterableDataset):
-    def __init__(self, row_groups: Sequence[ig.RowGroup], cfg: DictConfig):
+    def __init__(
+        self, row_groups: Sequence[ig.RowGroup], cfg: DictConfig, batch_size: int = 1
+    ):
         super().__init__()
         self.cfg = cfg
+        self.batch_size = batch_size
         self.row_groups = row_groups
         self.num_rows = sum([rg.num_rows for rg in self.row_groups])
         print(f"There are {'{:,}'.format(self.num_rows)} jets in the dataset.")
 
     def __len__(self):
-        return self.num_rows
-
-    def _pad_and_convert_to_tensor(
-        self, ak_array, dtype=torch.float32, fill_value=0, unsqueeze_dim=None
-    ):
-        """Helper function to pad awkward arrays and convert to torch tensors."""
-        padded_array = ak.to_numpy(
-            ak.fill_none(
-                ak.pad_none(
-                    ak_array,
-                    self.cfg.dataset.max_cands,
-                    clip=True,
-                ),
-                fill_value,
-            )
-        )
-        tensor = torch.tensor(padded_array, dtype=dtype)
-        if unsqueeze_dim is not None:
-            tensor = torch.unsqueeze(tensor, dim=unsqueeze_dim)
-        return tensor
+        return math.ceil(self.num_rows / self.batch_size)
 
     def build_tensors(self, data: ak.Array):
-        jet_constituent_p4s = g.reinitialize_p4(data.reco_cand_p4s)
-        gen_jet_tau_p4s = g.reinitialize_p4(data.gen_jet_tau_p4)
-        jet_p4s = g.reinitialize_p4(data.reco_jet_p4)
-        gen_jet_p4s = g.reinitialize_p4(data.gen_jet_p4)
-
-        # ParticleTransformer features from https://arxiv.org/pdf/2202.03772, table 2
-        # Add small epsilon to avoid log(0) issues
+        max_cands = self.cfg.dataset.max_cands
         eps = 1e-6
-        cand_features = ak.Array(
-            {
-                "cand_deta": f.deltaEta(jet_constituent_p4s.eta, jet_p4s.eta),
-                "cand_dphi": f.deltaPhi(jet_constituent_p4s.phi, jet_p4s.phi),
-                "cand_logpt": np.log(np.maximum(jet_constituent_p4s.pt, eps)),
-                "cand_loge": np.log(np.maximum(jet_constituent_p4s.energy, eps)),
-                "cand_logptrel": np.log(
-                    np.maximum(jet_constituent_p4s.pt / jet_p4s.pt, eps)
-                ),
-                "cand_logerel": np.log(
-                    np.maximum(jet_constituent_p4s.energy / jet_p4s.energy, eps)
-                ),
-                "cand_deltaR": f.deltaR_etaPhi(
-                    jet_constituent_p4s.eta,
-                    jet_constituent_p4s.phi,
-                    jet_p4s.eta,
-                    jet_p4s.phi,
-                ),
-                "cand_charge": data.reco_cand_charges,
-                "isElectron": ak.values_astype(
-                    abs(data.reco_cand_pdgs) == 11, np.float32
-                ),
-                "isMuon": ak.values_astype(abs(data.reco_cand_pdgs) == 13, np.float32),
-                "isPhoton": ak.values_astype(
-                    abs(data.reco_cand_pdgs) == 22, np.float32
-                ),
-                "isChargedHadron": ak.values_astype(
-                    abs(data.reco_cand_pdgs) == 211, np.float32
-                ),
-                "isNeutralHadron": ak.values_astype(
-                    abs(data.reco_cand_pdgs) == 130, np.float32
-                ),
-                "cand_dz": data.reco_cand_dz,
-                "cand_dz_error": data.reco_cand_dz_error,
-                "cand_dxy": data.reco_cand_dxy,
-                "cand_dxy_error": data.reco_cand_dxy_error,
-            }
-        )
 
-        cand_kinematics = ak.Array(
-            {
-                "cand_px": jet_constituent_p4s.px,
-                "cand_py": jet_constituent_p4s.py,
-                "cand_pz": jet_constituent_p4s.pz,
-                "cand_en": jet_constituent_p4s.energy,
-            }
-        )
+        # ------------------------------------------------------------------
+        # Helper: pad jagged awkward array → dense float32 [N, max_cands]
+        # ------------------------------------------------------------------
+        def pad_cand(arr, fill=0.0):
+            return ak.to_numpy(
+                ak.fill_none(ak.pad_none(arr, max_cands, clip=True), fill)
+            ).astype(np.float32)
 
-        if not "cls_weight" in data.fields:
-            weight_tensors = torch.tensor(
-                ak.ones_like(data.gen_jet_tau_decaymode), dtype=torch.float32
-            )
+        # ------------------------------------------------------------------
+        # Candidate p4 components: stored as (rho=pt, eta, phi, t=energy)
+        # All other candidate fields — one padded extraction each
+        # ------------------------------------------------------------------
+        cand_pt = pad_cand(data.reco_cand_p4s["rho"])  # [N, max_cands]
+        cand_eta = pad_cand(data.reco_cand_p4s["eta"])
+        cand_phi = pad_cand(data.reco_cand_p4s["phi"])
+        cand_en = pad_cand(data.reco_cand_p4s["t"])  # energy
+        cand_charge = pad_cand(data.reco_cand_charges)
+        cand_pdg_abs = pad_cand(abs(data.reco_cand_pdgs))
+        cand_dz = pad_cand(data.reco_cand_dz)
+        cand_dz_err = pad_cand(data.reco_cand_dz_error)
+        cand_dxy = pad_cand(data.reco_cand_dxy)
+        cand_dxy_err = pad_cand(data.reco_cand_dxy_error)
+
+        # Mask: True = real particle, False = padding  [N, max_cands]
+        lengths = np.minimum(ak.to_numpy(ak.num(data.reco_cand_pdgs)), max_cands)
+        mask_np = np.arange(max_cands)[None, :] < lengths[:, None]
+
+        # Scalar jet p4s — read raw fields directly, no reinitialize_p4
+        jet_pt = ak.to_numpy(data.reco_jet_p4["rho"]).astype(np.float32)  # [N]
+        jet_eta = ak.to_numpy(data.reco_jet_p4["eta"]).astype(np.float32)
+        jet_phi = ak.to_numpy(data.reco_jet_p4["phi"]).astype(np.float32)
+        jet_en = ak.to_numpy(data.reco_jet_p4["t"]).astype(np.float32)
+
+        _pt_gen = ak.to_numpy(data.gen_jet_tau_p4["rho"]).astype(np.float32)
+        _eta_gen = ak.to_numpy(data.gen_jet_tau_p4["eta"]).astype(np.float32)
+        _phi_gen = ak.to_numpy(data.gen_jet_tau_p4["phi"]).astype(np.float32)
+        _energy_gen = ak.to_numpy(data.gen_jet_tau_p4["t"]).astype(np.float32)
+
+        _pt_gen_jet = ak.to_numpy(data.gen_jet_p4["rho"]).astype(np.float32)
+        _eta_gen_jet = ak.to_numpy(data.gen_jet_p4["eta"]).astype(np.float32)
+        _phi_gen_jet = ak.to_numpy(data.gen_jet_p4["phi"]).astype(np.float32)
+        _energy_gen_jet = ak.to_numpy(data.gen_jet_p4["t"]).astype(np.float32)
+
+        # ------------------------------------------------------------------
+        # Compute 17 ParticleTransformer features in numpy (zero awkward)
+        # ParticleTransformer features from https://arxiv.org/pdf/2202.03772, table 2
+        # Broadcast jet scalars [N] → [N, 1] against candidates [N, max_cands]
+        # ------------------------------------------------------------------
+        jpt = jet_pt[:, None]
+        jeta = jet_eta[:, None]
+        jphi = jet_phi[:, None]
+        jen = jet_en[:, None]
+
+        cand_deta = np.abs(cand_eta - jeta)
+        dphi_raw = cand_phi - jphi
+        cand_dphi = np.abs(np.arctan2(np.sin(dphi_raw), np.cos(dphi_raw)))
+        cand_logpt = np.log(np.maximum(cand_pt, eps))
+        cand_loge = np.log(np.maximum(cand_en, eps))
+        cand_logptrel = np.log(np.maximum(cand_pt / np.maximum(jpt, eps), eps))
+        cand_logerel = np.log(np.maximum(cand_en / np.maximum(jen, eps), eps))
+        cand_dR = np.sqrt(cand_deta**2 + cand_dphi**2)
+
+        isElectron = (cand_pdg_abs == 11).astype(np.float32)
+        isMuon = (cand_pdg_abs == 13).astype(np.float32)
+        isPhoton = (cand_pdg_abs == 22).astype(np.float32)
+        isChargedHadron = (cand_pdg_abs == 211).astype(np.float32)
+        isNeutralHadron = (cand_pdg_abs == 130).astype(np.float32)
+
+        # Stack → [N, 17, max_cands], zero padded slots, fix nan/inf
+        cand_features_np = np.stack(
+            [
+                cand_deta,
+                cand_dphi,
+                cand_logpt,
+                cand_loge,
+                cand_logptrel,
+                cand_logerel,
+                cand_dR,
+                cand_charge,
+                isElectron,
+                isMuon,
+                isPhoton,
+                isChargedHadron,
+                isNeutralHadron,
+                cand_dz,
+                cand_dz_err,
+                cand_dxy,
+                cand_dxy_err,
+            ],
+            axis=1,
+        )  # [N, 17, max_cands]
+        cand_features_np *= mask_np[:, None, :]
+        np.nan_to_num(cand_features_np, copy=False, nan=0.0, posinf=0.0, neginf=0.0)
+
+        # Cand kinematics: (px, py, pz, energy) → [N, 4, max_cands]
+        cand_px = cand_pt * np.cos(cand_phi)
+        cand_py = cand_pt * np.sin(cand_phi)
+        cand_pz = cand_pt * np.sinh(cand_eta)
+        cand_kinematics_np = np.stack([cand_px, cand_py, cand_pz, cand_en], axis=1)
+        cand_kinematics_np *= mask_np[:, None, :]
+
+        # ------------------------------------------------------------------
+        # Weights, decay mode, charge
+        # ------------------------------------------------------------------
+        if "cls_weight" not in data.fields:
+            weight_tensors = torch.ones(len(data), dtype=torch.float32)
         else:
-            weight_tensors = torch.tensor(
-                ak.to_numpy(data.cls_weight), dtype=torch.float32
+            weight_tensors = torch.from_numpy(
+                ak.to_numpy(data.cls_weight).astype(np.float32)
             )
 
         gen_jet_tau_decaymode = ak.to_numpy(data.gen_jet_tau_decaymode)
         reduced_gen_decay_modes = g.get_reduced_decaymodes(gen_jet_tau_decaymode)
         ohe_prepared_decay_modes = g.prepare_one_hot_encoding(reduced_gen_decay_modes)
-        gen_jet_tau_decaymode_reduced = torch.tensor(ohe_prepared_decay_modes).long()
+        gen_jet_tau_decaymode_reduced = torch.from_numpy(
+            ohe_prepared_decay_modes.astype(np.int64)
+        )
         gen_jet_tau_decaymode_ohe = torch.nn.functional.one_hot(
             gen_jet_tau_decaymode_reduced, 6
         ).float()
+        gen_jet_tau_decaymode_exists = torch.from_numpy(
+            (gen_jet_tau_decaymode != -1).astype(np.int64)
+        )
+        charge_tensor = torch.from_numpy(
+            (ak.to_numpy(data.gen_jet_tau_charge).astype(np.int32) == 1).astype(
+                np.float32
+            )
+        )
 
-        gen_jet_tau_decaymode_exists = (
-            torch.tensor(ak.to_numpy(data.gen_jet_tau_decaymode)) != -1
-        ).long()
-
-        charge_tensor = (
-            torch.tensor(ak.to_numpy(data.gen_jet_tau_charge)) == 1
-        ).float()
-
-        # dtheta = f.deltaTheta(gen_jet_tau_p4s.theta, jet_p4s.theta)
-
-        deta = f.signedDeltaEta(gen_jet_tau_p4s.eta, jet_p4s.eta)
-        dphi = f.signedDeltaPhi(gen_jet_tau_p4s.phi, jet_p4s.phi)
-        # Add epsilon and clamp to avoid log(0) or log(negative)
-        vis_pt_ratio = torch.tensor(gen_jet_tau_p4s.pt / jet_p4s.pt)
-        vis_pt_ratio_safe = torch.clamp(vis_pt_ratio, min=eps)
-
-        vis_m_ratio = torch.tensor(gen_jet_tau_p4s.mass / jet_p4s.mass)
-        vis_m_ratio_safe = torch.clamp(vis_m_ratio, min=eps)
-        # Stack kinematic variables into a single tensor [N, 5] for [pT_vis, eta, sin(phi), cos(phi), m_vis]
-        kinematics_tensor = torch.stack(
-            [
-                torch.log(vis_pt_ratio_safe),  # pT_vis (log of pT ratio) - safe version
-                torch.tensor(deta),  # delta eta between gen_vis_tau and reco_jet
-                torch.sin(
-                    torch.tensor(dphi)
-                ),  # sin(delta phi) between gen_vis_tau and reco_jet
-                torch.cos(
-                    torch.tensor(dphi)
-                ),  # cos(delta phi) between gen_vis_tau and reco_jet
-                torch.log(vis_m_ratio_safe),  # m_vis
-            ],
-            dim=-1,
-        )  # Stack along last dimension to get [N, 5]
-
-        # Pad and convert cand_kinematics to tensor
-        cand_kinematics_tensor = torch.stack(
-            [
-                self._pad_and_convert_to_tensor(cand_kinematics[feat])
-                for feat in cand_kinematics.fields
-            ],
-            dim=-1,
-        ).transpose(
-            1, 2
-        )  # [batch, max_cands, 4] -> [batch, 4, max_cands]
-
-        # Pad and convert cand_features to tensor
-        cand_features_tensor = torch.stack(
-            [
-                self._pad_and_convert_to_tensor(cand_features[feat])
-                for feat in cand_features.fields
-            ],
-            dim=-1,
-        ).transpose(
-            1, 2
-        )  # [batch, max_cands, 13] -> [batch, 13, max_cands]
-
-        # Create padded mask
-        mask = self._pad_and_convert_to_tensor(
-            ak.ones_like(data.reco_cand_pdgs),
-            dtype=torch.bool,
-            fill_value=0,
-            unsqueeze_dim=1,
+        # ------------------------------------------------------------------
+        # Kinematics regression targets (pure numpy, no reinitialize_p4)
+        # ------------------------------------------------------------------
+        _deta = _eta_gen - jet_eta
+        _dphi_raw = _phi_gen - jet_phi
+        _dphi = np.arctan2(np.sin(_dphi_raw), np.cos(_dphi_raw))
+        _vis_pt_ratio = np.maximum(_pt_gen / np.maximum(jet_pt, eps), eps)
+        # m^2 = E^2 - pt^2 * cosh^2(eta)
+        _mass_gen = np.sqrt(
+            np.maximum(_energy_gen**2 - (_pt_gen * np.cosh(_eta_gen)) ** 2, 0.0)
+        )
+        _mass_reco = np.sqrt(
+            np.maximum(jet_en**2 - (jet_pt * np.cosh(jet_eta)) ** 2, 0.0)
+        )
+        _vis_m_ratio = np.maximum(_mass_gen / np.maximum(_mass_reco, eps), eps)
+        kinematics_tensor = torch.from_numpy(
+            np.stack(
+                [
+                    np.log(_vis_pt_ratio),
+                    _deta,
+                    np.sin(_dphi),
+                    np.cos(_dphi),
+                    np.log(_vis_m_ratio),
+                ],
+                axis=-1,
+            )
         )
 
         return (
-            cand_features_tensor,
-            cand_kinematics_tensor,
+            torch.from_numpy(cand_features_np),
+            torch.from_numpy(cand_kinematics_np),
             {
                 "kinematics": kinematics_tensor.float(),
                 "decay_mode": gen_jet_tau_decaymode_ohe.float(),
                 "charge": charge_tensor.float(),
                 "is_tau": gen_jet_tau_decaymode_exists.long(),
             },
-            mask,
+            torch.from_numpy(mask_np).unsqueeze(1),  # [N, 1, max_cands]
             weight_tensors.float(),
-            gen_jet_tau_p4s,
-            jet_p4s,
-            gen_jet_p4s,
+            {
+                "pt": torch.from_numpy(_pt_gen),
+                "eta": torch.from_numpy(_eta_gen),
+                "phi": torch.from_numpy(_phi_gen),
+                "energy": torch.from_numpy(_energy_gen),
+            },
+            {
+                "pt": torch.from_numpy(jet_pt),
+                "eta": torch.from_numpy(jet_eta),
+                "phi": torch.from_numpy(jet_phi),
+                "energy": torch.from_numpy(jet_en),
+            },
+            {
+                "pt": torch.from_numpy(_pt_gen_jet),
+                "eta": torch.from_numpy(_eta_gen_jet),
+                "phi": torch.from_numpy(_phi_gen_jet),
+                "energy": torch.from_numpy(_energy_gen_jet),
+            },
         )
 
     def __iter__(self):
@@ -214,29 +236,44 @@ class ParticleTransformerDataset(IterableDataset):
             row_groups_end = row_groups_start + per_worker
             row_groups_to_process = self.row_groups[row_groups_start:row_groups_end]
 
-        for row_group in row_groups_to_process:
-            # load one chunk from one file
-            data = ak.from_parquet(row_group.filename, row_groups=[row_group.row_group])
-            tensors = self.build_tensors(data)
+        # Only load columns actually used by build_tensors
+        _NEEDED_COLUMNS = [
+            "reco_cand_p4s",
+            "reco_cand_charges",
+            "reco_cand_pdgs",
+            "reco_cand_dz",
+            "reco_cand_dz_error",
+            "reco_cand_dxy",
+            "reco_cand_dxy_error",
+            "reco_jet_p4",
+            "gen_jet_tau_p4",
+            "gen_jet_p4",
+            "gen_jet_tau_decaymode",
+            "gen_jet_tau_charge",
+            "cls_weight",
+        ]
 
-            # return individual jets from the dataset
-            # Note: Let PyTorch Lightning handle device placement automatically
-            for ijet in range(len(data)):
+        for row_group in row_groups_to_process:
+            data = ak.from_parquet(
+                row_group.filename,
+                row_groups=[row_group.row_group],
+                columns=_NEEDED_COLUMNS,
+            )
+            tensors = self.build_tensors(data)
+            N = tensors[0].shape[0]
+
+            # Yield pre-batched slices — bypasses PyTorch per-sample collation entirely
+            for start in range(0, N, self.batch_size):
+                end = min(start + self.batch_size, N)
                 yield (
-                    tensors[0][ijet],  # cand_features
-                    tensors[1][ijet],  # cand_kinematics
-                    {k: v[ijet] for k, v in tensors[2].items()},  # targets
-                    tensors[3][ijet],  # mask
-                    tensors[4][ijet],  # weights
-                    {
-                        field: tensors[5][field][ijet] for field in tensors[5].fields
-                    },  # gen_jet_tau_p4s
-                    {
-                        field: tensors[6][field][ijet] for field in tensors[6].fields
-                    },  # reco_jet_p4s
-                    {
-                        field: tensors[7][field][ijet] for field in tensors[7].fields
-                    },  # gen_jet_p4s
+                    tensors[0][start:end],  # cand_features
+                    tensors[1][start:end],  # cand_kinematics
+                    {k: v[start:end] for k, v in tensors[2].items()},  # targets
+                    tensors[3][start:end],  # mask
+                    tensors[4][start:end],  # weights
+                    {k: v[start:end] for k, v in tensors[5].items()},  # gen_jet_tau_p4s
+                    {k: v[start:end] for k, v in tensors[6].items()},  # reco_jet_p4s
+                    {k: v[start:end] for k, v in tensors[7].items()},  # gen_jet_p4s
                 )
 
 
@@ -311,17 +348,15 @@ class ParTDataModule(LightningDataModule):
                 dataset_type="train"
             )
             self.train_dataset = ParticleTransformerDataset(
-                row_groups=train_row_groups, cfg=self.cfg
+                row_groups=train_row_groups, cfg=self.cfg, batch_size=batch_size
             )
             self.val_dataset = ParticleTransformerDataset(
-                row_groups=val_row_groups, cfg=self.cfg
+                row_groups=val_row_groups, cfg=self.cfg, batch_size=batch_size
             )
-            # Use conservative prefetch_factor to avoid memory issues with IterableDataset
-            # IterableDatasets with complex data (awkward arrays) can cause OOM with high prefetch
-            safe_prefetch = min(self.cfg.training.dataloader.prefetch_factor, 4)
+            # batch_size=None: dataset yields pre-batched slices, skip collation entirely
             self.train_loader = DataLoader(
                 self.train_dataset,
-                batch_size=batch_size,
+                batch_size=None,
                 persistent_workers=False if self.debug_run else True,
                 num_workers=(
                     0
@@ -333,13 +368,16 @@ class ParTDataModule(LightningDataModule):
                     if self.cfg.training.dataloader.num_dataloader_workers > 1
                     else None
                 ),
-                prefetch_factor=safe_prefetch,  # Limited to prevent memory explosion
-                pin_memory=True,  # Enable for faster GPU transfers
+                prefetch_factor=(
+                    None
+                    if self.debug_run
+                    else self.cfg.training.dataloader.prefetch_factor
+                ),
+                pin_memory=True,
             )
-            safe_prefetch = min(self.cfg.training.dataloader.prefetch_factor, 4)
             self.val_loader = DataLoader(
                 self.val_dataset,
-                batch_size=batch_size,
+                batch_size=None,
                 persistent_workers=False if self.debug_run else True,
                 num_workers=(
                     0
@@ -351,22 +389,29 @@ class ParTDataModule(LightningDataModule):
                     if self.cfg.training.dataloader.num_dataloader_workers > 1
                     else None
                 ),
-                prefetch_factor=safe_prefetch,  # Limited to prevent memory explosion
-                pin_memory=True,  # Enable for faster GPU transfers
+                prefetch_factor=(
+                    None
+                    if self.debug_run
+                    else self.cfg.training.dataloader.prefetch_factor
+                ),
+                pin_memory=True,
             )
         elif stage == "test":
             test_row_groups = self.get_dataset_rowgroups(dataset_type="test")
             self.test_dataset = ParticleTransformerDataset(
-                row_groups=test_row_groups, cfg=self.cfg
+                row_groups=test_row_groups, cfg=self.cfg, batch_size=batch_size
             )
-            safe_prefetch = min(self.cfg.training.dataloader.prefetch_factor, 4)
             self.test_loader = DataLoader(
                 self.test_dataset,
-                batch_size=batch_size,
+                batch_size=None,
                 persistent_workers=True,
                 num_workers=self.cfg.training.dataloader.num_dataloader_workers,
-                prefetch_factor=safe_prefetch,  # Limited to prevent memory explosion
-                pin_memory=True,  # Enable for faster GPU transfers
+                prefetch_factor=(
+                    self.cfg.training.dataloader.prefetch_factor
+                    if self.cfg.training.dataloader.num_dataloader_workers > 0
+                    else None
+                ),
+                pin_memory=True,
             )
         else:
             raise ValueError(f"Unexpected stage: {stage}")

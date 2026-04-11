@@ -3,6 +3,7 @@
 Paper: "Particle Transformer for Jet Tagging" - https://arxiv.org/abs/2202.03772
 """
 
+import contextlib
 import math
 import random
 import warnings
@@ -868,7 +869,10 @@ class ParticleTransformer(nn.Module):
         # cand_mask: (N, 1, P) -- real particle = 1, padded = 0
         cand_mask = cand_mask.type(torch.bool)
         padding_mask = ~cand_mask.squeeze(1)  # (N, 1, P) -> (N, P)
-        with torch.amp.autocast("cuda", enabled=self.use_amp):
+        amp_ctx = (
+            torch.amp.autocast("cuda") if self.use_amp else contextlib.nullcontext()
+        )
+        with amp_ctx:
             num_particles = cand_features.size(-1)
 
             # input embedding

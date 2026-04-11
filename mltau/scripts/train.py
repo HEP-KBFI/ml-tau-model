@@ -7,6 +7,7 @@ from lightning.pytorch.loggers import CSVLogger, TensorBoardLogger  # , CometLog
 from lightning.pytorch.callbacks import TQDMProgressBar, ModelCheckpoint
 
 from mltau.tools.io import ParT_dataloader as dl
+from mltau.tools.io import preprocessed_ParTau_dataloader as dl
 from mltau.models import MultiParTau_module, SingleParTau_module
 
 
@@ -56,6 +57,7 @@ def train(cfg: DictConfig):
             ),
         ],
         accelerator="auto",  # Automatically detect GPU/CPU
+        precision="16-mixed",  # fp16 activations: halves GPU memory, ~30% faster
         num_sanity_val_steps=0,  # Skip sanity validation for faster startup
         enable_progress_bar=True,  # Keep enabled for monitoring
     )
