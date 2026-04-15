@@ -10,6 +10,9 @@ from mltau.tools import general as g
 from mltau.tools.evaluation.histogram import Histogram
 
 
+plt.rcParams["mathtext.fontset"] = "stix"
+
+
 def jet_charge_qkappa(cand_charges, cand_pts, jet_pts, kappa=0.5):
     """Calculate jet charge using Q*kappa weighting.
 

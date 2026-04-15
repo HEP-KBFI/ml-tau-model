@@ -1,6 +1,7 @@
 import os
 import hydra
 import lightning as L
+import numpy as np
 
 from omegaconf import DictConfig
 from lightning.pytorch.loggers import CSVLogger, TensorBoardLogger  # , CometLogger
@@ -9,6 +10,7 @@ from lightning.pytorch.callbacks import TQDMProgressBar, ModelCheckpoint
 from mltau.tools.io import ParT_dataloader as dl
 from mltau.tools.io import preprocessed_ParTau_dataloader as dl
 from mltau.models import MultiParTau_module, SingleParTau_module
+from mltau.tools.evaluation import inference
 
 
 @hydra.main(config_path="../config", config_name="main", version_base=None)
@@ -61,7 +63,36 @@ def train(cfg: DictConfig):
         num_sanity_val_steps=0,  # Skip sanity validation for faster startup
         enable_progress_bar=True,  # Keep enabled for monitoring
     )
+
     trainer.fit(model=model, datamodule=datamodule)
+    # --- Inference on test set using best checkpoint ---
+    best_ckpt_path = os.path.join(models_dir, "ParT-model_best.ckpt")
+    if os.path.exists(best_ckpt_path):
+        print(f"\n[INFO] Running inference on test set using {best_ckpt_path}")
+        # Reload the best model
+        if model_name == "MultiParTau":
+            best_model = MultiParTau_module.ParTauModule.load_from_checkpoint(
+                best_ckpt_path, cfg=cfg, input_dim=17, num_dm_classes=6
+            )
+        elif model_name == "SingleParTau":
+            best_model = SingleParTau_module.ParTauModule.load_from_checkpoint(
+                best_ckpt_path,
+                cfg=cfg,
+                input_dim=17,
+                num_dm_classes=6,
+                task=cfg.training.model.task,
+            )
+        else:
+            raise ValueError(f"Unknown model '{model_name}' for prediction.")
+
+        inference.create_predictions_files(
+            best_model=best_model, model_name=model_name, cfg=cfg
+        )
+
+    else:
+        print(
+            f"[WARNING] Best checkpoint not found at {best_ckpt_path}. Skipping inference."
+        )
 
 
 if __name__ == "__main__":

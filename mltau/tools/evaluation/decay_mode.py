@@ -7,6 +7,7 @@ import matplotlib.pyplot as plt
 from mltau.tools.io.general import NpEncoder
 
 hep.style.use(hep.styles.CMS)
+plt.rcParams["mathtext.fontset"] = "stix"
 
 
 def visualize_confusion_matrix(

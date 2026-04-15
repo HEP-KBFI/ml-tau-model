@@ -162,7 +162,7 @@ class ParTDataModule(LightningDataModule):
             train_tensors, val_tensors = _load_and_split(all_train_paths, train_frac)
             self.train_loader = self._make_loader(train_tensors, batch_size)
             self.val_loader = self._make_loader(val_tensors, batch_size)
-        elif stage == "test":
+        elif stage == "test" or stage == "predict":
             test_paths = self._get_pt_paths("test")
             # For test, use all data (no split needed)
             test_tensors, _ = _load_and_split(test_paths, train_frac=1.0)
@@ -177,4 +177,7 @@ class ParTDataModule(LightningDataModule):
         return self.val_loader
 
     def test_dataloader(self):
+        return self.test_loader
+
+    def predict_dataloader(self):
         return self.test_loader

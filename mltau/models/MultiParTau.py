@@ -1,7 +1,7 @@
 import contextlib
 import torch
 import torch.nn as nn
-from mltau.models.ParticleTransformer import ParticleTransformer
+from mltau.models.ParticleTransformer import ParticleTransformer, trunc_normal_
 
 
 class ParTau(ParticleTransformer):
@@ -66,6 +66,20 @@ class ParTau(ParticleTransformer):
         # We will have a total of 4 heads: decay mode, kinematic, charge and tauID.
 
         embed_dim = embed_dims[-1] if len(embed_dims) > 0 else input_dim
+
+        # Replace the single inherited cls_token with 4 per-task tokens.
+        # Each token attends to the particle cloud independently through cls_blocks,
+        # giving each head the same private representational capacity as a single-head model.
+        del self.cls_token
+        self.cls_token_tagging = nn.Parameter(torch.zeros(1, 1, embed_dim))
+        self.cls_token_charge = nn.Parameter(torch.zeros(1, 1, embed_dim))
+        self.cls_token_decay_mode = nn.Parameter(torch.zeros(1, 1, embed_dim))
+        self.cls_token_kinematics = nn.Parameter(torch.zeros(1, 1, embed_dim))
+        trunc_normal_(self.cls_token_tagging, std=0.02)
+        trunc_normal_(self.cls_token_charge, std=0.02)
+        trunc_normal_(self.cls_token_decay_mode, std=0.02)
+        trunc_normal_(self.cls_token_kinematics, std=0.02)
+
         # Classification head for decay mode classification
         self.classification_head = nn.Linear(embed_dim, num_dm_classes)
         # Regression head kinematic reconstruction [pT_vis, theta, phi, m_vis]
@@ -75,6 +89,15 @@ class ParTau(ParticleTransformer):
         # Binary heads for tau-tagging and charge reco
         self.tau_id_head = nn.Linear(embed_dim, 1)
         self.tau_charge_head = nn.Linear(embed_dim, 1)
+
+    @torch.jit.ignore
+    def no_weight_decay(self):
+        return {
+            "cls_token_tagging",
+            "cls_token_charge",
+            "cls_token_decay_mode",
+            "cls_token_kinematics",
+        }
 
     def forward(
         self,
@@ -113,27 +136,46 @@ class ParTau(ParticleTransformer):
                 )
 
             # transform per-jet class tokens
-            cls_tokens = self.cls_token.expand(
-                1, cand_features_embed.size(1), -1
-            )  # (1, N, C)
+            # The cls_blocks are designed for a single CLS token per sample.
+            # To give each task its own private CLS token, we tile the particle
+            # features 4x along the batch dimension so each task slot runs as an
+            # independent sample through the cls_blocks in one efficient pass.
+            N = cand_features_embed.size(1)
+            # (P, 4N, C) and (4N, P)
+            feat_4x = cand_features_embed.repeat(1, 4, 1)
+            mask_4x = padding_mask.repeat(4, 1)
+            # Stack the 4 task tokens along the batch dim: (1, 4N, C)
+            cls_tokens = torch.cat(
+                [
+                    self.cls_token_tagging.expand(1, N, -1),
+                    self.cls_token_charge.expand(1, N, -1),
+                    self.cls_token_decay_mode.expand(1, N, -1),
+                    self.cls_token_kinematics.expand(1, N, -1),
+                ],
+                dim=1,
+            )  # (1, 4N, C)
             for block in self.cls_blocks:
-                cls_tokens = block(
-                    cand_features_embed, x_cls=cls_tokens, padding_mask=padding_mask
-                )
-            x_cls = self.norm(cls_tokens).squeeze(0)
+                cls_tokens = block(feat_4x, x_cls=cls_tokens, padding_mask=mask_4x)
+            cls_tokens = self.norm(cls_tokens.squeeze(0))  # (4N, C)
+            x_tagging = cls_tokens[:N]  # (N, C)
+            x_charge = cls_tokens[N : 2 * N]  # (N, C)
+            x_decay_mode = cls_tokens[2 * N : 3 * N]  # (N, C)
+            x_kinematics = cls_tokens[3 * N :]  # (N, C)
 
             # As fc_params is an empty list, then basically we have been using one Linear layer only.
             # Now introduce the different heads also here.
             # Output raw logits - activations will be applied by loss functions or during inference
 
             output = {
-                "is_tau": self.tau_id_head(x_cls).squeeze(-1),  # (N,) - raw logits
-                "charge": self.tau_charge_head(x_cls).squeeze(-1),  # (N,) - raw logits
+                "is_tau": self.tau_id_head(x_tagging).squeeze(-1),  # (N,) - raw logits
+                "charge": self.tau_charge_head(x_charge).squeeze(
+                    -1
+                ),  # (N,) - raw logits
                 "decay_mode": self.classification_head(
-                    x_cls
+                    x_decay_mode
                 ),  # (N, num_dm_classes) - raw logits
                 "kinematics": self.regression_head(
-                    x_cls
+                    x_kinematics
                 ),  # (N, 5) - [log_pt, deta, sin(dphi), cos(dphi), log_m]
             }
 

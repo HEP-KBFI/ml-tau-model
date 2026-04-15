@@ -14,6 +14,7 @@ from mltau.tools.io.general import NpEncoder
 
 hep.style.use(hep.styles.CMS)
 matplotlib.rcParams["axes.unicode_minus"] = False
+plt.rcParams["mathtext.fontset"] = "stix"
 
 
 class TaggerEvaluator:
