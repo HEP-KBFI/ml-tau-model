@@ -1,4 +1,5 @@
 import warnings
+import logging
 import numpy as np
 import matplotlib.pyplot as plt
 from omegaconf import DictConfig
@@ -16,6 +17,12 @@ warnings.filterwarnings(
     message=".*invalid value encountered in multiply.*",
     category=RuntimeWarning,
 )
+warnings.filterwarnings(
+    "ignore",
+    message=".*invalid value encountered in divide.*",
+    category=RuntimeWarning,
+)
+logging.getLogger("matplotlib.mathtext").setLevel(logging.WARNING)
 
 
 def _log_single_variable(
@@ -26,6 +33,7 @@ def _log_single_variable(
     cfg: DictConfig,
     tb_logger,
     current_epoch: int,
+    reco_pred: np.ndarray | None = None,
 ):
     """Log response, resolution, 2D resolution, and bin distribution plots for one variable."""
     evaluator = k.RegressionEvaluator(
@@ -35,6 +43,15 @@ def _log_single_variable(
         algorithm="all",
         sample_name="all",
     )
+    reco_evaluator = None
+    if reco_pred is not None:
+        reco_evaluator = k.RegressionEvaluator(
+            prediction=reco_pred,
+            truth=truth,
+            bin_edges=var_cfg.bin_edges["all"],
+            algorithm="all",
+            sample_name="reco",
+        )
 
     response_lineplot = k.LinePlot(
         cfg=cfg,
@@ -49,6 +66,18 @@ def _log_single_variable(
     response_lineplot.add_line(
         evaluator.bin_centers, evaluator.responses, evaluator.algorithm, label=""
     )
+    if reco_evaluator is not None:
+        response_lineplot.ax.plot(
+            reco_evaluator.bin_centers,
+            reco_evaluator.responses,
+            label="Reco jet",
+            color="tab:orange",
+            ls="--",
+            lw=3,
+            marker="o",
+            ms=8,
+        )
+        response_lineplot.ax.legend()
     tb_logger.add_figure(
         f"kinematics/{var_name}/responses", response_lineplot.fig, current_epoch
     )
@@ -67,6 +96,18 @@ def _log_single_variable(
     resolution_lineplot.add_line(
         evaluator.bin_centers, evaluator.resolutions, evaluator.algorithm, label=""
     )
+    if reco_evaluator is not None:
+        resolution_lineplot.ax.plot(
+            reco_evaluator.bin_centers,
+            reco_evaluator.resolutions,
+            label="Reco jet",
+            color="tab:orange",
+            ls="--",
+            lw=3,
+            marker="o",
+            ms=8,
+        )
+        resolution_lineplot.ax.legend()
     tb_logger.add_figure(
         f"kinematics/{var_name}/resolutions", resolution_lineplot.fig, current_epoch
     )
@@ -95,6 +136,17 @@ def _log_single_variable(
     tb_logger.add_scalar(
         f"kinematics/{var_name}/response", evaluator.response, current_epoch
     )
+    if reco_evaluator is not None:
+        tb_logger.add_scalar(
+            f"kinematics/{var_name}/reco_resolution",
+            reco_evaluator.resolution,
+            current_epoch,
+        )
+        tb_logger.add_scalar(
+            f"kinematics/{var_name}/reco_response",
+            reco_evaluator.response,
+            current_epoch,
+        )
 
 
 def log_all_kinematics_metrics(
@@ -116,7 +168,7 @@ def log_all_kinematics_metrics(
     pred_pt = np.exp(signal_predictions[:, 0]) * reco.pt
     true_pt = np.exp(signal_targets[:, 0]) * reco.pt
     _log_single_variable(
-        pred_pt, true_pt, "pt", cfg.metrics.kinematics.pt, cfg, tb_logger, current_epoch
+        pred_pt, true_pt, "pt", cfg.metrics.kinematics.pt, cfg, tb_logger, current_epoch, reco_pred=np.array(reco.pt)
     )
 
     # --- eta (direct: index 1 is delta_eta = gen_eta - reco_eta) ---
@@ -130,6 +182,7 @@ def log_all_kinematics_metrics(
         cfg,
         tb_logger,
         current_epoch,
+        reco_pred=np.array(reco.eta),
     )
 
     # --- theta (derived from eta; radians → degrees) ---
@@ -137,6 +190,7 @@ def log_all_kinematics_metrics(
     true_theta_rad = 2 * np.arctan(np.exp(-true_eta))
     pred_theta_deg = np.rad2deg(pred_theta_rad)
     true_theta_deg = np.rad2deg(true_theta_rad)
+    reco_theta_deg = np.rad2deg(np.array(reco.theta))
     _log_single_variable(
         pred_theta_deg,
         true_theta_deg,
@@ -145,6 +199,7 @@ def log_all_kinematics_metrics(
         cfg,
         tb_logger,
         current_epoch,
+        reco_pred=reco_theta_deg,
     )
 
     # --- phi (indices 2,3 are sin/cos of delta_phi; radians → degrees) ---
@@ -166,6 +221,7 @@ def log_all_kinematics_metrics(
         cfg,
         tb_logger,
         current_epoch,
+        reco_pred=np.rad2deg(np.array(reco.phi)),
     )
 
     # --- m_vis (index 4 is log(m_gen / m_reco)) ---
@@ -179,6 +235,7 @@ def log_all_kinematics_metrics(
         cfg,
         tb_logger,
         current_epoch,
+        reco_pred=np.array(reco.mass),
     )
 
     # --- energy (derived from pt and theta) ---
@@ -192,6 +249,7 @@ def log_all_kinematics_metrics(
         cfg,
         tb_logger,
         current_epoch,
+        reco_pred=np.array(reco.energy),
     )
 
     # --- deltaR (predicted tau vs gen_tau, binned by true pT) ---
@@ -203,6 +261,15 @@ def log_all_kinematics_metrics(
     dr_cfg = cfg.metrics.kinematics.deltaR
     deltaR_evaluator = k.DeltaREvaluator(
         deltaR=deltaR,
+        pt_truth=np.array(true_pt),
+        bin_edges=cfg.metrics.kinematics.pt.bin_edges["all"],
+        algorithm="all",
+    )
+    reco_dphi_dr = np.array(reco.phi) - np.array(gen_tau.phi)
+    reco_dphi_dr = np.arctan2(np.sin(reco_dphi_dr), np.cos(reco_dphi_dr))
+    reco_deltaR = np.sqrt((np.array(reco.eta) - np.array(gen_tau.eta)) ** 2 + reco_dphi_dr**2)
+    reco_deltaR_evaluator = k.DeltaREvaluator(
+        deltaR=reco_deltaR,
         pt_truth=np.array(true_pt),
         bin_edges=cfg.metrics.kinematics.pt.bin_edges["all"],
         algorithm="all",
@@ -223,6 +290,17 @@ def log_all_kinematics_metrics(
         deltaR_evaluator.algorithm,
         label="",
     )
+    median_lineplot.ax.plot(
+        reco_deltaR_evaluator.bin_centers,
+        reco_deltaR_evaluator.medians,
+        label="Reco jet",
+        color="tab:orange",
+        ls="--",
+        lw=3,
+        marker="o",
+        ms=8,
+    )
+    median_lineplot.ax.legend()
     tb_logger.add_figure(
         "kinematics/deltaR/median_vs_pt_plot", median_lineplot.fig, current_epoch
     )
@@ -243,7 +321,13 @@ def log_all_kinematics_metrics(
         "kinematics/deltaR/median", deltaR_evaluator.median, current_epoch
     )
     tb_logger.add_scalar(
+        "kinematics/deltaR/reco_median", reco_deltaR_evaluator.median, current_epoch
+    )
+    tb_logger.add_scalar(
         "kinematics/deltaR/mean", float(np.mean(deltaR)), current_epoch
+    )
+    tb_logger.add_scalar(
+        "kinematics/deltaR/reco_mean", float(np.mean(reco_deltaR)), current_epoch
     )
     tb_logger.add_scalar(
         "kinematics/energy/mean_diff",

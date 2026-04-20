@@ -1,4 +1,3 @@
-import contextlib
 import torch
 import torch.nn as nn
 from mltau.models.ParticleTransformer import ParticleTransformer
@@ -72,13 +71,17 @@ class ParTau(ParticleTransformer):
             # Classification head for decay mode classification
             self.classification_head = nn.Linear(embed_dim, num_dm_classes)
         elif self.task == "kinematics":
-            # Original regression head kinematic reconstruction [pT_vis, theta, phi, m_vis]
-            # self.regression_head = nn.Linear(embed_dim, 4)
-            # Updated regression head: [log(pt_gen/pt_reco), delta_eta, sin(delta_phi), cos(delta_phi)]
-            self.regression_head = nn.Linear(embed_dim, 4)
+            # Regression head: [log(pt_gen/pt_reco), delta_eta, sin(delta_phi), cos(delta_phi), log(m_gen/m_reco)]
+            self.regression_head = nn.Linear(embed_dim, 5)
         elif self.task == "is_tau":
+            # Previous local implementation kept for quick rollback:
             # Binary head for tau-tagging
-            self.binary_head = nn.Linear(embed_dim, 1)
+            # self.binary_head = nn.Linear(embed_dim, 1)
+
+            # Tau-ID comparison setup aligned with ml-tau-reco:
+            # use a two-logit head so the task is treated as explicit
+            # two-class classification rather than one-logit sigmoid output.
+            self.binary_head = nn.Linear(embed_dim, 2)
         elif self.task == "charge":
             # Two-logit head to match the en-reg charge-classification setup
             self.binary_head = nn.Linear(embed_dim, 2)
@@ -98,10 +101,7 @@ class ParTau(ParticleTransformer):
         # cand_mask: (N, 1, P) -- real particle = 1, padded = 0
         cand_mask = cand_mask.type(torch.bool)
         padding_mask = ~cand_mask.squeeze(1)  # (N, 1, P) -> (N, P)
-        amp_ctx = (
-            torch.amp.autocast("cuda") if self.use_amp else contextlib.nullcontext()
-        )
-        with amp_ctx:
+        with torch.amp.autocast("cuda", enabled=self.use_amp):
             num_particles = cand_features.size(-1)
 
             # input embedding
@@ -138,16 +138,19 @@ class ParTau(ParticleTransformer):
 
             if self.task == "decay_mode":
                 output = (
-                    torch.softmax(self.classification_head(x_cls), axis=-1),
-                )  # (N, num_dm_classes)
+                    self.classification_head(x_cls),
+                )  # (N, num_dm_classes) raw logits
             elif self.task == "kinematics":
-                # Original regression output [pT_vis, theta, phi, m_vis]
-                # output = (self.regression_head(x_cls),)  # (N, 4)
-                # Updated regression output [log(pt_gen/pt_reco), delta_eta, sin(delta_phi), cos(delta_phi)]
-                output = (self.regression_head(x_cls),)  # (N, 4)
+                # Regression output: [log(pt_gen/pt_reco), delta_eta, sin(delta_phi), cos(delta_phi), log(m_gen/m_reco)]
+                output = (self.regression_head(x_cls),)  # (N, 5)
             elif self.task == "is_tau":
-                # Binary head for tau-tagging
-                output = (torch.sigmoid(self.binary_head(x_cls)).squeeze(-1),)  # (N,)
+                # Previous local implementation kept for quick rollback:
+                # Return logits; sigmoid is applied outside for logging and evaluation.
+                # output = (self.binary_head(x_cls).squeeze(-1),)  # (N,)
+
+                # Tau-ID comparison setup aligned with ml-tau-reco:
+                # return two-class raw logits.
+                output = (self.binary_head(x_cls),)  # (N, 2)
             elif self.task == "charge":
                 # Two-class logits for charge classification
                 output = (self.binary_head(x_cls),)  # (N, 2)
