@@ -215,6 +215,8 @@ def create_predictions_file(
         all_gen_jet_tau_decaymode,
         all_gen_jet_tau_charge,
     ) = ([], [], [], [], [])
+    all_cand_charges = []
+    all_cand_p4 = []
     all_post = []
 
     for i, batch in enumerate(dataloader):
@@ -228,12 +230,58 @@ def create_predictions_file(
         )
         all_gen_jet_tau_charge.append(inputs.target["charge"].detach().cpu().numpy())
 
+        # --- Candidate mask: 1 for real, 0 for padded ---
+        cand_features = (
+            inputs.cand_features.detach().cpu().numpy()
+        )  # (n_jets, n_cands, n_features)
+        cand_kinematics = (
+            inputs.cand_kinematics_pxpypze.detach().cpu().numpy()
+        )  # (n_jets, n_cands, 4)
+        cand_mask = (
+            inputs.cand_mask.detach().cpu().numpy().astype(bool)
+        )  # (n_jets, n_cands)
+
+        # --- Feature index for charge ---
+        charge_idx = -1  # <-- Adjust if charge is not last feature
+        batch_cand_charges = []
+        batch_cand_p4 = []
+        n_jets, n_cands, _ = cand_features.shape
+        for jet_idx in range(n_jets):
+            mask = cand_mask[jet_idx]  # (n_cands,)
+            real_idx = np.where(mask)[0]
+            if len(real_idx) == 0:
+                batch_cand_charges.append(np.array([]))
+                batch_cand_p4.append(
+                    {
+                        "px": np.array([]),
+                        "py": np.array([]),
+                        "pz": np.array([]),
+                        "energy": np.array([]),
+                    }
+                )
+                continue
+            charges = cand_features[jet_idx, real_idx, charge_idx]
+            kin = cand_kinematics[jet_idx, real_idx, :]
+            batch_cand_charges.append(charges)
+            batch_cand_p4.append(
+                {
+                    "px": kin[:, 0],
+                    "py": kin[:, 1],
+                    "pz": kin[:, 2],
+                    "energy": kin[:, 3],
+                }
+            )
+        all_cand_charges.append(ak.Array(batch_cand_charges))
+        all_cand_p4.append(ak.Array(batch_cand_p4))
+
     # Flatten
     gen_jet_p4 = ak.concatenate(all_gen_jet_p4)
     reco_jet_p4 = ak.concatenate(all_reco_jet_p4)
     gen_jet_tau_p4 = ak.concatenate(all_gen_jet_tau_p4)
     gen_jet_tau_decaymode = np.concatenate(all_gen_jet_tau_decaymode)
     gen_jet_tau_charge = np.concatenate(all_gen_jet_tau_charge)
+    cand_charges = ak.concatenate(all_cand_charges)
+    cand_p4 = ak.concatenate(all_cand_p4)
 
     # Postprocess predictions (predictions is a list of dicts)
     # Assume predictions[i] matches batch i
@@ -254,6 +302,8 @@ def create_predictions_file(
             "gen_jet_tau_p4": gen_jet_tau_p4,
             "gen_jet_tau_decaymode": gen_jet_tau_decaymode,
             "gen_jet_tau_charge": gen_jet_tau_charge,
+            "cand_charges": cand_charges,
+            "cand_p4": cand_p4,
             **{k: post[k] for k in post.fields},
         },
         depth_limit=1,
