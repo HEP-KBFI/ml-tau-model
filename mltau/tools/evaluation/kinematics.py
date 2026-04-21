@@ -10,6 +10,7 @@ import matplotlib.ticker as ticker
 from mltau.tools.io.general import NpEncoder
 
 hep.style.use(hep.styles.CMS)
+plt.rcParams["mathtext.fontset"] = "stix"
 
 
 def plot_regression_confusion_matrix(

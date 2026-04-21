@@ -396,7 +396,7 @@ class ParTDataModule(LightningDataModule):
                 ),
                 pin_memory=True,
             )
-        elif stage == "test":
+        elif stage == "test" or stage == "predict":
             test_row_groups = self.get_dataset_rowgroups(dataset_type="test")
             self.test_dataset = ParticleTransformerDataset(
                 row_groups=test_row_groups, cfg=self.cfg, batch_size=batch_size
@@ -423,4 +423,7 @@ class ParTDataModule(LightningDataModule):
         return self.val_loader
 
     def test_dataloader(self):
+        return self.test_loader
+
+    def predict_dataloader(self):
         return self.test_loader

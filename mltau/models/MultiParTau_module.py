@@ -40,7 +40,7 @@ class ParTauModule(L.LightningModule):
         #     reduction="none", gamma=0.0, alpha=0.5
         # )  # class balance, so one could use BCE with sigmoid also.
         self.tagging_loss = SigmoidFocalLoss(
-            alpha=0.75, gamma=0.5, reduction="none"
+            alpha=0.2, gamma=2.0, reduction="none"
         )  # class imbalance
         self.decay_mode_loss = nn.CrossEntropyLoss(reduction="none")
         self.kinematics_loss = nn.HuberLoss(reduction="none", delta=1.0)
@@ -61,6 +61,7 @@ class ParTauModule(L.LightningModule):
         )
         for key, value in metrics.items():
             self.training_loss_accumulator[key].append(value.detach())
+
         self.log(
             "LR",
             self.optimizers().param_groups[0]["lr"],
@@ -72,16 +73,39 @@ class ParTauModule(L.LightningModule):
         return metrics["loss"]
 
     def predict_step(self, batch, _batch_idx):
-        return self.forward(batch)[0]
+        """
+        Runs inference for a batch during prediction (trainer.predict()).
+        Returns only the predictions dict (no losses/metrics).
+        """
+        # Unpack batch if needed (BatchInputs or tuple)
+        if isinstance(batch, (list, tuple)):
+            # Standard tuple from DataLoader
+            predictions, _, _ = self.forward(batch)
+        else:
+            # Already a BatchInputs or similar
+            predictions, _, _ = self.forward((batch,))
+        return predictions
 
     def test_step(self, batch, _batch_idx):
         return self.forward(batch)[0]
 
     def configure_optimizers(self):
         # AdamW is generally preferred for transformer architectures
+        # Use a 10x lower LR for log_var parameters to prevent them from
+        # racing ahead of the main network and collapsing tasks
+        log_var_params = [
+            self.log_var_tagging,
+            self.log_var_charge,
+            self.log_var_decay_mode,
+            self.log_var_kinematics,
+        ]
+        log_var_param_ids = {id(p) for p in log_var_params}
+        main_params = [p for p in self.parameters() if id(p) not in log_var_param_ids]
         optimizer = torch.optim.AdamW(
-            params=self.parameters(),
-            lr=self.cfg.training.lr,
+            [
+                {"params": main_params, "lr": self.cfg.training.lr},
+                {"params": log_var_params, "lr": self.cfg.training.lr * 0.1},
+            ],
         )
         # if self.cfg.training.optimizer.use_lookahead:
         #     optimizer = Lookahead(base_optimizer=optimizer, k=6, alpha=0.5)
@@ -139,7 +163,9 @@ class ParTauModule(L.LightningModule):
 
         return predictions
 
-    def _calculate_baseline_charges(self, inputs):
+    def _calculate_baseline_charges(
+        self, inputs
+    ):  # TODO: Should maybe add as a separate "algorithm" under evaluation and merge with inference?
         """Calculate baseline jet charge using Q*kappa weighting."""
         # Extract candidate data
         cand_charges = inputs.cand_features[:, 7, :]  # Feature index 7 is charge
@@ -247,18 +273,23 @@ class ParTauModule(L.LightningModule):
 
         if not is_tau_mask.any():
             # Only tagging loss when no tau jets present
-            # Apply uncertainty weighting: L = (1/(2*exp(log_var))) * loss + 0.5 * log_var
-            precision = torch.exp(-self.log_var_tagging)
+            # Apply uncertainty weighting: L = (1/(2*exp(log_var))) * loss + 1.0 * log_var
+            log_var_tag_clamped = self.log_var_tagging.clamp(min=-4.0, max=4.0)
+            precision = torch.exp(-log_var_tag_clamped)
             weighted_tagging_loss = (
                 0.5 * precision * tau_id_loss_per_jet * weights
-            ).mean() + 0.5 * self.log_var_tagging
+            ).mean() + 1.0 * log_var_tag_clamped
 
             return {
                 "tau_id_loss": tau_id_loss_per_jet.mean(),
                 "charge_loss": tau_id_loss_per_jet.new_zeros(()),
                 "decay_mode_loss": tau_id_loss_per_jet.new_zeros(()),
                 "kinematics_loss": tau_id_loss_per_jet.new_zeros(()),
-                "loss": weighted_tagging_loss,
+                "tau_id_loss_weighted": weighted_tagging_loss.squeeze(),
+                "charge_loss_weighted": tau_id_loss_per_jet.new_zeros(()),
+                "decay_mode_loss_weighted": tau_id_loss_per_jet.new_zeros(()),
+                "kinematics_loss_weighted": tau_id_loss_per_jet.new_zeros(()),
+                "loss": weighted_tagging_loss.squeeze(),
             }
 
         # Per-jet losses for signal-only heads — shape [N_signal]
@@ -273,39 +304,52 @@ class ParTauModule(L.LightningModule):
         )
 
         # Apply uncertainty-based weighting following Kendall et al.
-        # L = (1/(2*exp(log_var))) * loss + 0.5 * log_var
+        # L = (1/(2*exp(log_var))) * loss + 1.0 * log_var  (beta=1.0 to penalise task collapse)
+        # Clamp log_var to prevent task collapse (network zeroing out hard tasks)
+        # Tagging is learning well so allow wider range; signal tasks clamped tighter
+        # to enforce minimum precision floor: exp(-1.5) ≈ 0.22 for signal tasks
+        log_var_tagging = self.log_var_tagging.clamp(min=-4.0, max=4.0)
+        log_var_charge = self.log_var_charge.clamp(min=-4.0, max=1.5)
+        log_var_decay_mode = self.log_var_decay_mode.clamp(min=-4.0, max=1.5)
+        log_var_kinematics = self.log_var_kinematics.clamp(min=-4.0, max=1.5)
 
         # Calculate precisions (inverse variances)
-        precision_tagging = torch.exp(-self.log_var_tagging)
-        precision_charge = torch.exp(-self.log_var_charge)
-        precision_dm = torch.exp(-self.log_var_decay_mode)
-        precision_kin = torch.exp(-self.log_var_kinematics)
+        precision_tagging = torch.exp(-log_var_tagging)
+        precision_charge = torch.exp(-log_var_charge)
+        precision_dm = torch.exp(-log_var_decay_mode)
+        precision_kin = torch.exp(-log_var_kinematics)
 
         # Apply uncertainty weighting to tagging task (with classification weights)
         weighted_tagging_loss = (
             0.5 * precision_tagging * tau_id_loss_per_jet * weights
-        ).mean() + 0.5 * self.log_var_tagging
+        ).mean() + 1.0 * log_var_tagging
 
         # Apply uncertainty weighting to signal tasks (no classification weights)
         weighted_charge_loss = (
             0.5 * precision_charge * charge_loss_per_jet
-        ).mean() + 0.5 * self.log_var_charge
+        ).mean() + 1.0 * log_var_charge
         weighted_dm_loss = (
             0.5 * precision_dm * dm_loss_per_jet
-        ).mean() + 0.5 * self.log_var_decay_mode
+        ).mean() + 1.0 * log_var_decay_mode
         weighted_kin_loss = (
             0.5 * precision_kin * kin_loss_per_jet
-        ).mean() + 0.5 * self.log_var_kinematics
+        ).mean() + 1.0 * log_var_kinematics
 
         signal_losses = weighted_charge_loss + weighted_dm_loss + weighted_kin_loss
         loss = weighted_tagging_loss + signal_losses
+
+        # No degradation correction: pure uncertainty weighting with clamped log_var
 
         return {
             "tau_id_loss": tau_id_loss_per_jet.mean(),
             "charge_loss": charge_loss_per_jet.mean(),
             "decay_mode_loss": dm_loss_per_jet.mean(),
             "kinematics_loss": kin_loss_per_jet.mean(),
-            "loss": loss,
+            "tau_id_loss_weighted": weighted_tagging_loss.squeeze(),
+            "charge_loss_weighted": weighted_charge_loss.squeeze(),
+            "decay_mode_loss_weighted": weighted_dm_loss.squeeze(),
+            "kinematics_loss_weighted": weighted_kin_loss.squeeze(),
+            "loss": loss.squeeze(),
         }
 
     def validation_step(self, batch, _batch_idx):
@@ -340,6 +384,10 @@ class ParTauModule(L.LightningModule):
                 "charge_loss",
                 "decay_mode_loss",
                 "kinematics_loss",
+                "tau_id_loss_weighted",
+                "charge_loss_weighted",
+                "decay_mode_loss_weighted",
+                "kinematics_loss_weighted",
             ]
         }
 
@@ -468,6 +516,10 @@ class ParTauModule(L.LightningModule):
                 "charge_loss",
                 "decay_mode_loss",
                 "kinematics_loss",
+                "tau_id_loss_weighted",
+                "charge_loss_weighted",
+                "decay_mode_loss_weighted",
+                "kinematics_loss_weighted",
             ]
         }
 
