@@ -80,10 +80,11 @@ class ParTauModule(L.LightningModule):
         # Unpack batch if needed (BatchInputs or tuple)
         if isinstance(batch, (list, tuple)):
             # Standard tuple from DataLoader
-            predictions, _, _ = self.forward(batch)
+            logits, _, _ = self.forward(batch)
         else:
             # Already a BatchInputs or similar
-            predictions, _, _ = self.forward((batch,))
+            logits, _, _ = self.forward((batch,))
+        predictions = self._convert_logits_to_predictions(logits)
         return predictions
 
     def test_step(self, batch, _batch_idx):

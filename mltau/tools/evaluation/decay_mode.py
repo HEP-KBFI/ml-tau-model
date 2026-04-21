@@ -4,7 +4,10 @@ import numpy as np
 import mplhep as hep
 from sklearn import metrics
 import matplotlib.pyplot as plt
+from omegaconf import DictConfig
 from mltau.tools.io.general import NpEncoder
+from matplotlib.ticker import FormatStrFormatter
+from sklearn.metrics import precision_score, f1_score
 
 hep.style.use(hep.styles.CMS)
 plt.rcParams["mathtext.fontset"] = "stix"
@@ -67,7 +70,7 @@ class DecayModeEvaluator:
 
     def __init__(
         self,
-        predicted: np.array,
+        pred_proba: np.array,
         truth: np.array,
         output_dir: str = "",
         sample: str = "all",
@@ -78,8 +81,9 @@ class DecayModeEvaluator:
             os.makedirs(self.output_dir, exist_ok=True)
         self.sample = sample
         self.algorithm = algorithm
-        self.predicted = predicted
-        self.truth = truth
+        self.pred_proba = pred_proba
+        self.predicted = np.argmax(pred_proba, axis=-1)
+        self.truth = np.argmax(truth, axis=-1)
         self.confusion_matrix = metrics.confusion_matrix(self.truth, self.predicted)
         self.normalized_confusion_matrix = metrics.confusion_matrix(
             self.truth, self.predicted, normalize="true"
@@ -92,10 +96,16 @@ class DecayModeEvaluator:
             11: r"$h^{\pm}h^{\mp}h^{\pm}+\geq\pi^0$",
             15: "Rare",
         }
+        self.inverse_mapping = {
+            i: key for i, key in enumerate(self._decay_mode_name_mapping.keys())
+        }
         self.categories = list(self._decay_mode_name_mapping.values())
         self.general_metrics, self.class_metrics = self._calculate_performance_metrics()
+        self.class_performances = self.calculate_class_wise_metrics()
 
-    def plot_confusion_matrix(self, output_path: str = ""):
+    def plot_confusion_matrix(
+        self, output_path: str = ""
+    ):  # TODO: Remove the duplicate
         fig, ax = visualize_confusion_matrix(
             histogram=self.normalized_confusion_matrix,
             categories=self.categories,
@@ -189,7 +199,7 @@ class DecayModeEvaluator:
         print("----------------------------------------")
         print(json.dumps(self.general_metrics, indent=4, cls=NpEncoder))
 
-    def save_performance(self):
+    def save_performance(self):  # TODO: Saving to the MultiEvaluator maybe?
         class_metrics_output_path = os.path.join(
             self.output_dir, f"{self.sample}_{self.algorithm}_class_metrics.json"
         )
@@ -207,6 +217,34 @@ class DecayModeEvaluator:
         )
         self.plot_confusion_matrix(output_path=confusion_matrix_output_path)
 
+    def calculate_class_wise_metrics(self):
+        return {
+            "F1": f1_score(y_true=self.truth, y_pred=self.predicted, average=None),
+            "precision": precision_score(
+                y_true=self.truth, y_pred=self.predicted, average=None
+            ),
+        }
+
+
+class ConfusionMatrix:
+    def __init__(self, evaluator: DecayModeEvaluator):
+        self.evaluator = evaluator
+        self.fig, self.ax = self.plot()
+
+    def plot(self):
+        fig, ax = visualize_confusion_matrix(
+            histogram=self.evaluator.normalized_confusion_matrix,
+            categories=self.evaluator.categories,
+        )
+        return fig, ax
+
+    def save(self, output_dir):
+        output_path = os.path.join(
+            output_dir, f"decay_mode_cm_{self.evaluator.algorithm}.pdf"
+        )
+        self.fig.savefig(output_path, format="pdf")
+        plt.close("all")
+
 
 # Example use:
 #     dm_evaluator = DecayModeEvaluator(true_classes, pred_classes, '/path/to/output')
@@ -222,17 +260,16 @@ class DecayModeROCPlot:
 
     COLORS = ["#e41a1c", "#377eb8", "#4daf4a", "#984ea3", "#ff7f00", "#a65628"]
 
-    def __init__(
-        self, predictions_proba: np.ndarray, targets: np.ndarray, categories: list
-    ):
+    def __init__(self, evaluator: DecayModeEvaluator):
         """Args:
         predictions_proba: (N, num_classes) softmax probability array.
         targets: (N,) integer class-index array.
         categories: list of class label strings in class-index order.
         """
-        self.predictions_proba = np.asarray(predictions_proba)
-        self.targets = np.asarray(targets)
-        self.categories = categories
+        self.evaluator = evaluator
+        self.predictions_proba = np.asarray(evaluator.pred_proba)
+        self.targets = np.asarray(evaluator.truth)
+        self.categories = evaluator.categories
         self.fig, self.ax = self._make_axes()
         self._plot_roc_curves()
 
@@ -262,6 +299,129 @@ class DecayModeROCPlot:
             self.ax.plot(fpr, tpr, label=label, color=color, lw=2)
         self.ax.legend(prop={"size": 14}, loc="lower right")
 
+    def save(self, output_dir: str):
+        output_path = os.path.join(
+            output_dir, f"decay_mode_ROC_{self.evaluator.algorithm}.pdf"
+        )
+        self.fig.savefig(output_path, bbox_inches="tight")
+        plt.close("all")
 
-#     dm_evaluator.plot_confusion_matrix()
-#     dm_evaluator.save_performance()
+
+class DecayModeComparisonPlot:
+    def __init__(
+        self,
+        cfg,
+        ymin: float = 0.0,
+        ymax: float = 1.0,
+        figsize: tuple = (10, 10),
+        metric: str = "F1",
+    ):
+        self.cfg = cfg
+        self.ymin = ymin
+        self.ymax = ymax
+        self.figsize = figsize
+        self.metric = metric
+        self.decay_modes = {
+            0: {"label": r"$h^\pm$", "PDG_ratio": 0.1777},
+            1: {"label": r"$h^\pm+\pi^0$", "PDG_ratio": 0.4002},
+            2: {"label": r"$h^\pm+\geq2\pi^0$", "PDG_ratio": 0.1668},
+            3: {"label": r"$h^\pm h^\mp h^\pm$", "PDG_ratio": 0.1513},
+            4: {
+                "label": r"$h^\pm h^\mp h^\pm$" "\n" r"$+\geq\pi^0$",
+                "PDG_ratio": 0.0816,
+            },
+            5: {"label": "Rare", "PDG_ratio": 0.0224},
+        }
+        self.fig, self.ax = self.plot()
+
+    def plot(self):
+        x = range(len(self.decay_modes.keys()))
+        fig, ax = plt.subplots(figsize=self.figsize)
+        ax.set_xlabel("Decay Modes")
+        ax.set_ylabel(self.metric, x=1.05)
+        # ax.set_title(f"Classification Precision of the DMs for {dataset}", y=1.05)
+        ax.set_xticks(x)
+        ax.tick_params(
+            axis="x", which="both", bottom=False, top=False, labelbottom=True
+        )
+        ax.tick_params(axis="y", which="both", left=True, right=False, labelleft=True)
+        ax.yaxis.set_major_formatter(FormatStrFormatter("%.2f"))
+        ax.set_xticklabels(
+            [info["label"] for info in self.decay_modes.values()], rotation=45
+        )
+        # Vertical lines between the DMs
+        for i in range(len(x)):
+            ax.axvline(i - 0.5, color="gray", linestyle="--", linewidth=0.5, zorder=0)
+        return fig, ax
+
+    def _annotate_points(self, x, y, offset):
+        # Function to add labels to the datapoints
+        for ii, (i, j) in enumerate(zip(x, y)):
+            self.ax.annotate(
+                f"{j:.3f}",
+                (i, j),
+                textcoords="offset points",
+                xytext=offset,
+                ha="center",
+                va="bottom",
+                fontsize=9,
+            )
+
+    def add_line(self, evaluator, offset):
+        self._annotate_points(
+            np.array(range(len(self.decay_modes.keys()))) + offset,
+            evaluator.class_performances[self.metric],
+            (-18, -4),
+        )
+        self.ax.legend(
+            loc="lower left", shadow=True, fancybox=True, framealpha=1, borderpad=1
+        )
+
+    def save(self, output_dir: str):
+        self.fig.tight_layout()
+        self.fig.savefig(
+            os.path.join(output_dir, f"decay_mode_{self.metric}.pdf"),
+            bbox_inches="tight",
+            format="pdf",
+        )
+        plt.close("all")
+
+
+def get_offsets(n: int):
+    """Calculates the offsets for n nuber of algorithms"""
+    if n < 6:
+        delta_offset = 0.2
+    elif n < 12:
+        delta_offset = 0.1
+    else:
+        raise ValueError("Having more than 12 algorithms will bee too crowded")
+    left_most_bin = (1 - n) * (delta_offset / 2)
+    offsets = [left_most_bin + (i * delta_offset) for i in range(n)]
+    return offsets
+
+
+class DecayModeMultiEvaluator:
+    def __init__(self, output_dir: str, cfg: DictConfig, sample: str):
+        self.output_dir = output_dir
+        self.cfg = cfg
+        self.sample = sample
+        self.cfg = cfg
+        self.dmrps = []
+        self.cms = []
+        self.dmcp = DecayModeComparisonPlot(
+            cfg=self.cfg, ymin=0.0, ymax=1.0, figsize=(10, 10), metric="F1"
+        )
+
+    def combine_results(self, evaluators: list):
+        offsets = get_offsets(len(evaluators))
+        for i, evaluator in enumerate(evaluators):
+            self.cms.append(ConfusionMatrix(evaluator=evaluator))
+            self.dmrps.append(DecayModeROCPlot(evaluator=evaluator))
+            self.dmcp.add_line(evaluator=evaluator, offset=offsets[i])
+
+    def save(self):
+        for drmp in self.dmrps:
+            drmp.save(output_dir=self.output_dir)
+        for cm in self.cms:
+            cm.save(output_dir=self.output_dir)
+        self.dmcp.save(output_dir=self.output_dir)

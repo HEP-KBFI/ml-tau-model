@@ -40,10 +40,10 @@ from mltau.tools.io.general import BatchInputs
 from mltau.tools.io.preprocessed_ParTau_dataloader import ParticleTransformerDataset
 
 
-def softmax(x):
-    # x shape: (N, 6)
-    e_x = np.exp(x - np.max(x, axis=1, keepdims=True))
-    return e_x / np.sum(e_x, axis=1, keepdims=True)
+# def softmax(x):
+#     # x shape: (N, 6)
+#     e_x = np.exp(x - np.max(x, axis=1, keepdims=True))
+#     return e_x / np.sum(e_x, axis=1, keepdims=True)
 
 
 def to_np(x):
@@ -62,7 +62,7 @@ def decode_kinematic_predictions(predictions: dict, reco_jet_p4s: ak.Array) -> a
     reco_mass = np.asarray(reco.mass)
 
     # --- decode kinematics ---
-    kin = to_np(predictions["kinematics"])  # (N, 5)
+    kin = to_np(predictions)  # (N, 5)
 
     pred_pt = np.exp(kin[:, 0]) * reco_pt
     pred_eta = kin[:, 1] + reco_eta
@@ -88,7 +88,8 @@ def decode_kinematic_predictions(predictions: dict, reco_jet_p4s: ak.Array) -> a
 
 def decode_decay_mode_predictions(predictions):
     # --- decode decay mode ---
-    dm_probs = softmax(to_np(predictions["decay_mode"]))  # (N, 6)
+    dm_probs = to_np(predictions)  # (N, 6)
+    # dm_probs = softmax(to_np(predictions["decay_mode"]))  # (N, 6)
     dm_idx = np.argmax(dm_probs, axis=-1)  # (N,) indices 0-5
     dm_class = one_hot_decoding(dm_idx)  # (N,) e.g. {0,1,2,10,11,15}
     return dm_class, dm_probs

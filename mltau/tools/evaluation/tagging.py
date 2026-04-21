@@ -146,7 +146,7 @@ class TaggerEvaluator:
         return efficiencies, numerator_mask, denominator_mask
 
     def _calculate_wps(self):
-        working_points = {"Loose": 0.99, "Medium": 0.95, "Tight": 0.90}  # Efficiencies
+        working_points = {"Loose": 0.7, "Medium": 0.8, "Tight": 0.9}  # Efficiencies
         wp_values = {}
         for wp_name, wp_value in working_points.items():
             diff = abs(np.array(self.efficiencies) - wp_value)
@@ -415,7 +415,7 @@ class TaggerMultiEvaluator:
                 "Tight": evaluator.tight_wp,
             }
 
-    def save_results(self):
+    def save(self):
         for metric in self.metrics:
             fr_output_path = os.path.join(self.output_dir, f"{metric}_fakerates.pdf")
             self.fakerate_plots[metric].save(fr_output_path)

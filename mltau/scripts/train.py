@@ -4,7 +4,7 @@ import lightning as L
 import numpy as np
 
 from omegaconf import DictConfig
-from lightning.pytorch.loggers import CSVLogger, TensorBoardLogger  # , CometLogger
+from lightning.pytorch.loggers import TensorBoardLogger  # , CometLogger
 from lightning.pytorch.callbacks import TQDMProgressBar, ModelCheckpoint
 
 from mltau.tools.io import preprocessed_ParTau_dataloader as dl
