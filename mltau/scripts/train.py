@@ -7,7 +7,6 @@ from omegaconf import DictConfig
 from lightning.pytorch.loggers import CSVLogger, TensorBoardLogger  # , CometLogger
 from lightning.pytorch.callbacks import TQDMProgressBar, ModelCheckpoint
 
-from mltau.tools.io import ParT_dataloader as dl
 from mltau.tools.io import preprocessed_ParTau_dataloader as dl
 from mltau.models import MultiParTau_module, SingleParTau_module
 from mltau.tools.evaluation import inference

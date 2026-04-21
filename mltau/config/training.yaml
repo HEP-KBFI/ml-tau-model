@@ -5,7 +5,7 @@ training:
     name: MultiParTau  # MultiParTau | SingleParTau
     task: is_tau       # SingleParTau only: is_tau | charge | decay_mode | kinematics
   trainer:
-    max_epochs: 250
+    max_epochs: 100
 
   task_weights:
     tau_id: 1.0

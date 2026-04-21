@@ -1,11 +1,13 @@
 import torch
 import awkward as ak
+import numpy as np
 import torch.nn as nn
 import lightning as L
 from omegaconf import DictConfig
 
 from mltau.tools.io.general import BatchInputs
-from mltau.tools.losses import SigmoidFocalLoss
+from mltau.tools import general as g
+from mltau.tools.losses import FocalLoss, SigmoidFocalLoss
 from mltau.tools.logging import tagging, kinematics, decay_mode, charge_id
 from mltau.models.SingleParTau import ParTau
 
@@ -19,19 +21,53 @@ class ParTauModule(L.LightningModule):
             raise ValueError(f"task must be one of {VALID_TASKS}, got '{task}'")
         self.cfg = cfg
         self.task = task
-        self.ParTau = ParTau(
-            input_dim=input_dim,
-            task=task,
-            num_dm_classes=num_dm_classes,
-            num_layers=2,
-            embed_dims=[256, 512, 256],
-            use_pre_activation_pair=False,
-            for_inference=False,
-            use_amp=False,
-            metric="eta-phi",
-        )
+        # Current local SingleParTau configuration kept for reference:
+        # self.ParTau = ParTau(
+        #     input_dim=input_dim,
+        #     task=task,
+        #     num_dm_classes=num_dm_classes,
+        #     num_layers=2,
+        #     embed_dims=[256, 512, 256],
+        #     use_pre_activation_pair=False,
+        #     for_inference=False,
+        #     use_amp=False,
+        #     metric="eta-phi",
+        # )
+        #
+        # Tau-ID comparison setup:
+        # - keep the existing local configuration for non-tagging tasks
+        # - switch tau-ID to the deeper / narrower ml-tau-reco-style backbone
         if task == "is_tau":
-            self.loss_fn = SigmoidFocalLoss(alpha=0.25, gamma=2.0, reduction="none")
+            self.ParTau = ParTau(
+                input_dim=input_dim,
+                task=task,
+                num_dm_classes=num_dm_classes,
+                num_layers=8,
+                embed_dims=[128, 512, 128],
+                use_pre_activation_pair=False,
+                for_inference=False,
+                use_amp=False,
+                metric="eta-phi",
+            )
+        else:
+            self.ParTau = ParTau(
+                input_dim=input_dim,
+                task=task,
+                num_dm_classes=num_dm_classes,
+                num_layers=2,
+                embed_dims=[256, 512, 256],
+                use_pre_activation_pair=False,
+                for_inference=False,
+                use_amp=False,
+                metric="eta-phi",
+            )
+        if task == "is_tau":
+            # Previous local implementation kept for quick rollback:
+            # self.loss_fn = SigmoidFocalLoss(alpha=0.75, gamma=2.0, reduction="none")
+
+            # Tau-ID comparison setup aligned with ml-tau-reco, but without
+            # the external 10:1 class-weighting scheme for now.
+            self.loss_fn = FocalLoss(alpha=None, gamma=2.0, reduction="none")
         elif task == "charge":
             self.loss_fn = nn.CrossEntropyLoss(reduction="none")
         elif task == "decay_mode":
@@ -53,6 +89,7 @@ class ParTauModule(L.LightningModule):
                     "kinematics_delta_eta_loss",
                     "kinematics_sin_delta_phi_loss",
                     "kinematics_cos_delta_phi_loss",
+                    "kinematics_log_mass_loss",
                 ]
             )
         return {key: [] for key in keys}
@@ -64,17 +101,13 @@ class ParTauModule(L.LightningModule):
         )
         for key, value in metrics.items():
             self.training_loss_accumulator[key].append(value.detach())
-        inputs = BatchInputs(*batch)
-        if batch_idx % 100 == 0:  # Reduced frequency: store every 100th batch to save memory
-            self.training_outputs.append(
-                {
-                    "predictions": predictions,
-                    "targets": targets,
-                    "gen_jet_p4s": inputs.gen_jet_p4s,
-                    "reco_jet_p4s": inputs.reco_jet_p4s,
-                    "gen_jet_tau_p4s": inputs.gen_jet_tau_p4s,
-                }
-            )
+        self.log(
+            "LR",
+            self.optimizers().param_groups[0]["lr"],
+            on_step=True,
+            on_epoch=False,
+            prog_bar=True,
+        )
         return metrics["loss"]
 
     def predict_step(self, batch, _batch_idx):
@@ -113,6 +146,53 @@ class ParTauModule(L.LightningModule):
         )
         return [optimizer], [{"scheduler": lr_scheduler, "interval": "step"}]
 
+    def _calculate_baseline_charges(self, inputs):
+        """Calculate baseline jet charge using Q*kappa weighting."""
+        cand_charges = inputs.cand_features[:, 7, :]
+        cand_mask = inputs.cand_mask[:, 0, :]
+
+        px = inputs.cand_kinematics_pxpypze[:, 0, :]
+        py = inputs.cand_kinematics_pxpypze[:, 1, :]
+        cand_pts = torch.sqrt(px**2 + py**2)
+
+        try:
+            reco_jet_p4s_ak = ak.Array(inputs.reco_jet_p4s)
+            reco_jet_p4s = g.reinitialize_p4(reco_jet_p4s_ak)
+
+            pt_values = reco_jet_p4s.pt
+            if hasattr(pt_values, "to_numpy"):
+                pt_numpy = pt_values.to_numpy()
+            else:
+                pt_numpy = ak.to_numpy(pt_values)
+
+            if pt_numpy.ndim == 0:
+                pt_numpy = np.array([pt_numpy])
+            elif pt_numpy.ndim > 1:
+                pt_numpy = pt_numpy.flatten()[: len(cand_charges)]
+
+            jet_pts = torch.tensor(
+                pt_numpy, dtype=torch.float32, device=cand_charges.device
+            )
+
+            if len(jet_pts) != len(cand_charges):
+                if len(jet_pts) == 1:
+                    jet_pts = jet_pts.repeat(len(cand_charges))
+                else:
+                    jet_pts = jet_pts[: len(cand_charges)]
+        except Exception:
+            jet_pts = torch.sum(cand_pts * cand_mask, dim=1)
+
+        cand_charges_masked = cand_charges * cand_mask
+        cand_pts_masked = cand_pts * cand_mask
+
+        kappa = 0.2
+        numer = torch.sum(cand_charges_masked * (cand_pts_masked**kappa), dim=1)
+        denom = jet_pts**kappa
+        denom = torch.where(denom == 0, torch.ones_like(denom), denom)
+
+        baseline_charges = numer / denom
+        return baseline_charges.detach().cpu().numpy()
+
     
     # def configure_optimizers(self):
     #     optimizer = torch.optim.RAdam(
@@ -142,6 +222,23 @@ class ParTauModule(L.LightningModule):
                 self.task: torch.softmax(charge_logits, dim=-1)[:, 1],
                 "charge_logits": charge_logits,
             }
+        elif self.task == "decay_mode":
+            decay_mode_logits = model_output[0]
+            predictions = {
+                self.task: torch.softmax(decay_mode_logits, dim=-1),
+                "decay_mode_logits": decay_mode_logits,
+            }
+        elif self.task == "is_tau":
+            tau_logits = model_output[0]
+            # Previous local implementation kept for quick rollback:
+            # predictions = {
+            #     self.task: torch.sigmoid(tau_logits),
+            #     "is_tau_logits": tau_logits,
+            # }
+            predictions = {
+                self.task: torch.softmax(tau_logits, dim=-1)[:, 1],
+                "is_tau_logits": tau_logits,
+            }
         else:
             predictions = {self.task: model_output[0]}
         return predictions, inputs.target, inputs.weight
@@ -151,15 +248,18 @@ class ParTauModule(L.LightningModule):
         target = targets[self.task]
 
         if self.task == "kinematics":
-            # Original aggregate-only implementation kept for reference.
-            # raw_loss = self.loss_fn(pred, target).mean(dim=-1)
-            # is_tau_mask = targets["is_tau"].bool()
-            # loss = raw_loss[is_tau_mask].mean()
             component_raw_loss = self.loss_fn(pred, target)
             is_tau_mask = targets["is_tau"].bool()
             masked_component_loss = component_raw_loss[is_tau_mask]
             component_loss = masked_component_loss.mean(dim=0)
-            loss = component_loss.mean()
+            l_m = 0.2
+            loss = (
+                component_loss[0]
+                + component_loss[1]
+                + component_loss[2]
+                + component_loss[3]
+                + l_m * component_loss[4]
+            ) / (4.0 + l_m)
             metrics = {
                 "loss": loss,
                 self._loss_key(): loss,
@@ -167,18 +267,19 @@ class ParTauModule(L.LightningModule):
                 "kinematics_delta_eta_loss": component_loss[1],
                 "kinematics_sin_delta_phi_loss": component_loss[2],
                 "kinematics_cos_delta_phi_loss": component_loss[3],
+                "kinematics_log_mass_loss": component_loss[4],
             }
             return metrics
         elif self.task == "is_tau":
-            loss = self.loss_fn(pred, target).mean()
+            loss = (
+                self.loss_fn(predictions["is_tau_logits"], target.long()) * weights
+            ).mean()
         elif self.task == "charge":
-            # Mirror the en-reg single-task setup: 2-class cross entropy on the
-            # en-reg-style charge target without tau-only masking.
             loss = self.loss_fn(
-                predictions["charge_logits"], targets["charge_enreg"]
+                predictions["charge_logits"], targets["charge"].long()
             ).mean()
         else:  # "decay_mode" — only meaningful for signal taus
-            raw_loss = self.loss_fn(pred, target)
+            raw_loss = self.loss_fn(predictions["decay_mode_logits"], target)
             is_tau_mask = targets["is_tau"].bool()
             loss = raw_loss[is_tau_mask].mean()
 
@@ -197,6 +298,7 @@ class ParTauModule(L.LightningModule):
                 "gen_jet_p4s": inputs.gen_jet_p4s,
                 "reco_jet_p4s": inputs.reco_jet_p4s,
                 "gen_jet_tau_p4s": inputs.gen_jet_tau_p4s,
+                "inputs": inputs if self.task == "charge" else None,
             }
         )
         for key, value in metrics.items():
@@ -217,6 +319,7 @@ class ParTauModule(L.LightningModule):
         tb_logger,
         current_epoch,
         dataset,
+        baseline_charges=None,
     ):
         kwargs = dict(
             targets=targets,
@@ -239,6 +342,7 @@ class ParTauModule(L.LightningModule):
                 reco_jet_p4s=reco_jet_p4s,
                 cfg=self.cfg,
                 dataset=dataset,
+                baseline_charges=baseline_charges,
                 **kwargs,
             )
         elif self.task == "decay_mode":
@@ -256,9 +360,7 @@ class ParTauModule(L.LightningModule):
         if dataset == "val" and self.trainer.sanity_checking:
             return
 
-        dataset_outputs = (
-            self.validation_outputs if dataset == "val" else self.training_outputs
-        )
+        dataset_outputs = self.validation_outputs if dataset == "val" else []
 
         if dataset_outputs:
             all_predictions = {}
@@ -266,6 +368,7 @@ class ParTauModule(L.LightningModule):
             all_gen_jet_p4s = {}
             all_gen_jet_tau_p4s = {}
             all_reco_jet_p4s = {}
+            all_inputs = []
 
             for output in dataset_outputs:
                 for key, pred in output["predictions"].items():
@@ -293,6 +396,9 @@ class ParTauModule(L.LightningModule):
                         all_gen_jet_tau_p4s[key] = []
                     all_gen_jet_tau_p4s[key].append(ak.Array(value.detach().cpu()))
 
+                if output.get("inputs") is not None:
+                    all_inputs.append(output["inputs"])
+
             for key in all_predictions:
                 all_predictions[key] = ak.concatenate(all_predictions[key], axis=0)
             for key in all_targets:
@@ -310,6 +416,11 @@ class ParTauModule(L.LightningModule):
             reco_jet_p4s = ak.Array(all_reco_jet_p4s)
             gen_jet_tau_p4s = ak.Array(all_gen_jet_tau_p4s)
 
+            all_baseline_charges = None
+            if self.task == "charge" and all_inputs:
+                baseline_chunks = [self._calculate_baseline_charges(inputs) for inputs in all_inputs]
+                all_baseline_charges = np.concatenate(baseline_chunks, axis=0)
+
             self._log_task_metrics(
                 targets=all_targets,
                 predictions=all_predictions,
@@ -319,6 +430,7 @@ class ParTauModule(L.LightningModule):
                 tb_logger=self.logger.experiment,
                 current_epoch=self.current_epoch,
                 dataset=dataset,
+                baseline_charges=all_baseline_charges,
             )
 
             dataset_outputs.clear()
@@ -335,7 +447,6 @@ class ParTauModule(L.LightningModule):
         self._log_at_epoch_end(dataset="val")
 
     def on_train_epoch_start(self):
-        self.training_outputs = []
         self.training_loss_accumulator = self._make_accumulator()
 
     def on_train_epoch_end(self):
@@ -346,4 +457,3 @@ class ParTauModule(L.LightningModule):
         }
         for k, v in epoch_metrics.items():
             self.log(f"train_losses/{k}", v)
-        self._log_at_epoch_end(dataset="train")
