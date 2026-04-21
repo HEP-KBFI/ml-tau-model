@@ -8,6 +8,33 @@ ALGORITHM_PLOT_STYLES:
         label: ParTau
         lw: 3
         marker_size: 15
+    RecoJet:
+        name: RecoJet
+        marker: "^"
+        hatch: "."
+        color: "k"
+        ls: "solid"
+        label: RecoJet
+        lw: 3
+        marker_size: 15
+    SingleParTau:
+        name: SingleParTau
+        marker: "v"
+        hatch: "."
+        color: "red"
+        ls: "solid"
+        label: SingleParTau
+        lw: 3
+        marker_size: 15
+    MultiParTau:
+        name: MultiParTau
+        marker: "s"
+        hatch: "."
+        color: "green"
+        ls: "solid"
+        label: MultiParTau
+        lw: 3
+        marker_size: 15
     all:
         name: ParTau
         marker: "X"

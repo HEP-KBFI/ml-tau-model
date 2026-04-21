@@ -2,12 +2,15 @@ import os
 import json
 import numpy as np
 import mplhep as hep
+import awkward as ak
 import boost_histogram as bh
 import matplotlib.pyplot as plt
 from omegaconf import DictConfig
 import matplotlib.colors as colors
 import matplotlib.ticker as ticker
 from mltau.tools.io.general import NpEncoder
+from mltau.tools.general import reinitialize_p4
+from mltau.tools.features import deltaR_thetaPhi
 
 hep.style.use(hep.styles.CMS)
 plt.rcParams["mathtext.fontset"] = "stix"
@@ -58,7 +61,9 @@ def plot_regression_confusion_matrix(
     fig, ax = plt.subplots(figsize=figsize)
     ax.label_outer()
     bin_counts = np.histogram2d(y_true, y_pred, bins=[bin_edges, bin_edges])[0]
-    im = ax.pcolor(bin_edges, bin_edges, bin_counts.T, cmap=cmap, norm=colors.LogNorm())
+    im = ax.pcolor(bin_edges, bin_edges, bin_counts.T, cmap=cmap)
+    # im = ax.pcolor(bin_edges, bin_edges, bin_counts.T, cmap=cmap, norm=colors.LogNorm())
+    # fig.colorbar(im, ax=ax)
     fig.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
     ax.set_aspect("equal")
     ax.set_ylabel(f"{y_label}")
@@ -254,7 +259,7 @@ class DeltaRContentPlot:
             ax.set_xlabel(r"$\Delta R$", fontsize=12)
         return fig, axes
 
-    def add_line(self, evaluator: "DeltaREvaluator"):
+    def add_line(self, evaluator: str = "DeltaREvaluator"):
         bins = np.linspace(self.xlim[0], self.xlim[1], 101)
         for ax, data in zip(self.axes, evaluator.binned_deltaRs):
             if len(data) > 0:
@@ -447,3 +452,140 @@ class RegressionMultiEvaluator:
             json.dump(
                 self.resolution_performance_info, out_file, indent=4, cls=NpEncoder
             )
+
+
+class KinematicsEvaluator:
+    def __init__(
+        self,
+        predicted_p4: ak.Array,
+        true_p4: ak.Array,
+        cfg: DictConfig,
+        algorithm: str,
+        sample_name: str = "",
+    ):
+        self.predicted_p4 = reinitialize_p4(predicted_p4)
+        self.true_p4 = reinitialize_p4(true_p4)
+        self.cfg = cfg
+        self.algorithm = algorithm
+        self.sample_name = sample_name
+        self.var_evaluators = self._fill_evaluators()
+
+    def _fill_evaluators(self):
+        deltaR = deltaR_thetaPhi(
+            theta1=self.predicted_p4.theta,
+            phi1=self.predicted_p4.phi,
+            theta2=self.true_p4.theta,
+            phi2=self.true_p4.phi,
+        )
+        evaluators = {
+            "pt": RegressionEvaluator(
+                prediction=self.predicted_p4.pt,
+                truth=self.true_p4.pt,
+                bin_edges=self.cfg.metrics.kinematics.pt.bin_edges[self.sample_name],
+                algorithm=self.algorithm,
+                sample_name=self.sample_name,
+            ),
+            "eta": RegressionEvaluator(
+                prediction=self.predicted_p4.eta,
+                truth=self.true_p4.eta,
+                bin_edges=self.cfg.metrics.kinematics.eta.bin_edges[self.sample_name],
+                algorithm=self.algorithm,
+                sample_name=self.sample_name,
+            ),
+            "theta": RegressionEvaluator(
+                prediction=self.predicted_p4.theta,
+                truth=self.true_p4.theta,
+                bin_edges=self.cfg.metrics.kinematics.theta.bin_edges[self.sample_name],
+                algorithm=self.algorithm,
+                sample_name=self.sample_name,
+            ),
+            "phi": RegressionEvaluator(
+                prediction=self.predicted_p4.phi,
+                truth=self.true_p4.phi,
+                bin_edges=self.cfg.metrics.kinematics.phi.bin_edges[self.sample_name],
+                algorithm=self.algorithm,
+                sample_name=self.sample_name,
+            ),
+            "m_vis": RegressionEvaluator(
+                prediction=self.predicted_p4.mass,
+                truth=self.true_p4.mass,
+                bin_edges=self.cfg.metrics.kinematics.m_vis.bin_edges[self.sample_name],
+                algorithm=self.algorithm,
+                sample_name=self.sample_name,
+            ),
+            "energy": RegressionEvaluator(
+                prediction=self.predicted_p4.energy,
+                truth=self.true_p4.energy,
+                bin_edges=self.cfg.metrics.kinematics.energy.bin_edges[
+                    self.sample_name
+                ],
+                algorithm=self.algorithm,
+                sample_name=self.sample_name,
+            ),
+            "deltaR": DeltaREvaluator(
+                deltaR=deltaR,
+                pt_truth=np.array(self.true_p4.pt),
+                bin_edges=self.cfg.metrics.kinematics.pt.bin_edges[self.sample_name],
+                algorithm=self.algorithm,
+            ),
+        }
+        return evaluators
+
+
+class KinematicsMultiEvaluator:
+    def __init__(self, output_dir: str, cfg: DictConfig, sample: str):
+        self.output_dir = output_dir
+        self.cfg = cfg
+        self.sample = sample
+        self.cfg = cfg
+        self.variables = ["pt", "eta", "phi", "theta", "m_vis", "energy"]
+        self.multi_evaluators = {}
+        self._init_plots()
+
+    def _init_plots(self):
+        plots = {}
+        for variable in self.variables:
+            var_cfg = self.cfg.metrics.kinematics[variable]
+            vme_output_dir = os.path.join(self.output_dir, variable)
+            os.makedirs(vme_output_dir, exist_ok=True)
+            self.multi_evaluators[variable] = RegressionMultiEvaluator(
+                vme_output_dir, self.cfg, self.sample, var_cfg
+            )
+        dr_cfg = self.cfg.metrics.kinematics.deltaR
+        self.multi_evaluators["deltaR"] = LinePlot(
+            cfg=self.cfg,
+            xlabel=dr_cfg.median_plot.xlabel,
+            ylabel=dr_cfg.median_plot.ylabel,
+            xscale=dr_cfg.median_plot.xscale,
+            yscale=dr_cfg.median_plot.yscale,
+            ymin=dr_cfg.median_plot.ylim[0],
+            ymax=dr_cfg.median_plot.ylim[1],
+            nticks=dr_cfg.median_plot.nticks,
+        )
+        return plots
+
+    def combine_results(self, evaluators: list):
+        for variable in self.variables:
+            var_evaluators = [
+                evaluator.var_evaluators[variable] for evaluator in evaluators
+            ]
+            self.multi_evaluators[variable].combine_results(var_evaluators)
+        for evaluator in evaluators:
+            var_evaluator = evaluator.var_evaluators["deltaR"]
+            self.multi_evaluators["deltaR"].add_line(
+                var_evaluator.bin_centers,
+                var_evaluator.medians,
+                var_evaluator.algorithm,
+                label=evaluator.algorithm,
+            )
+
+    def save(self):
+        for variable in self.variables:
+            self.multi_evaluators[variable].save()
+        deltaR_output_dir = os.path.join(self.output_dir, "deltaR")
+        os.makedirs(deltaR_output_dir, exist_ok=True)
+        deltaR_output_path = os.path.join(deltaR_output_dir, "median_plot.pdf")
+        self.multi_evaluators["deltaR"].save(deltaR_output_path)
+
+
+# TODO: Add reco_jet as a baseline algorithm.

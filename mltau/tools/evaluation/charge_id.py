@@ -1,4 +1,6 @@
 import os
+import json
+from mltau.tools.io.general import NpEncoder
 import numpy as np
 import awkward as ak
 import mplhep as hep
@@ -669,3 +671,46 @@ class ConfusionMatrixPlot:
     def save(self, output_path):
         self.fig.savefig(output_path, format="pdf", bbox_inches="tight")
         plt.close(self.fig)
+
+
+class ChargeMultiEvaluator:
+    def __init__(self, output_dir: str, cfg: DictConfig):
+        self.output_dir = output_dir
+        self.cfg = cfg
+        os.makedirs(self.output_dir, exist_ok=True)
+        self.metrics = list(self.cfg.metrics.charge.metrics.keys())
+
+        self.tagging_plots = {}
+        self.efficiency_plots = {
+            metric: EfficiencyPlot(self.cfg, metric) for metric in self.metrics
+        }
+        self.fakerate_plots = {
+            metric: FakeRatePlot(self.cfg, metric) for metric in self.metrics
+        }
+        self.roc_plot = ROCPlot(self.cfg)
+        self.wp_values = {}
+
+    def combine_results(self, evaluators: list):
+        for evaluator in evaluators:
+            self.tagging_plots[evaluator.algorithm] = ChargeClassifierPlot()
+            self.tagging_plots[evaluator.algorithm].add_line(evaluator, "test")
+            self.roc_plot.add_line(evaluator)
+            for metric in self.metrics:
+                self.efficiency_plots[metric].add_line(evaluator)
+                self.fakerate_plots[metric].add_line(evaluator)
+
+    def save(self):
+        for metric in self.metrics:
+            fr_output_path = os.path.join(self.output_dir, f"{metric}_fakerates.pdf")
+            self.fakerate_plots[metric].save(fr_output_path)
+            eff_output_path = os.path.join(
+                self.output_dir, f"{metric}_efficiencies.pdf"
+            )
+            self.efficiency_plots[metric].save(eff_output_path)
+        roc_output_path = os.path.join(self.output_dir, f"ROC.pdf")
+        self.roc_plot.save(roc_output_path)
+        for algorithm in self.tagging_plots.keys():
+            cls_output_path = os.path.join(
+                self.output_dir, f"classifier_scores_{algorithm}.pdf"
+            )
+            self.tagging_plots[algorithm].save(cls_output_path)

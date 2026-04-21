@@ -34,7 +34,8 @@ class ParticleTransformerDataset(IterableDataset):
         num_workers = worker_info.num_workers if worker_info is not None else 1
         worker_id = worker_info.id if worker_info is not None else 0
 
-        N = self.cand_features.shape[0]
+        N = 5000
+        # N = self.cand_features.shape[0]
         # Strided partition — each worker gets every num_workers-th index.
         # Because the dataset is pre-shuffled (see _load_and_split), consecutive
         # indices are already mixed z/qq, so the stride preserves that mix.
