@@ -12,7 +12,7 @@ class ParticleTransformerDataset(IterableDataset):
     """Wraps a pre-loaded slice of jet tensors.  Workers share the same
     physical memory via share_memory_(); no file I/O happens in __iter__."""
 
-    def __init__(self, tensors: tuple, batch_size: int):
+    def __init__(self, tensors: tuple, batch_size: int, shuffle: bool = True):
         super().__init__()
         (
             self.cand_features,
@@ -25,6 +25,7 @@ class ParticleTransformerDataset(IterableDataset):
             self.gen_jet,
         ) = tensors
         self.batch_size = batch_size
+        self.shuffle = shuffle
 
     def __len__(self):
         return math.ceil(self.cand_features.shape[0] / self.batch_size)
@@ -34,14 +35,15 @@ class ParticleTransformerDataset(IterableDataset):
         num_workers = worker_info.num_workers if worker_info is not None else 1
         worker_id = worker_info.id if worker_info is not None else 0
 
-        N = 5000
-        # N = self.cand_features.shape[0]
+        # N = 5000
+        N = self.cand_features.shape[0]
         # Strided partition — each worker gets every num_workers-th index.
         # Because the dataset is pre-shuffled (see _load_and_split), consecutive
         # indices are already mixed z/qq, so the stride preserves that mix.
         worker_indices = torch.arange(worker_id, N, num_workers)
         # Per-epoch local shuffle within this worker's slice.
-        worker_indices = worker_indices[torch.randperm(len(worker_indices))]
+        if self.shuffle:
+            worker_indices = worker_indices[torch.randperm(len(worker_indices))]
 
         for i in range(0, len(worker_indices), self.batch_size):
             idx = worker_indices[i : i + self.batch_size]

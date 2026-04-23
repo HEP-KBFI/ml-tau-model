@@ -21,53 +21,19 @@ class ParTauModule(L.LightningModule):
             raise ValueError(f"task must be one of {VALID_TASKS}, got '{task}'")
         self.cfg = cfg
         self.task = task
-        # Current local SingleParTau configuration kept for reference:
-        # self.ParTau = ParTau(
-        #     input_dim=input_dim,
-        #     task=task,
-        #     num_dm_classes=num_dm_classes,
-        #     num_layers=2,
-        #     embed_dims=[256, 512, 256],
-        #     use_pre_activation_pair=False,
-        #     for_inference=False,
-        #     use_amp=False,
-        #     metric="eta-phi",
-        # )
-        #
-        # Tau-ID comparison setup:
-        # - keep the existing local configuration for non-tagging tasks
-        # - switch tau-ID to the deeper / narrower ml-tau-reco-style backbone
+        self.ParTau = ParTau(
+            input_dim=input_dim,
+            task=task,
+            num_dm_classes=num_dm_classes,
+            num_layers=2,
+            embed_dims=[256, 512, 256],
+            use_pre_activation_pair=False,
+            for_inference=False,
+            use_amp=False,
+            metric="eta-phi",
+        )
         if task == "is_tau":
-            self.ParTau = ParTau(
-                input_dim=input_dim,
-                task=task,
-                num_dm_classes=num_dm_classes,
-                num_layers=8,
-                embed_dims=[128, 512, 128],
-                use_pre_activation_pair=False,
-                for_inference=False,
-                use_amp=False,
-                metric="eta-phi",
-            )
-        else:
-            self.ParTau = ParTau(
-                input_dim=input_dim,
-                task=task,
-                num_dm_classes=num_dm_classes,
-                num_layers=2,
-                embed_dims=[256, 512, 256],
-                use_pre_activation_pair=False,
-                for_inference=False,
-                use_amp=False,
-                metric="eta-phi",
-            )
-        if task == "is_tau":
-            # Previous local implementation kept for quick rollback:
-            # self.loss_fn = SigmoidFocalLoss(alpha=0.75, gamma=2.0, reduction="none")
-
-            # Tau-ID comparison setup aligned with ml-tau-reco, but without
-            # the external 10:1 class-weighting scheme for now.
-            self.loss_fn = FocalLoss(alpha=None, gamma=2.0, reduction="none")
+            self.loss_fn = SigmoidFocalLoss(alpha=0.75, gamma=2.0, reduction="none")
         elif task == "charge":
             self.loss_fn = nn.CrossEntropyLoss(reduction="none")
         elif task == "decay_mode":
@@ -230,13 +196,8 @@ class ParTauModule(L.LightningModule):
             }
         elif self.task == "is_tau":
             tau_logits = model_output[0]
-            # Previous local implementation kept for quick rollback:
-            # predictions = {
-            #     self.task: torch.sigmoid(tau_logits),
-            #     "is_tau_logits": tau_logits,
-            # }
             predictions = {
-                self.task: torch.softmax(tau_logits, dim=-1)[:, 1],
+                self.task: torch.sigmoid(tau_logits),
                 "is_tau_logits": tau_logits,
             }
         else:
@@ -271,9 +232,7 @@ class ParTauModule(L.LightningModule):
             }
             return metrics
         elif self.task == "is_tau":
-            loss = (
-                self.loss_fn(predictions["is_tau_logits"], target.long()) * weights
-            ).mean()
+            loss = (self.loss_fn(predictions["is_tau_logits"], target) * weights).mean()
         elif self.task == "charge":
             loss = self.loss_fn(
                 predictions["charge_logits"], targets["charge"].long()

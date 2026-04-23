@@ -13,11 +13,10 @@ def log_all_decay_mode_metrics(
     current_epoch: int,
 ):
     predictions_proba = np.asarray(predictions["decay_mode"])
-    targets_class = np.argmax(np.asarray(targets["decay_mode"]), axis=-1)
 
     evaluator = dm.DecayModeEvaluator(
         pred_proba=predictions_proba,
-        truth=targets_class,
+        truth=np.asarray(targets["decay_mode"]),
         output_dir="",
         sample="all",
         algorithm="all",

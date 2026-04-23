@@ -81,9 +81,14 @@ class DecayModeEvaluator:
             os.makedirs(self.output_dir, exist_ok=True)
         self.sample = sample
         self.algorithm = algorithm
-        self.pred_proba = pred_proba
-        self.predicted = np.argmax(pred_proba, axis=-1)
-        self.truth = np.argmax(truth, axis=-1)
+        self.pred_proba = np.asarray(pred_proba)
+        self.predicted = np.argmax(self.pred_proba, axis=-1)
+
+        truth = np.asarray(truth)
+        if truth.ndim == 1:
+            self.truth = truth.astype(int)
+        else:
+            self.truth = np.argmax(truth, axis=-1)
         self.confusion_matrix = metrics.confusion_matrix(self.truth, self.predicted)
         self.normalized_confusion_matrix = metrics.confusion_matrix(
             self.truth, self.predicted, normalize="true"
