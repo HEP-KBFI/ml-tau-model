@@ -209,6 +209,7 @@ __marimo__/
 
 logs/
 outputs/
+lightning_logs/
 
 .codex
-.vscode/
+.vscode/lightning_logs/

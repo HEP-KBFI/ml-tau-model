@@ -83,16 +83,6 @@ class DecayModeEvaluator:
         self.algorithm = algorithm
         self.pred_proba = np.asarray(pred_proba)
         self.predicted = np.argmax(self.pred_proba, axis=-1)
-
-        truth = np.asarray(truth)
-        if truth.ndim == 1:
-            self.truth = truth.astype(int)
-        else:
-            self.truth = np.argmax(truth, axis=-1)
-        self.confusion_matrix = metrics.confusion_matrix(self.truth, self.predicted)
-        self.normalized_confusion_matrix = metrics.confusion_matrix(
-            self.truth, self.predicted, normalize="true"
-        )
         self._decay_mode_name_mapping = {
             0: r"$h^{\pm}$",
             1: r"$h^{\pm}\pi^0$",
@@ -104,6 +94,21 @@ class DecayModeEvaluator:
         self.inverse_mapping = {
             i: key for i, key in enumerate(self._decay_mode_name_mapping.keys())
         }
+        self.forward_mapping = {key: i for i, key in self.inverse_mapping.items()}
+
+        truth = np.asarray(truth)
+        if truth.ndim == 1:
+            truth = truth.astype(int)
+            if np.any(truth > 5):
+                self.truth = np.vectorize(self.forward_mapping.get)(truth)
+            else:
+                self.truth = truth
+        else:
+            self.truth = np.argmax(truth, axis=-1)
+        self.confusion_matrix = metrics.confusion_matrix(self.truth, self.predicted)
+        self.normalized_confusion_matrix = metrics.confusion_matrix(
+            self.truth, self.predicted, normalize="true"
+        )
         self.categories = list(self._decay_mode_name_mapping.values())
         self.general_metrics, self.class_metrics = self._calculate_performance_metrics()
         self.class_performances = self.calculate_class_wise_metrics()
@@ -340,7 +345,7 @@ class DecayModeComparisonPlot:
         self.fig, self.ax = self.plot()
 
     def plot(self):
-        x = range(len(self.decay_modes.keys()))
+        x = range(len(self.decay_modes.keys()) + 1)
         fig, ax = plt.subplots(figsize=self.figsize)
         ax.set_xlabel("Decay Modes")
         ax.set_ylabel(self.metric, x=1.05)
@@ -352,12 +357,19 @@ class DecayModeComparisonPlot:
         ax.tick_params(axis="y", which="both", left=True, right=False, labelleft=True)
         ax.yaxis.set_major_formatter(FormatStrFormatter("%.2f"))
         ax.set_xticklabels(
-            [info["label"] for info in self.decay_modes.values()], rotation=45
+            [info["label"] for info in self.decay_modes.values()] + ["Overall"],
+            rotation=45,
         )
         # Vertical lines between the DMs
         for i in range(len(x)):
             ax.axvline(i - 0.5, color="gray", linestyle="--", linewidth=0.5, zorder=0)
         return fig, ax
+
+    def _calculate_overall_performance(self, evaluator):
+        metric_value = np.array(evaluator.class_performances[self.metric])
+        brs = np.array([value["PDG_ratio"] for value in self.decay_modes.values()])
+        overall = np.sum(metric_value * brs)
+        return overall
 
     def _annotate_points(self, x, y, offset):
         # Function to add labels to the datapoints
@@ -373,9 +385,22 @@ class DecayModeComparisonPlot:
             )
 
     def add_line(self, evaluator, offset):
+        location = np.arange(len(self.decay_modes.keys()) + 1) + offset
+        overall_score = self._calculate_overall_performance(evaluator)
+        metric_values = list(evaluator.class_performances[self.metric]) + [
+            overall_score
+        ]
+        self.ax.scatter(
+            location,
+            metric_values,
+            label=evaluator.algorithm,
+            color=self.cfg.metrics.ALGORITHM_PLOT_STYLES[evaluator.algorithm].color,
+            marker=self.cfg.metrics.ALGORITHM_PLOT_STYLES[evaluator.algorithm].marker,
+            s=100,
+        )
         self._annotate_points(
-            np.array(range(len(self.decay_modes.keys()))) + offset,
-            evaluator.class_performances[self.metric],
+            location,
+            metric_values,
             (-18, -4),
         )
         self.ax.legend(
