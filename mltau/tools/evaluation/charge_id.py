@@ -6,6 +6,7 @@ import awkward as ak
 import mplhep as hep
 import matplotlib.pyplot as plt
 from matplotlib import ticker
+from matplotlib import colors as mcolors
 
 from omegaconf import DictConfig
 from mltau.tools import general as g
@@ -15,22 +16,22 @@ from mltau.tools.evaluation.histogram import Histogram
 plt.rcParams["mathtext.fontset"] = "stix"
 
 
-def jet_charge_qkappa(cand_charges, cand_pts, jet_pts, kappa=0.5):
-    """Calculate jet charge using Q*kappa weighting.
+def _lighten_color(color, amount=0.55):
+    rgb = np.array(mcolors.to_rgb(color))
+    return tuple((1 - amount) * rgb + amount * np.ones_like(rgb))
 
-    Args:
-        cand_charges: Candidate particle charges [batch, max_cands]
-        cand_pts: Candidate particle pTs [batch, max_cands]
-        jet_pts: Jet pTs [batch]
-        kappa: Weighting exponent
 
-    Returns:
-        Jet charge values ranging from -1 to +1
-    """
-    numer = ak.sum(cand_charges * (cand_pts**kappa), axis=1)
-    denom = jet_pts**kappa
-    denom = ak.where(denom == 0, 1.0, denom)
-    return ak.to_numpy(numer / denom)
+def _get_charge_colors(cfg, algorithm):
+    style = cfg.metrics.ALGORITHM_PLOT_STYLES[algorithm]
+    base = style.color
+    light = getattr(style, "light_color", None)
+    if light is None:
+        light = _lighten_color(base)
+    return base, light
+
+
+def _get_charge_label(cfg, algorithm):
+    return cfg.metrics.ALGORITHM_PLOT_STYLES[algorithm].name
 
 
 class ChargeIdEvaluator:
@@ -53,6 +54,15 @@ class ChargeIdEvaluator:
             os.makedirs(self.output_dir, exist_ok=True)
         self.sample = sample
         self.algorithm = algorithm
+        truth = np.asarray(truth)
+        predicted = np.asarray(predicted)
+
+        # Accept either binary truth labels {0,1} or physical signed charge {-1,+1}.
+        if np.any(truth < 0):
+            truth = (truth == 1).astype(int)
+        else:
+            truth = truth.astype(int)
+
         self.predicted = predicted
         self.gen_jet_tau_p4s = g.reinitialize_p4(gen_jet_tau_p4s)
         self.reco_jet_p4s = g.reinitialize_p4(reco_jet_p4s)
@@ -126,6 +136,138 @@ class ChargeIdEvaluator:
                     "eff_yerr": eff_yerr,
                     "eff_xerr": eff_xerr,
                 }
+
+    def choose_threshold_for_target_eff_per_class(
+        self, target_eff: float = 0.8, which: str = "positive"
+    ) -> float:
+        eff = np.asarray(
+            self.efficiencies["positive" if which == "positive" else "negative"],
+            dtype=float,
+        )
+        thr = np.asarray(self.tagging_cuts, dtype=float)
+        mask = np.isfinite(eff) & np.isfinite(thr)
+        eff = eff[mask]
+        thr = thr[mask]
+        if eff.size == 0:
+            raise RuntimeError("No finite ROC points found for threshold selection")
+        order = np.argsort(eff)
+        eff_sorted = eff[order]
+        thr_sorted = thr[order]
+        eff_unique, unique_idx = np.unique(eff_sorted, return_index=True)
+        thr_unique = thr_sorted[unique_idx]
+        if eff_unique.size == 1:
+            threshold = float(thr_unique[0])
+            return threshold if which == "positive" else float(1.0 - threshold)
+        clipped_eff = np.clip(target_eff, eff_unique[0], eff_unique[-1])
+        threshold = float(np.interp(clipped_eff, eff_unique, thr_unique))
+        return threshold if which == "positive" else float(1.0 - threshold)
+
+    def _metric_values(self, metric: str):
+        values = getattr(self.gen_jet_tau_p4s, metric).to_numpy()
+        if metric == "theta":
+            values = np.rad2deg(values)
+        return np.asarray(values)
+
+    def _base_mask(self):
+        ref_var_pt_mask = self.gen_jet_tau_p4s.pt > self.cfg.metrics.tagging.cuts.min_pt
+        ref_var_theta_mask1 = (
+            abs(np.rad2deg(self.gen_jet_tau_p4s.theta))
+            < self.cfg.metrics.tagging.cuts.max_theta
+        )
+        ref_var_theta_mask2 = (
+            abs(np.rad2deg(self.gen_jet_tau_p4s.theta))
+            > self.cfg.metrics.tagging.cuts.min_theta
+        )
+        gen_denominator_mask = (
+            ref_var_pt_mask * ref_var_theta_mask1 * ref_var_theta_mask2
+        )
+        tau_pt_mask = self.reco_jet_p4s.pt > self.cfg.metrics.tagging.cuts.min_pt
+        tau_theta_mask1 = (
+            abs(np.rad2deg(self.reco_jet_p4s.theta))
+            < self.cfg.metrics.tagging.cuts.max_theta
+        )
+        tau_theta_mask2 = (
+            abs(np.rad2deg(self.reco_jet_p4s.theta))
+            > self.cfg.metrics.tagging.cuts.min_theta
+        )
+        reco_denominator_mask = tau_pt_mask * tau_theta_mask1 * tau_theta_mask2
+        return gen_denominator_mask * reco_denominator_mask
+
+    def compute_binned_fake_rates_for_target_eff(
+        self, metric: str, target_eff: float = 0.8
+    ):
+        values = self._metric_values(metric)
+        metric_cfg = self.cfg.metrics.charge.metrics[metric]
+        bin_edges = np.linspace(
+            metric_cfg.x_range[0], metric_cfg.x_range[1], metric_cfg.n_bins + 1
+        )
+        centers = 0.5 * (bin_edges[:-1] + bin_edges[1:])
+        threshold_pos = self.choose_threshold_for_target_eff_per_class(
+            target_eff, "positive"
+        )
+        threshold_neg = self.choose_threshold_for_target_eff_per_class(
+            target_eff, "negative"
+        )
+
+        pred_charge_pos = self.predicted >= threshold_pos
+        pred_charge_neg = self.predicted < threshold_neg
+
+        base_mask = self._base_mask()
+        pos_truth = self.true_positive_charge_mask & base_mask
+        neg_truth = self.true_negative_charge_mask & base_mask
+
+        fake_pos = []
+        fake_neg = []
+        for left, right in zip(bin_edges[:-1], bin_edges[1:]):
+            metric_mask = (values >= left) & (values < right)
+            neg_sel = metric_mask & neg_truth
+            pos_sel = metric_mask & pos_truth
+            fake_pos.append(
+                np.mean(pred_charge_pos[neg_sel]) if np.any(neg_sel) else np.nan
+            )
+            fake_neg.append(
+                np.mean(pred_charge_neg[pos_sel]) if np.any(pos_sel) else np.nan
+            )
+
+        return centers, np.asarray(fake_pos), np.asarray(fake_neg)
+
+    def compute_binned_efficiencies_for_target_eff(
+        self, metric: str, target_eff: float = 0.8
+    ):
+        values = self._metric_values(metric)
+        metric_cfg = self.cfg.metrics.charge.metrics[metric]
+        bin_edges = np.linspace(
+            metric_cfg.x_range[0], metric_cfg.x_range[1], metric_cfg.n_bins + 1
+        )
+        centers = 0.5 * (bin_edges[:-1] + bin_edges[1:])
+        threshold_pos = self.choose_threshold_for_target_eff_per_class(
+            target_eff, "positive"
+        )
+        threshold_neg = self.choose_threshold_for_target_eff_per_class(
+            target_eff, "negative"
+        )
+
+        pred_charge_pos = self.predicted >= threshold_pos
+        pred_charge_neg = self.predicted < threshold_neg
+
+        base_mask = self._base_mask()
+        pos_truth = self.true_positive_charge_mask & base_mask
+        neg_truth = self.true_negative_charge_mask & base_mask
+
+        eff_pos = []
+        eff_neg = []
+        for left, right in zip(bin_edges[:-1], bin_edges[1:]):
+            metric_mask = (values >= left) & (values < right)
+            pos_sel = metric_mask & pos_truth
+            neg_sel = metric_mask & neg_truth
+            eff_pos.append(
+                np.mean(pred_charge_pos[pos_sel]) if np.any(pos_sel) else np.nan
+            )
+            eff_neg.append(
+                np.mean(pred_charge_neg[neg_sel]) if np.any(neg_sel) else np.nan
+            )
+
+        return centers, np.asarray(eff_pos), np.asarray(eff_neg)
 
     def _calculate_eff_fake(self, eff_fake: str = "eff"):
         _eff_fake = {"positive": [], "negative": []}
@@ -353,6 +495,8 @@ class ChargeClassifierPlot:
 
     def add_line(self, evaluator, dataset: str):
         linestyle = "solid" if dataset == "test" else "dashed"
+        pos_color, neg_color = _get_charge_colors(evaluator.cfg, evaluator.algorithm)
+        algorithm_label = _get_charge_label(evaluator.cfg, evaluator.algorithm)
         neg_histogram = np.histogram(
             evaluator.neg_charge_predictions, bins=self.bin_edges
         )[0]
@@ -365,18 +509,18 @@ class ChargeClassifierPlot:
             pos_histogram,
             bins=self.bin_edges,
             histtype="step",
-            label=r"$\tau^{+}$",
+            label=rf"{algorithm_label} $\tau^{{+}}$",
             ls=linestyle,
-            color="red",
+            color=pos_color,
             ax=self.ax,
         )
         hep.histplot(
             neg_histogram,
             bins=self.bin_edges,
             histtype="step",
-            label=r"$\tau^{-}$",
+            label=rf"{algorithm_label} $\tau^{{-}}$",
             ls=linestyle,
-            color="blue",
+            color=neg_color,
             ax=self.ax,
         )
         self.ax.legend(prop={"size": 28})
@@ -412,22 +556,25 @@ class ROCPlot:
         return fig, ax
 
     def add_line(self, evaluator):
+        pos_color, neg_color = _get_charge_colors(evaluator.cfg, evaluator.algorithm)
+        marker = evaluator.cfg.metrics.ALGORITHM_PLOT_STYLES[evaluator.algorithm].marker
+        algorithm_label = _get_charge_label(evaluator.cfg, evaluator.algorithm)
         # ML prediction curves
         self.ax.plot(
             evaluator.efficiencies["positive"],
             evaluator.fakerates["positive"],
-            color="r",
-            marker="s",
-            label=r"$\tau^{+}$ (ML)",
+            color=pos_color,
+            marker=marker,
+            label=rf"{algorithm_label} $\tau^{{+}}$",
             ms=8,
             ls="",
         )
         self.ax.plot(
             evaluator.efficiencies["negative"],
             evaluator.fakerates["negative"],
-            color="b",
-            marker="^",
-            label=r"$\tau^{-}$ (ML)",
+            color=neg_color,
+            marker=marker,
+            label=rf"{algorithm_label} $\tau^{{-}}$",
             ms=8,
             ls="",
         )
@@ -437,12 +584,13 @@ class ROCPlot:
             hasattr(evaluator, "baseline_efficiencies")
             and evaluator.baseline_efficiencies is not None
         ):
+            baseline_pos, baseline_neg = _get_charge_colors(evaluator.cfg, "QKappa")
             self.ax.plot(
                 evaluator.baseline_efficiencies["positive"],
                 evaluator.baseline_fakerates["positive"],
-                color="r",
+                color=baseline_pos,
                 marker="o",
-                label=r"$\tau^{+}$ (Baseline)",
+                label=r"QKappa $\tau^{+}$",
                 ms=6,
                 ls="--",
                 alpha=0.7,
@@ -450,9 +598,9 @@ class ROCPlot:
             self.ax.plot(
                 evaluator.baseline_efficiencies["negative"],
                 evaluator.baseline_fakerates["negative"],
-                color="b",
+                color=baseline_neg,
                 marker="v",
-                label=r"$\tau^{-}$ (Baseline)",
+                label=r"QKappa $\tau^{-}$",
                 ms=6,
                 ls="--",
                 alpha=0.7,
@@ -486,16 +634,19 @@ class EfficiencyPlot:
         self.fig, self.ax = self.plot()
 
     def add_line(self, evaluator):
+        pos_color, neg_color = _get_charge_colors(evaluator.cfg, evaluator.algorithm)
+        marker = evaluator.cfg.metrics.ALGORITHM_PLOT_STYLES[evaluator.algorithm].marker
+        algorithm_label = _get_charge_label(evaluator.cfg, evaluator.algorithm)
         self.ax.errorbar(
             evaluator.wp_metrics[self.metric]["negative"]["eff_bin_centers"],
             evaluator.wp_metrics[self.metric]["negative"]["efficiencies"],
             xerr=evaluator.wp_metrics[self.metric]["negative"]["eff_xerr"],
             yerr=evaluator.wp_metrics[self.metric]["negative"]["eff_yerr"],
             ms=20,
-            color="b",
-            marker="^",
+            color=neg_color,
+            marker=marker,
             linestyle="",
-            label=r"$\tau^{-}$",
+            label=rf"{algorithm_label} $\tau^{{-}}$",
         )
         self.ax.errorbar(
             evaluator.wp_metrics[self.metric]["positive"]["eff_bin_centers"],
@@ -503,10 +654,10 @@ class EfficiencyPlot:
             xerr=evaluator.wp_metrics[self.metric]["positive"]["eff_xerr"],
             yerr=evaluator.wp_metrics[self.metric]["positive"]["eff_yerr"],
             ms=20,
-            color="r",
-            marker="s",
+            color=pos_color,
+            marker=marker,
             linestyle="",
-            label=r"$\tau^{+}$",
+            label=rf"{algorithm_label} $\tau^{{+}}$",
         )
         self.ax.legend(loc="upper right", prop={"size": 30})
 
@@ -548,16 +699,19 @@ class FakeRatePlot:
         self.fig, self.ax = self.plot()
 
     def add_line(self, evaluator):
+        pos_color, neg_color = _get_charge_colors(evaluator.cfg, evaluator.algorithm)
+        marker = evaluator.cfg.metrics.ALGORITHM_PLOT_STYLES[evaluator.algorithm].marker
+        algorithm_label = _get_charge_label(evaluator.cfg, evaluator.algorithm)
         self.ax.errorbar(
             evaluator.wp_metrics[self.metric]["negative"]["fr_bin_centers"],
             evaluator.wp_metrics[self.metric]["negative"]["fakerates"],
             xerr=evaluator.wp_metrics[self.metric]["negative"]["fr_xerr"],
             yerr=evaluator.wp_metrics[self.metric]["negative"]["fr_yerr"],
             ms=20,
-            color="b",
-            marker="^",
+            color=neg_color,
+            marker=marker,
             linestyle="",
-            label=r"$\tau^{-}$",
+            label=rf"{algorithm_label} $\tau^{{-}}$",
         )
         self.ax.errorbar(
             evaluator.wp_metrics[self.metric]["positive"]["fr_bin_centers"],
@@ -565,10 +719,10 @@ class FakeRatePlot:
             xerr=evaluator.wp_metrics[self.metric]["positive"]["fr_xerr"],
             yerr=evaluator.wp_metrics[self.metric]["positive"]["fr_yerr"],
             ms=20,
-            color="r",
-            marker="s",
+            color=pos_color,
+            marker=marker,
             linestyle="",
-            label=r"$\tau^{+}$",
+            label=rf"{algorithm_label} $\tau^{{+}}$",
         )
         self.ax.legend(loc="upper right", prop={"size": 30})
 
@@ -599,6 +753,130 @@ class FakeRatePlot:
 
     def save(self, output_path):
         self.fig.savefig(output_path, format="pdf")
+        plt.close("all")
+
+
+class AsymmetryPlot:
+    def __init__(self, cfg: DictConfig, metric: str, quantity: str):
+        self.cfg = cfg
+        self.metric = metric
+        self.quantity = quantity
+        self.target_eff = 0.8
+        self.fig, (self.ax, self.ax_ratio) = self.plot()
+
+    def _series(self, evaluator):
+        if self.quantity == "efficiency":
+            x, pos, neg = evaluator.compute_binned_efficiencies_for_target_eff(
+                self.metric, target_eff=self.target_eff
+            )
+        else:
+            x, pos, neg = evaluator.compute_binned_fake_rates_for_target_eff(
+                self.metric, target_eff=self.target_eff
+            )
+        return np.asarray(x), np.asarray(pos), np.asarray(neg)
+
+    def add_line(self, evaluator):
+        x, pos, neg = self._series(evaluator)
+        pos_color, neg_color = _get_charge_colors(evaluator.cfg, evaluator.algorithm)
+        marker = evaluator.cfg.metrics.ALGORITHM_PLOT_STYLES[evaluator.algorithm].marker
+        algorithm_label = _get_charge_label(evaluator.cfg, evaluator.algorithm)
+
+        self.ax.plot(
+            x,
+            pos,
+            color=pos_color,
+            marker=marker,
+            linewidth=1.8,
+            markersize=5,
+            label=rf"{algorithm_label} $\tau^{{+}}$",
+        )
+        self.ax.plot(
+            x,
+            neg,
+            color=neg_color,
+            marker=marker,
+            linewidth=1.8,
+            markersize=5,
+            label=rf"{algorithm_label} $\tau^{{-}}$",
+        )
+
+        ratio = np.divide(
+            pos,
+            neg,
+            out=np.full_like(pos, np.nan, dtype=float),
+            where=np.isfinite(neg) & (neg > 0),
+        )
+        self.ax_ratio.plot(
+            x,
+            ratio,
+            color=pos_color,
+            marker=marker,
+            linewidth=1.6,
+            markersize=4.5,
+            label=algorithm_label,
+        )
+
+    def plot(self):
+        fig, (ax, ax_ratio) = plt.subplots(
+            2,
+            1,
+            figsize=(10, 10),
+            sharex=True,
+            gridspec_kw={"height_ratios": [3, 1]},
+        )
+
+        locator = ticker.MultipleLocator(
+            self.cfg.metrics.tagging.metrics[self.metric].x_maj_tick_spacing
+        )
+        ax.xaxis.set_major_locator(locator)
+        ax_ratio.xaxis.set_major_locator(locator)
+
+        if self.quantity == "efficiency":
+            ylabel = self.cfg.metrics.tagging.performances.efficiency.ylabel
+            yscale = self.cfg.metrics.tagging.performances.efficiency.yscale
+            ylim = self.cfg.metrics.tagging.performances.efficiency.ylim
+        else:
+            ylabel = self.cfg.metrics.tagging.performances.fakerate.ylabel
+            yscale = self.cfg.metrics.tagging.performances.fakerate.yscale
+            ylim = self.cfg.metrics.tagging.performances.fakerate.ylim
+
+        ax.set_ylabel(rf"{ylabel}", fontsize=24)
+        ax.set_yscale(yscale)
+        if ylim is not None:
+            ax.set_ylim(tuple(ylim))
+        ax.tick_params(axis="x", labelsize=24)
+        ax.tick_params(axis="y", labelsize=24)
+        ax.grid()
+        ax.text(
+            0.98,
+            0.95,
+            rf"$\varepsilon_\tau = {self.target_eff:.1f}$",
+            transform=ax.transAxes,
+            ha="right",
+            va="top",
+            fontsize=18,
+        )
+
+        ax_ratio.set_xlabel(
+            rf"{self.cfg.metrics.tagging.performances.fakerate.xlabel[self.metric]}",
+            fontsize=24,
+        )
+        ratio_label = (
+            r"$\varepsilon(\tau^{+}) / \varepsilon(\tau^{-})$"
+            if self.quantity == "efficiency"
+            else r"$P_{\mathrm{misid}}(\tau^{+}) / P_{\mathrm{misid}}(\tau^{-})$"
+        )
+        ax_ratio.set_ylabel(ratio_label, fontsize=16)
+        ax_ratio.axhline(1.0, color="gray", linestyle="--", linewidth=1.0)
+        ax_ratio.tick_params(axis="x", labelsize=24)
+        ax_ratio.tick_params(axis="y", labelsize=20)
+        ax_ratio.grid()
+        return fig, (ax, ax_ratio)
+
+    def save(self, output_path):
+        self.ax.legend(loc="best", prop={"size": 14})
+        self.ax_ratio.legend(loc="best", prop={"size": 11})
+        self.fig.savefig(output_path, format="pdf", bbox_inches="tight")
         plt.close("all")
 
 
@@ -687,6 +965,14 @@ class ChargeMultiEvaluator:
         self.fakerate_plots = {
             metric: FakeRatePlot(self.cfg, metric) for metric in self.metrics
         }
+        self.efficiency_asymmetry_plots = {
+            metric: AsymmetryPlot(self.cfg, metric, "efficiency")
+            for metric in self.metrics
+        }
+        self.fakerate_asymmetry_plots = {
+            metric: AsymmetryPlot(self.cfg, metric, "fakerate")
+            for metric in self.metrics
+        }
         self.roc_plot = ROCPlot(self.cfg)
         self.wp_values = {}
 
@@ -698,15 +984,25 @@ class ChargeMultiEvaluator:
             for metric in self.metrics:
                 self.efficiency_plots[metric].add_line(evaluator)
                 self.fakerate_plots[metric].add_line(evaluator)
+                self.efficiency_asymmetry_plots[metric].add_line(evaluator)
+                self.fakerate_asymmetry_plots[metric].add_line(evaluator)
 
     def save(self):
         for metric in self.metrics:
             fr_output_path = os.path.join(self.output_dir, f"{metric}_fakerates.pdf")
             self.fakerate_plots[metric].save(fr_output_path)
+            fr_asym_output_path = os.path.join(
+                self.output_dir, f"{metric}_fakerates_asymmetry.pdf"
+            )
+            self.fakerate_asymmetry_plots[metric].save(fr_asym_output_path)
             eff_output_path = os.path.join(
                 self.output_dir, f"{metric}_efficiencies.pdf"
             )
             self.efficiency_plots[metric].save(eff_output_path)
+            eff_asym_output_path = os.path.join(
+                self.output_dir, f"{metric}_efficiencies_asymmetry.pdf"
+            )
+            self.efficiency_asymmetry_plots[metric].save(eff_asym_output_path)
         roc_output_path = os.path.join(self.output_dir, f"ROC.pdf")
         self.roc_plot.save(roc_output_path)
         for algorithm in self.tagging_plots.keys():

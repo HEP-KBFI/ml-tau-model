@@ -308,6 +308,7 @@ class LinePlot:
         self.yscale = yscale
         self.nticks = nticks
         self.ymin, self.ymax = ymin, ymax
+        self._y_values = []
         self.fig, self.ax = self.plot()
 
     def add_line(self, x_values, y_values, algorithm, label=""):
@@ -323,7 +324,47 @@ class LinePlot:
             lw=self.cfg.metrics.ALGORITHM_PLOT_STYLES[algorithm].lw,
             ms=10,
         )
+        finite_y = np.asarray(y_values, dtype=float)
+        finite_y = finite_y[np.isfinite(finite_y)]
+        if finite_y.size > 0:
+            self._y_values.append(finite_y)
         self.ax.legend()
+
+    def _autoscale_y(self):
+        if self.yscale != "linear" or not self._y_values:
+            return
+
+        y = np.concatenate(self._y_values)
+        y_min = float(np.min(y))
+        y_max = float(np.max(y))
+
+        if np.isclose(y_min, y_max):
+            pad = max(abs(y_min) * 0.1, 1e-3)
+        else:
+            pad = max((y_max - y_min) * 0.15, 1e-3)
+
+        lower = y_min - pad
+        upper = y_max + pad
+
+        # Keep positive-only metrics anchored at zero when appropriate.
+        if y_min >= 0 and lower < 0:
+            lower = 0.0
+
+        self.ax.set_ylim((lower, upper))
+        self.ax.yaxis.set_ticks(np.linspace(lower, upper, self.nticks))
+        self._set_y_formatter(lower, upper)
+
+    def _set_y_formatter(self, lower, upper, axis=None):
+        if axis is None:
+            axis = self.ax
+        span = abs(upper - lower)
+        magnitude = max(abs(lower), abs(upper))
+        if span < 0.01 or magnitude < 0.01:
+            axis.yaxis.set_major_formatter(ticker.FormatStrFormatter("%0.4f"))
+        elif span < 0.1 or magnitude < 0.1:
+            axis.yaxis.set_major_formatter(ticker.FormatStrFormatter("%0.3f"))
+        else:
+            axis.yaxis.set_major_formatter(ticker.FormatStrFormatter("%0.2f"))
 
     def plot(self):
         fig, ax = plt.subplots(figsize=(8, 8))
@@ -335,10 +376,11 @@ class LinePlot:
         ax.grid()
         start, end = ax.get_ylim()
         ax.yaxis.set_ticks(np.linspace(start, end, self.nticks))
-        ax.yaxis.set_major_formatter(ticker.FormatStrFormatter("%0.2f"))
+        self._set_y_formatter(start, end, axis=ax)
         return fig, ax
 
     def save(self, output_path: str):
+        self._autoscale_y()
         self.fig.savefig(output_path, bbox_inches="tight", format="pdf")
         plt.close("all")
 

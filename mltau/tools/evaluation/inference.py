@@ -34,6 +34,7 @@ import lightning as L
 import torch
 from torch.utils.data import DataLoader
 from omegaconf import DictConfig
+from tqdm.auto import tqdm
 
 from mltau.tools.general import reinitialize_p4, one_hot_decoding
 from mltau.tools.io.general import BatchInputs
@@ -128,24 +129,25 @@ def postprocess_multi_predictions(
 
 
 def postprocess_single_predictions(predictions, reco_jet_p4s, task):
-    ret = {}
     if task == "kinematics":
         pred_p4 = decode_kinematic_predictions(
             predictions[task], reco_jet_p4s=reco_jet_p4s
         )
-        ret = {"tau_p4": pred_p4}
+        ret = ak.Array({"tau_p4": pred_p4})
     elif task == "decay_mode":
         dm_class, dm_probs = decode_decay_mode_predictions(predictions[task])
-        ret = {
-            "tau_decay_mode": dm_class,
-            "tau_decay_mode_probs": dm_probs,
-        }
+        ret = ak.Array(
+            {
+                "tau_decay_mode": dm_class,
+                "tau_decay_mode_probs": dm_probs,
+            }
+        )
     elif task == "is_tau":
         tagging_score = to_np(predictions[task])  # (N,)
-        ret = {"tau_tagging_score": tagging_score}
+        ret = ak.Array({"tau_tagging_score": tagging_score})
     elif task == "charge":
         charge_score = to_np(predictions[task])  # (N,)
-        ret = {"tau_charge_score": charge_score}
+        ret = ak.Array({"tau_charge_score": charge_score})
     else:
         raise NotImplementedError(f"Task '{task}' is not implemented.")
     return ret
@@ -184,8 +186,25 @@ def create_predictions_files(
     best_model, cfg: DictConfig, model_name: str, test_only: bool = True
 ):
     split = "test" if test_only else "*"
-    # Iterate over -all- the requested files to create predictions
-    paths_to_process = glob.glob(os.path.join(cfg.dataset.data_dir, f"*_{split}.pt"))
+    # Match the training-time sample routing:
+    # - MultiParTau and SingleParTau tau-ID use all samples
+    # - other SingleParTau tasks use only z samples
+    sample_pattern = "*"
+    if model_name == "SingleParTau" and cfg.training.model.task != "is_tau":
+        sample_pattern = "z"
+
+    paths_to_process = glob.glob(
+        os.path.join(cfg.dataset.data_dir, f"{sample_pattern}_{split}.pt")
+    )
+    if not paths_to_process:
+        print(
+            "[WARNING] No input files matched for prediction creation:",
+            os.path.join(cfg.dataset.data_dir, f"{sample_pattern}_{split}.pt"),
+        )
+        return
+    print("[INFO] Prediction inputs:")
+    for input_path in paths_to_process:
+        print(" -", input_path)
     for input_path in paths_to_process:
         create_predictions_file(best_model, input_path, model_name, cfg)
 
@@ -194,17 +213,14 @@ def create_predictions_file(
     best_model, input_path: str, model_name: str, cfg: DictConfig
 ):
     # Load your .pt file and build the dataset
-    trainer = L.Trainer(enable_progress_bar=True)
-    tensors = torch.load(input_path, weights_only=True)
     tensors = load_tensors(input_path)
     dataset = ParticleTransformerDataset(
-        tensors, batch_size=cfg.training.dataloader.batch_size
+        tensors,
+        batch_size=cfg.training.dataloader.batch_size,
+        shuffle=False,
     )
     # Create DataLoader
     dataloader = DataLoader(dataset, batch_size=None)
-
-    # Run prediction
-    predictions = trainer.predict(best_model, dataloaders=dataloader)
 
     # --- Postprocess and save as {sample}_test.parquet ---
 
@@ -214,84 +230,117 @@ def create_predictions_file(
         all_gen_jet_tau_p4,
         all_gen_jet_tau_decaymode,
         all_gen_jet_tau_charge,
-    ) = ([], [], [], [], [])
+        all_is_tau,
+    ) = ([], [], [], [], [], [])
     all_cand_charges = []
     all_cand_p4 = []
     all_post = []
 
-    for i, batch in enumerate(dataloader):
-        inputs = BatchInputs(*batch)
-        # Get ground truth fields
-        all_gen_jet_p4.append(ak.Array(inputs.gen_jet_p4s))
-        all_reco_jet_p4.append(ak.Array(inputs.reco_jet_p4s))
-        all_gen_jet_tau_p4.append(ak.Array(inputs.gen_jet_tau_p4s))
-        all_gen_jet_tau_decaymode.append(
-            inputs.target["decay_mode"].detach().cpu().numpy()
-        )
-        all_gen_jet_tau_charge.append(inputs.target["charge"].detach().cpu().numpy())
+    def _move_to_device(item, device):
+        if isinstance(item, torch.Tensor):
+            return item.to(device)
+        if isinstance(item, dict):
+            return {k: _move_to_device(v, device) for k, v in item.items()}
+        if isinstance(item, (list, tuple)):
+            return type(item)(_move_to_device(v, device) for v in item)
+        return item
 
-        # --- Candidate mask: 1 for real, 0 for padded ---
-        cand_features = (
-            inputs.cand_features.detach().cpu().numpy()
-        )  # (n_jets, n_cands, n_features)
-        cand_kinematics = (
-            inputs.cand_kinematics_pxpypze.detach().cpu().numpy()
-        )  # (n_jets, n_cands, 4)
-        cand_mask = (
-            inputs.cand_mask.detach().cpu().numpy().astype(bool)
-        )  # (n_jets, n_cands)
+    try:
+        device = next(best_model.parameters()).device
+    except StopIteration:
+        device = torch.device("cpu")
 
-        # --- Feature index for charge ---
-        charge_idx = -1  # <-- Adjust if charge is not last feature
-        batch_cand_charges = []
-        batch_cand_p4 = []
-        n_jets, n_cands, _ = cand_features.shape
-        for jet_idx in range(n_jets):
-            mask = cand_mask[jet_idx]  # (n_cands,)
-            real_idx = np.where(mask)[0]
-            if len(real_idx) == 0:
-                batch_cand_charges.append(np.array([]))
+    best_model.eval()
+
+    progress_desc = f"{model_name} inference on {os.path.basename(input_path)}"
+    with tqdm(dataloader, desc=progress_desc, unit="batch") as progress:
+        for i, batch in enumerate(progress):
+            batch_on_device = _move_to_device(batch, device)
+            with torch.no_grad():
+                preds = best_model.predict_step(batch_on_device, i)
+
+            inputs = BatchInputs(*batch)
+            # Get ground truth fields
+            all_gen_jet_p4.append(ak.Array(inputs.gen_jet_p4s))
+            all_reco_jet_p4.append(ak.Array(inputs.reco_jet_p4s))
+            all_gen_jet_tau_p4.append(ak.Array(inputs.gen_jet_tau_p4s))
+            all_gen_jet_tau_decaymode.append(
+                inputs.target["decay_mode"].detach().cpu().numpy()
+            )
+            all_gen_jet_tau_charge.append(
+                inputs.target["charge"].detach().cpu().numpy()
+            )
+            all_is_tau.append(inputs.target["is_tau"].detach().cpu().numpy())
+
+            # --- Candidate mask: 1 for real, 0 for padded ---
+            cand_features = (
+                inputs.cand_features.detach().cpu().numpy()
+            )  # (n_jets, n_cands, n_features)
+            cand_kinematics = (
+                inputs.cand_kinematics_pxpypze.detach().cpu().numpy()
+            )  # (n_jets, n_cands, 4)
+            cand_mask = (
+                inputs.cand_mask.detach().cpu().numpy().astype(bool)
+            )  # (n_jets, n_cands)
+
+            # --- Feature index for charge ---
+            charge_idx = 7  # Feature index 7 is charge
+            batch_cand_charges = []
+            batch_cand_p4 = []
+            n_jets, n_cands, _ = cand_features.shape
+            for jet_idx in range(n_jets):
+                mask = cand_mask[jet_idx]  # (n_cands,)
+                real_idx = np.where(mask)[0]
+                if len(real_idx) == 0:
+                    batch_cand_charges.append(np.array([]))
+                    batch_cand_p4.append(
+                        {
+                            "px": np.array([]),
+                            "py": np.array([]),
+                            "pz": np.array([]),
+                            "energy": np.array([]),
+                        }
+                    )
+                    continue
+                charges = cand_features[jet_idx, real_idx, charge_idx]
+                kin = cand_kinematics[jet_idx, real_idx, :]
+                batch_cand_charges.append(charges)
                 batch_cand_p4.append(
                     {
-                        "px": np.array([]),
-                        "py": np.array([]),
-                        "pz": np.array([]),
-                        "energy": np.array([]),
+                        "px": kin[:, 0],
+                        "py": kin[:, 1],
+                        "pz": kin[:, 2],
+                        "energy": kin[:, 3],
                     }
                 )
-                continue
-            charges = cand_features[jet_idx, real_idx, charge_idx]
-            kin = cand_kinematics[jet_idx, real_idx, :]
-            batch_cand_charges.append(charges)
-            batch_cand_p4.append(
-                {
-                    "px": kin[:, 0],
-                    "py": kin[:, 1],
-                    "pz": kin[:, 2],
-                    "energy": kin[:, 3],
-                }
+            all_cand_charges.append(ak.Array(batch_cand_charges))
+            all_cand_p4.append(ak.Array(batch_cand_p4))
+
+            post = postprocess_predictions(
+                preds, ak.Array(inputs.reco_jet_p4s), model_name, cfg
             )
-        all_cand_charges.append(ak.Array(batch_cand_charges))
-        all_cand_p4.append(ak.Array(batch_cand_p4))
+            all_post.append(post)
 
     # Flatten
     gen_jet_p4 = ak.concatenate(all_gen_jet_p4)
     reco_jet_p4 = ak.concatenate(all_reco_jet_p4)
     gen_jet_tau_p4 = ak.concatenate(all_gen_jet_tau_p4)
-    gen_jet_tau_decaymode = np.concatenate(all_gen_jet_tau_decaymode)
-    gen_jet_tau_charge = np.concatenate(all_gen_jet_tau_charge)
+    decay_mode_target = np.concatenate(all_gen_jet_tau_decaymode)
+    charge_target = np.concatenate(all_gen_jet_tau_charge)
+    is_tau_target = np.concatenate(all_is_tau).astype(bool)
+
+    # Convert stored training targets back into physical truth labels for output.
+    decay_mode_indices = np.argmax(decay_mode_target, axis=-1)
+    gen_jet_tau_decaymode = np.where(
+        is_tau_target, one_hot_decoding(decay_mode_indices), -1
+    )
+    gen_jet_tau_charge = np.where(
+        is_tau_target,
+        np.where(charge_target >= 0.5, 1.0, -1.0),
+        np.nan,
+    )
     cand_charges = ak.concatenate(all_cand_charges)
     cand_p4 = ak.concatenate(all_cand_p4)
-
-    # Postprocess predictions (predictions is a list of dicts)
-    # Assume predictions[i] matches batch i
-    for i, batch in enumerate(dataloader):
-        inputs = BatchInputs(*batch)
-        preds = predictions[i]
-        post = postprocess_predictions(
-            preds, ak.Array(inputs.reco_jet_p4s), model_name, cfg
-        )
-        all_post.append(post)
     post = ak.concatenate(all_post)
 
     # Build output awkward array

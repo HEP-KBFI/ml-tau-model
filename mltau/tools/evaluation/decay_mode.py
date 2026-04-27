@@ -81,13 +81,8 @@ class DecayModeEvaluator:
             os.makedirs(self.output_dir, exist_ok=True)
         self.sample = sample
         self.algorithm = algorithm
-        self.pred_proba = pred_proba
-        self.predicted = np.argmax(pred_proba, axis=-1)
-        self.truth = np.argmax(truth, axis=-1)
-        self.confusion_matrix = metrics.confusion_matrix(self.truth, self.predicted)
-        self.normalized_confusion_matrix = metrics.confusion_matrix(
-            self.truth, self.predicted, normalize="true"
-        )
+        self.pred_proba = np.asarray(pred_proba)
+        self.predicted = np.argmax(self.pred_proba, axis=-1)
         self._decay_mode_name_mapping = {
             0: r"$h^{\pm}$",
             1: r"$h^{\pm}\pi^0$",
@@ -99,6 +94,21 @@ class DecayModeEvaluator:
         self.inverse_mapping = {
             i: key for i, key in enumerate(self._decay_mode_name_mapping.keys())
         }
+        self.forward_mapping = {key: i for i, key in self.inverse_mapping.items()}
+
+        truth = np.asarray(truth)
+        if truth.ndim == 1:
+            truth = truth.astype(int)
+            if np.any(truth > 5):
+                self.truth = np.vectorize(self.forward_mapping.get)(truth)
+            else:
+                self.truth = truth
+        else:
+            self.truth = np.argmax(truth, axis=-1)
+        self.confusion_matrix = metrics.confusion_matrix(self.truth, self.predicted)
+        self.normalized_confusion_matrix = metrics.confusion_matrix(
+            self.truth, self.predicted, normalize="true"
+        )
         self.categories = list(self._decay_mode_name_mapping.values())
         self.general_metrics, self.class_metrics = self._calculate_performance_metrics()
         self.class_performances = self.calculate_class_wise_metrics()

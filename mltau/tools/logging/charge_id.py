@@ -18,7 +18,6 @@ def log_charge_id_performance(
     tb_logger,
     current_epoch: int,
     dataset="train",
-    # baseline_charges: np.array = None,
 ):
     # Charge is only meaningful for signal taus — exclude background jets
     signal_mask = targets["is_tau"] == 1
@@ -26,10 +25,6 @@ def log_charge_id_performance(
     targets = targets["charge"][signal_mask]
     gen_jet_tau_p4s = gen_jet_tau_p4s[signal_mask]
     reco_jet_p4s = reco_jet_p4s[signal_mask]
-
-    # # Apply signal mask to baseline charges if provided
-    # if baseline_charges is not None:
-    #     baseline_charges = baseline_charges[signal_mask]
 
     evaluator = c.ChargeIdEvaluator(
         predicted=predictions,
@@ -39,7 +34,6 @@ def log_charge_id_performance(
         cfg=cfg,
         sample="all",
         algorithm="all",
-        # baseline_charges=baseline_charges,
     )
 
     # Classifier plot
