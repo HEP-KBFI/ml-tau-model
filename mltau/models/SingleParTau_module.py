@@ -87,7 +87,7 @@ class ParTauModule(L.LightningModule):
             params=self.ParTau.parameters(),
             lr=self.cfg.training.lr,
         )
-        
+
         # Check if estimated_stepping_batches is available and valid
         estimated_steps = getattr(self.trainer, "estimated_stepping_batches", None)
 
@@ -159,7 +159,6 @@ class ParTauModule(L.LightningModule):
         baseline_charges = numer / denom
         return baseline_charges.detach().cpu().numpy()
 
-    
     # def configure_optimizers(self):
     #     optimizer = torch.optim.RAdam(
     #         params=self.ParTau.parameters(),
@@ -278,7 +277,6 @@ class ParTauModule(L.LightningModule):
         tb_logger,
         current_epoch,
         dataset,
-        baseline_charges=None,
     ):
         kwargs = dict(
             targets=targets,
@@ -301,7 +299,6 @@ class ParTauModule(L.LightningModule):
                 reco_jet_p4s=reco_jet_p4s,
                 cfg=self.cfg,
                 dataset=dataset,
-                baseline_charges=baseline_charges,
                 **kwargs,
             )
         elif self.task == "decay_mode":
@@ -377,7 +374,9 @@ class ParTauModule(L.LightningModule):
 
             all_baseline_charges = None
             if self.task == "charge" and all_inputs:
-                baseline_chunks = [self._calculate_baseline_charges(inputs) for inputs in all_inputs]
+                baseline_chunks = [
+                    self._calculate_baseline_charges(inputs) for inputs in all_inputs
+                ]
                 all_baseline_charges = np.concatenate(baseline_chunks, axis=0)
 
             self._log_task_metrics(

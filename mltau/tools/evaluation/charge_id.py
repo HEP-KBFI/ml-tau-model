@@ -16,24 +16,6 @@ from mltau.tools.evaluation.histogram import Histogram
 plt.rcParams["mathtext.fontset"] = "stix"
 
 
-def jet_charge_qkappa(cand_charges, cand_pts, jet_pts, kappa=0.2):
-    """Calculate jet charge using Q*kappa weighting.
-
-    Args:
-        cand_charges: Candidate particle charges [batch, max_cands]
-        cand_pts: Candidate particle pTs [batch, max_cands]
-        jet_pts: Jet pTs [batch]
-        kappa: Weighting exponent
-
-    Returns:
-        Jet charge values ranging from -1 to +1
-    """
-    numer = ak.sum(cand_charges * (cand_pts**kappa), axis=1)
-    denom = jet_pts**kappa
-    denom = ak.where(denom == 0, 1.0, denom)
-    return ak.to_numpy(numer / denom)
-
-
 def _lighten_color(color, amount=0.55):
     rgb = np.array(mcolors.to_rgb(color))
     return tuple((1 - amount) * rgb + amount * np.ones_like(rgb))
@@ -74,19 +56,6 @@ class ChargeIdEvaluator:
         self.algorithm = algorithm
         truth = np.asarray(truth)
         predicted = np.asarray(predicted)
-
-        # Accept either binary truth labels {0,1} or physical signed charge {-1,+1}.
-        # Also drop NaN truth entries so parquet files can carry non-signal placeholders.
-        valid_mask = ~np.isnan(truth)
-        truth = truth[valid_mask]
-        predicted = predicted[valid_mask]
-        gen_jet_tau_p4s = gen_jet_tau_p4s[valid_mask]
-        reco_jet_p4s = reco_jet_p4s[valid_mask]
-
-        if np.any(truth < 0):
-            truth = (truth == 1).astype(int)
-        else:
-            truth = truth.astype(int)
 
         self.predicted = predicted
         self.gen_jet_tau_p4s = g.reinitialize_p4(gen_jet_tau_p4s)
@@ -247,8 +216,12 @@ class ChargeIdEvaluator:
             metric_mask = (values >= left) & (values < right)
             neg_sel = metric_mask & neg_truth
             pos_sel = metric_mask & pos_truth
-            fake_pos.append(np.mean(pred_charge_pos[neg_sel]) if np.any(neg_sel) else np.nan)
-            fake_neg.append(np.mean(pred_charge_neg[pos_sel]) if np.any(pos_sel) else np.nan)
+            fake_pos.append(
+                np.mean(pred_charge_pos[neg_sel]) if np.any(neg_sel) else np.nan
+            )
+            fake_neg.append(
+                np.mean(pred_charge_neg[pos_sel]) if np.any(pos_sel) else np.nan
+            )
 
         return centers, np.asarray(fake_pos), np.asarray(fake_neg)
 
@@ -281,8 +254,12 @@ class ChargeIdEvaluator:
             metric_mask = (values >= left) & (values < right)
             pos_sel = metric_mask & pos_truth
             neg_sel = metric_mask & neg_truth
-            eff_pos.append(np.mean(pred_charge_pos[pos_sel]) if np.any(pos_sel) else np.nan)
-            eff_neg.append(np.mean(pred_charge_neg[neg_sel]) if np.any(neg_sel) else np.nan)
+            eff_pos.append(
+                np.mean(pred_charge_pos[pos_sel]) if np.any(pos_sel) else np.nan
+            )
+            eff_neg.append(
+                np.mean(pred_charge_neg[neg_sel]) if np.any(neg_sel) else np.nan
+            )
 
         return centers, np.asarray(eff_pos), np.asarray(eff_neg)
 

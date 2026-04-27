@@ -164,62 +164,6 @@ class ParTauModule(L.LightningModule):
 
         return predictions
 
-    def _calculate_baseline_charges(
-        self, inputs
-    ):  # TODO: Should maybe add as a separate "algorithm" under evaluation and merge with inference?
-        """Calculate baseline jet charge using Q*kappa weighting."""
-        # Extract candidate data
-        cand_charges = inputs.cand_features[:, 7, :]  # Feature index 7 is charge
-        cand_mask = inputs.cand_mask[:, 0, :]  # Remove singleton dimension
-
-        # Calculate candidate pTs from px, py
-        px = inputs.cand_kinematics_pxpypze[:, 0, :]
-        py = inputs.cand_kinematics_pxpypze[:, 1, :]
-        cand_pts = torch.sqrt(px**2 + py**2)
-
-        # Get jet pTs - first convert dict to awkward array, then reinitialize p4
-        try:
-            # Convert dict to awkward array
-            reco_jet_p4s_ak = ak.Array(inputs.reco_jet_p4s)
-            reco_jet_p4s = g.reinitialize_p4(reco_jet_p4s_ak)
-
-            pt_values = reco_jet_p4s.pt
-
-            if hasattr(pt_values, "to_numpy"):
-                pt_numpy = pt_values.to_numpy()
-            else:
-                pt_numpy = ak.to_numpy(pt_values)
-
-            if pt_numpy.ndim == 0:
-                pt_numpy = np.array([pt_numpy])
-            elif pt_numpy.ndim > 1:
-                pt_numpy = pt_numpy.flatten()[: len(cand_charges)]
-
-            jet_pts = torch.tensor(
-                pt_numpy, dtype=torch.float32, device=cand_charges.device
-            )
-
-            if len(jet_pts) != len(cand_charges):
-                if len(jet_pts) == 1:
-                    jet_pts = jet_pts.repeat(len(cand_charges))
-                else:
-                    jet_pts = jet_pts[: len(cand_charges)]
-
-        except Exception as e:
-            print(f"Warning: Error processing reco_jet_p4s.pt: {e}")
-            jet_pts = torch.sum(cand_pts * cand_mask, dim=1)
-
-        cand_charges_masked = cand_charges * cand_mask
-        cand_pts_masked = cand_pts * cand_mask
-
-        kappa = 0.2
-        numer = torch.sum(cand_charges_masked * (cand_pts_masked**kappa), dim=1)
-        denom = jet_pts**kappa
-        denom = torch.where(denom == 0, torch.ones_like(denom), denom)
-
-        baseline_charges = numer / denom
-        return baseline_charges.detach().cpu().numpy()
-
     def forward(self, batch):
         """Both `predictions` and `targets` are defined for the multiple heads"""
         # Unpack batch components
@@ -356,7 +300,6 @@ class ParTauModule(L.LightningModule):
     def validation_step(self, batch, _batch_idx):
         predictions, targets, weights = self.forward(batch)
 
-        # Store inputs for baseline calculation at epoch end
         inputs = BatchInputs(*batch)
 
         metrics = self.calculate_metrics(
@@ -367,7 +310,7 @@ class ParTauModule(L.LightningModule):
             "predictions": predictions,
             "targets": targets,
             # "weights": weights,
-            "inputs": inputs,  # Store inputs for baseline calculation and p4s extraction at epoch end
+            "inputs": inputs,  # Store inputs for p4s extraction at epoch end
         }
         self.validation_outputs.append(output)
         for key, value in metrics.items():
@@ -470,12 +413,6 @@ class ParTauModule(L.LightningModule):
             reco_jet_p4s = ak.Array(all_reco_jet_p4s)
             gen_jet_tau_p4s = ak.Array(all_gen_jet_tau_p4s)
 
-            all_baseline_charges = []
-            for inputs in all_inputs:
-                baseline_charges = self._calculate_baseline_charges(inputs)
-                all_baseline_charges.append(baseline_charges)
-            all_baseline_charges = np.concatenate(all_baseline_charges, axis=0)
-
             # all_weights = ak.concatenate(all_weights, dim=0)
 
             # Log comprehensive metrics with full validation dataset
@@ -491,7 +428,6 @@ class ParTauModule(L.LightningModule):
                 tb_logger=tb_logger,
                 current_epoch=current_epoch,
                 dataset=dataset,
-                baseline_charges=all_baseline_charges,
             )
 
             # Clear outputs to free memory
