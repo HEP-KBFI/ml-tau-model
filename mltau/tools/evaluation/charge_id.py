@@ -57,6 +57,12 @@ class ChargeIdEvaluator:
         truth = np.asarray(truth)
         predicted = np.asarray(predicted)
 
+        # Accept either binary truth labels {0,1} or physical signed charge {-1,+1}.
+        if np.any(truth < 0):
+            truth = (truth == 1).astype(int)
+        else:
+            truth = truth.astype(int)
+
         self.predicted = predicted
         self.gen_jet_tau_p4s = g.reinitialize_p4(gen_jet_tau_p4s)
         self.reco_jet_p4s = g.reinitialize_p4(reco_jet_p4s)
