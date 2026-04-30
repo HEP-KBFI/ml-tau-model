@@ -33,25 +33,18 @@ class ParTauModule(L.LightningModule):
         )
 
         # Initialize loss functions once to avoid memory allocation overhead
-        self.charge_loss = nn.BCEWithLogitsLoss(
-            reduction="none"
-        )  # For raw logits - avoids bias from double sigmoid
-        # self.charge_loss = SigmoidFocalLoss(
-        #     reduction="none", gamma=0.0, alpha=0.5
-        # )  # class balance, so one could use BCE with sigmoid also.
+        self.charge_loss = nn.BCEWithLogitsLoss(reduction="none")
         self.tagging_loss = SigmoidFocalLoss(
             alpha=0.2, gamma=2.0, reduction="none"
         )  # class imbalance
         self.decay_mode_loss = nn.CrossEntropyLoss(reduction="none")
         self.kinematics_loss = nn.HuberLoss(reduction="none", delta=1.0)
 
-        # Uncertainty-based weighting parameters (learnable log variances)
-        # Following Kendall et al. "Multi-Task Learning Using Uncertainty to Weigh Losses"
-        # Initialize log variance parameters to 0 (corresponding to variance = 1)
-        self.log_var_tagging = nn.Parameter(torch.zeros(1))
-        self.log_var_charge = nn.Parameter(torch.zeros(1))
-        self.log_var_decay_mode = nn.Parameter(torch.zeros(1))
-        self.log_var_kinematics = nn.Parameter(torch.zeros(1))
+        self.num_tasks = 4
+        # Learnable loss weights (initialized equally)
+        self.task_weights = nn.Parameter(torch.ones(self.num_tasks))
+        # Store initial losses for GradNorm
+        self.initial_losses = None
 
     def training_step(self, batch, batch_idx):
         predictions, targets, weights = self.forward(batch)
@@ -92,21 +85,9 @@ class ParTauModule(L.LightningModule):
 
     def configure_optimizers(self):
         # AdamW is generally preferred for transformer architectures
-        # Use a 10x lower LR for log_var parameters to prevent them from
-        # racing ahead of the main network and collapsing tasks
-        log_var_params = [
-            self.log_var_tagging,
-            self.log_var_charge,
-            self.log_var_decay_mode,
-            self.log_var_kinematics,
-        ]
-        log_var_param_ids = {id(p) for p in log_var_params}
-        main_params = [p for p in self.parameters() if id(p) not in log_var_param_ids]
         optimizer = torch.optim.AdamW(
-            [
-                {"params": main_params, "lr": self.cfg.training.lr},
-                {"params": log_var_params, "lr": self.cfg.training.lr * 0.1},
-            ],
+            params=self.ParTau.parameters(),
+            lr=self.cfg.training.lr,
         )
         # if self.cfg.training.optimizer.use_lookahead:
         #     optimizer = Lookahead(base_optimizer=optimizer, k=6, alpha=0.5)
@@ -208,7 +189,9 @@ class ParTauModule(L.LightningModule):
             4.0 + l_m
         )  # Normalize by sum of weights: 4 * 1.0 + l_m
 
-    def calculate_metrics(self, targets, predictions, weights):
+    def calculate_metrics(
+        self, targets, predictions, weights, w_kin=1, w_dm=1, w_tag=1, w_charge=1
+    ):
         is_tau_mask = targets["is_tau"].bool()
 
         # Per-jet losses — shape [N]
@@ -216,25 +199,16 @@ class ParTauModule(L.LightningModule):
             predictions["is_tau"], targets["is_tau"]
         )
 
-        if not is_tau_mask.any():
-            # Only tagging loss when no tau jets present
-            # Apply uncertainty weighting: L = (1/(2*exp(log_var))) * loss + 1.0 * log_var
-            log_var_tag_clamped = self.log_var_tagging.clamp(min=-4.0, max=4.0)
-            precision = torch.exp(-log_var_tag_clamped)
-            weighted_tagging_loss = (
-                0.5 * precision * tau_id_loss_per_jet * weights
-            ).mean() + 1.0 * log_var_tag_clamped
+        # Start combined per-jet loss with tagging term
+        combined_per_jet = w_tag * tau_id_loss_per_jet
 
+        if not is_tau_mask.any():
             return {
                 "tau_id_loss": tau_id_loss_per_jet.mean(),
-                "charge_loss": tau_id_loss_per_jet.new_zeros(()),
-                "decay_mode_loss": tau_id_loss_per_jet.new_zeros(()),
-                "kinematics_loss": tau_id_loss_per_jet.new_zeros(()),
-                "tau_id_loss_weighted": weighted_tagging_loss.squeeze(),
-                "charge_loss_weighted": tau_id_loss_per_jet.new_zeros(()),
-                "decay_mode_loss_weighted": tau_id_loss_per_jet.new_zeros(()),
-                "kinematics_loss_weighted": tau_id_loss_per_jet.new_zeros(()),
-                "loss": weighted_tagging_loss.squeeze(),
+                "charge_loss": combined_per_jet.new_zeros(()),
+                "decay_mode_loss": combined_per_jet.new_zeros(()),
+                "kinematics_loss": combined_per_jet.new_zeros(()),
+                "loss": (combined_per_jet * weights).mean(),
             }
 
         # Per-jet losses for signal-only heads — shape [N_signal]
@@ -248,53 +222,31 @@ class ParTauModule(L.LightningModule):
             predictions["kinematics"][is_tau_mask], targets["kinematics"][is_tau_mask]
         )
 
-        # Apply uncertainty-based weighting following Kendall et al.
-        # L = (1/(2*exp(log_var))) * loss + 1.0 * log_var  (beta=1.0 to penalise task collapse)
-        # Clamp log_var to prevent task collapse (network zeroing out hard tasks)
-        # Tagging is learning well so allow wider range; signal tasks clamped tighter
-        # to enforce minimum precision floor: exp(-1.5) ≈ 0.22 for signal tasks
-        log_var_tagging = self.log_var_tagging.clamp(min=-4.0, max=4.0)
-        log_var_charge = self.log_var_charge.clamp(min=-4.0, max=1.5)
-        log_var_decay_mode = self.log_var_decay_mode.clamp(min=-4.0, max=1.5)
-        log_var_kinematics = self.log_var_kinematics.clamp(min=-4.0, max=1.5)
+        # loss = torch.stack(
+        #     [
+        #         tau_id_loss_per_jet,
+        #         dm_loss_per_jet,
+        #         charge_loss_per_jet,
+        #         kin_loss_per_jet,
+        #     ]
+        # )
 
-        # Calculate precisions (inverse variances)
-        precision_tagging = torch.exp(-log_var_tagging)
-        precision_charge = torch.exp(-log_var_charge)
-        precision_dm = torch.exp(-log_var_decay_mode)
-        precision_kin = torch.exp(-log_var_kinematics)
+        # Add signal-only terms into combined per-jet loss
+        combined_per_jet[is_tau_mask] += (
+            w_dm * dm_loss_per_jet
+            + w_charge * charge_loss_per_jet
+            + w_kin * kin_loss_per_jet
+        )
 
-        # Apply uncertainty weighting to tagging task (with classification weights)
-        weighted_tagging_loss = (
-            0.5 * precision_tagging * tau_id_loss_per_jet * weights
-        ).mean() + 1.0 * log_var_tagging
-
-        # Apply uncertainty weighting to signal tasks (no classification weights)
-        weighted_charge_loss = (
-            0.5 * precision_charge * charge_loss_per_jet
-        ).mean() + 1.0 * log_var_charge
-        weighted_dm_loss = (
-            0.5 * precision_dm * dm_loss_per_jet
-        ).mean() + 1.0 * log_var_decay_mode
-        weighted_kin_loss = (
-            0.5 * precision_kin * kin_loss_per_jet
-        ).mean() + 1.0 * log_var_kinematics
-
-        signal_losses = weighted_charge_loss + weighted_dm_loss + weighted_kin_loss
-        loss = weighted_tagging_loss + signal_losses
-
-        # No degradation correction: pure uncertainty weighting with clamped log_var
+        # Multiply each jet's combined loss by its cls_weight, then average
+        loss = (combined_per_jet * weights).mean()
 
         return {
             "tau_id_loss": tau_id_loss_per_jet.mean(),
             "charge_loss": charge_loss_per_jet.mean(),
             "decay_mode_loss": dm_loss_per_jet.mean(),
             "kinematics_loss": kin_loss_per_jet.mean(),
-            "tau_id_loss_weighted": weighted_tagging_loss.squeeze(),
-            "charge_loss_weighted": weighted_charge_loss.squeeze(),
-            "decay_mode_loss_weighted": weighted_dm_loss.squeeze(),
-            "kinematics_loss_weighted": weighted_kin_loss.squeeze(),
-            "loss": loss.squeeze(),
+            "loss": loss,
         }
 
     def validation_step(self, batch, _batch_idx):
