@@ -168,7 +168,14 @@ def log_all_kinematics_metrics(
     pred_pt = np.exp(signal_predictions[:, 0]) * reco.pt
     true_pt = np.exp(signal_targets[:, 0]) * reco.pt
     _log_single_variable(
-        pred_pt, true_pt, "pt", cfg.metrics.kinematics.pt, cfg, tb_logger, current_epoch, reco_pred=np.array(reco.pt)
+        pred_pt,
+        true_pt,
+        "pt",
+        cfg.metrics.kinematics.pt,
+        cfg,
+        tb_logger,
+        current_epoch,
+        reco_pred=np.array(reco.pt),
     )
 
     # --- eta (direct: index 1 is delta_eta = gen_eta - reco_eta) ---
@@ -203,16 +210,17 @@ def log_all_kinematics_metrics(
     )
 
     # --- phi (indices 2,3 are sin/cos of delta_phi; radians → degrees) ---
-    pred_dphi = np.arctan2(
-        np.array(signal_predictions[:, 2]), np.array(signal_predictions[:, 3])
-    )
-    true_dphi = np.arctan2(
-        np.array(signal_targets[:, 2]), np.array(signal_targets[:, 3])
-    )
-    pred_phi_rad = np.array(reco.phi) + pred_dphi
-    true_phi_rad = np.array(reco.phi) + true_dphi
-    pred_phi_deg = np.rad2deg(pred_phi_rad)
-    true_phi_deg = np.rad2deg(true_phi_rad)
+
+    pred_sin_phi = np.array(signal_predictions[:, 2]) + np.sin(reco.phi)
+    pred_cos_phi = np.array(signal_predictions[:, 3]) + np.cos(reco.phi)
+    pred_phi = np.arctan2(pred_sin_phi, pred_cos_phi)
+
+    true_sin_phi = np.array(signal_targets[:, 2]) + np.sin(reco.phi)
+    true_cos_phi = np.array(signal_targets[:, 3]) + np.cos(reco.phi)
+    true_phi = np.arctan2(true_sin_phi, true_cos_phi)
+
+    pred_phi_deg = np.rad2deg(pred_phi)
+    true_phi_deg = np.rad2deg(true_phi)
     _log_single_variable(
         pred_phi_deg,
         true_phi_deg,
@@ -267,7 +275,9 @@ def log_all_kinematics_metrics(
     )
     reco_dphi_dr = np.array(reco.phi) - np.array(gen_tau.phi)
     reco_dphi_dr = np.arctan2(np.sin(reco_dphi_dr), np.cos(reco_dphi_dr))
-    reco_deltaR = np.sqrt((np.array(reco.eta) - np.array(gen_tau.eta)) ** 2 + reco_dphi_dr**2)
+    reco_deltaR = np.sqrt(
+        (np.array(reco.eta) - np.array(gen_tau.eta)) ** 2 + reco_dphi_dr**2
+    )
     reco_deltaR_evaluator = k.DeltaREvaluator(
         deltaR=reco_deltaR,
         pt_truth=np.array(true_pt),
