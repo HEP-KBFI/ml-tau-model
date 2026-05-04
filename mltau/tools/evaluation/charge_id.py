@@ -7,6 +7,7 @@ import mplhep as hep
 import matplotlib.pyplot as plt
 from matplotlib import ticker
 from matplotlib import colors as mcolors
+from matplotlib.lines import Line2D
 
 from omegaconf import DictConfig
 from mltau.tools import general as g
@@ -198,9 +199,15 @@ class ChargeIdEvaluator:
     ):
         values = self._metric_values(metric)
         metric_cfg = self.cfg.metrics.charge.metrics[metric]
-        bin_edges = np.linspace(
-            metric_cfg.x_range[0], metric_cfg.x_range[1], metric_cfg.n_bins + 1
-        )
+        # bin_edges = np.linspace(
+        #     metric_cfg.x_range[0], metric_cfg.x_range[1], metric_cfg.n_bins + 1
+        # )
+        if metric == "pt":
+            bin_edges = np.array([10, 20, 30, 40, 50])
+        else:
+            bin_edges = np.linspace(
+                metric_cfg.x_range[0], metric_cfg.x_range[1], metric_cfg.n_bins + 1
+            )
         centers = 0.5 * (bin_edges[:-1] + bin_edges[1:])
         threshold_pos = self.choose_threshold_for_target_eff_per_class(
             target_eff, "positive"
@@ -223,11 +230,17 @@ class ChargeIdEvaluator:
             neg_sel = metric_mask & neg_truth
             pos_sel = metric_mask & pos_truth
             fake_pos.append(
-                np.mean(pred_charge_pos[neg_sel]) if np.any(neg_sel) else np.nan
+                np.mean(pred_charge_pos[neg_sel]) if np.sum(neg_sel) > 5 else np.nan
             )
             fake_neg.append(
-                np.mean(pred_charge_neg[pos_sel]) if np.any(pos_sel) else np.nan
+                np.mean(pred_charge_neg[pos_sel]) if np.sum(pos_sel) > 5 else np.nan
             )
+            # fake_pos.append(
+            #     np.mean(pred_charge_pos[neg_sel]) if np.any(neg_sel) else np.nan
+            # )
+            # fake_neg.append(
+            #     np.mean(pred_charge_neg[pos_sel]) if np.any(pos_sel) else np.nan
+            # )
 
         return centers, np.asarray(fake_pos), np.asarray(fake_neg)
 
@@ -236,9 +249,15 @@ class ChargeIdEvaluator:
     ):
         values = self._metric_values(metric)
         metric_cfg = self.cfg.metrics.charge.metrics[metric]
-        bin_edges = np.linspace(
-            metric_cfg.x_range[0], metric_cfg.x_range[1], metric_cfg.n_bins + 1
-        )
+        # bin_edges = np.linspace(
+        #     metric_cfg.x_range[0], metric_cfg.x_range[1], metric_cfg.n_bins + 1
+        # )
+        if metric == "pt":
+            bin_edges = np.array([10, 20, 30, 40, 50])
+        else:
+            bin_edges = np.linspace(
+                metric_cfg.x_range[0], metric_cfg.x_range[1], metric_cfg.n_bins + 1
+            )
         centers = 0.5 * (bin_edges[:-1] + bin_edges[1:])
         threshold_pos = self.choose_threshold_for_target_eff_per_class(
             target_eff, "positive"
@@ -261,11 +280,17 @@ class ChargeIdEvaluator:
             pos_sel = metric_mask & pos_truth
             neg_sel = metric_mask & neg_truth
             eff_pos.append(
-                np.mean(pred_charge_pos[pos_sel]) if np.any(pos_sel) else np.nan
+                np.mean(pred_charge_pos[pos_sel]) if np.sum(pos_sel) > 5 else np.nan
             )
             eff_neg.append(
-                np.mean(pred_charge_neg[neg_sel]) if np.any(neg_sel) else np.nan
+                np.mean(pred_charge_neg[neg_sel]) if np.sum(neg_sel) > 5 else np.nan
             )
+            # eff_pos.append(
+            #     np.mean(pred_charge_pos[pos_sel]) if np.any(pos_sel) else np.nan
+            # )
+            # eff_neg.append(
+            #     np.mean(pred_charge_neg[neg_sel]) if np.any(neg_sel) else np.nan
+            # )
 
         return centers, np.asarray(eff_pos), np.asarray(eff_neg)
 
@@ -508,22 +533,30 @@ class ChargeClassifierPlot:
         hep.histplot(
             pos_histogram,
             bins=self.bin_edges,
-            histtype="step",
+            # histtype="step",
+            histtype="fill",
             label=rf"{algorithm_label} $\tau^{{+}}$",
             ls=linestyle,
             color=pos_color,
+            alpha=0.6,
+            hatch="\\",
+            edgecolor=pos_color,
             ax=self.ax,
         )
         hep.histplot(
             neg_histogram,
             bins=self.bin_edges,
-            histtype="step",
+            # histtype="step",
+            histtype="fill",
             label=rf"{algorithm_label} $\tau^{{-}}$",
             ls=linestyle,
             color=neg_color,
+            alpha=0.6,
+            hatch="//",
+            edgecolor=neg_color,
             ax=self.ax,
         )
-        self.ax.legend(prop={"size": 28})
+        self.ax.legend(prop={"size": 28}, loc ='upper center')
 
     def plot(self):
         fig, ax = plt.subplots(figsize=(10, 10))
@@ -552,7 +585,6 @@ class ROCPlot:
         ax.set_xlim((0, 1))
         ax.xaxis.set_major_locator(ticker.MultipleLocator(0.2))
         ax.set_yscale("log")
-        plt.grid()
         return fig, ax
 
     def add_line(self, evaluator):
@@ -565,7 +597,8 @@ class ROCPlot:
             evaluator.fakerates["positive"],
             color=pos_color,
             marker=marker,
-            label=rf"{algorithm_label} $\tau^{{+}}$",
+            # label=rf"{algorithm_label} $\tau^{{+}}$",
+            label=None,
             ms=8,
             ls="",
         )
@@ -574,12 +607,13 @@ class ROCPlot:
             evaluator.fakerates["negative"],
             color=neg_color,
             marker=marker,
-            label=rf"{algorithm_label} $\tau^{{-}}$",
+            # label=rf"{algorithm_label} $\tau^{{-}}$",
+            label=None,
             ms=8,
             ls="",
         )
 
-        # Baseline charge curves (if available)
+        # Baseline charge curves
         if (
             hasattr(evaluator, "baseline_efficiencies")
             and evaluator.baseline_efficiencies is not None
@@ -590,7 +624,8 @@ class ROCPlot:
                 evaluator.baseline_fakerates["positive"],
                 color=baseline_pos,
                 marker="o",
-                label=r"QKappa $\tau^{+}$",
+                # label=r"QKappa $\tau^{+}$",
+                label=None,
                 ms=6,
                 ls="--",
                 alpha=0.7,
@@ -600,27 +635,69 @@ class ROCPlot:
                 evaluator.baseline_fakerates["negative"],
                 color=baseline_neg,
                 marker="v",
-                label=r"QKappa $\tau^{-}$",
+                # label=r"QKappa $\tau^{-}$",
+                label=None,
                 ms=6,
                 ls="--",
                 alpha=0.7,
             )
-        # Mark the 95% average efficiency working point on both curves
-        idx = evaluator.wp_idx
-        for eff_key, fake_key in [
-            ("positive", "positive"),
-            ("negative", "negative"),
-        ]:
-            self.ax.plot(
-                evaluator.efficiencies[eff_key][idx],
-                evaluator.fakerates[fake_key][idx],
-                marker="*",
-                color="k",
-                ms=25,
-                zorder=5,
-                linestyle="",
+        # self.ax.legend(loc="upper left", prop={"size": 20})
+    # Create a custom legend for the ROC
+    def finalize_legend(self):
+        handles = []
+
+        # --- Models (ONLY positive colors)
+        wanted_algos = ["SingleParTau", "MultiParTau"]
+
+        for algo in wanted_algos:
+            style = self.cfg.metrics.ALGORITHM_PLOT_STYLES[algo]
+            handles.append(
+                Line2D(
+                    [0], [0],
+                    color=style.color,
+                    marker=style.marker,
+                    linestyle="",
+                    label=style.name,
+                    markersize=8,
+                )
             )
-        self.ax.legend(prop={"size": 30})
+
+        # --- Baseline (QKappa)
+        style = self.cfg.metrics.ALGORITHM_PLOT_STYLES["QKappa"]
+        handles.append(
+            Line2D(
+                [0], [0],
+                color=style.color,
+                marker=style.marker,
+                linestyle="",
+                label=style.name,
+                markersize=8,
+            )
+        )
+
+        # --- Charge encoding (THIS is the key part)
+        handles.append(
+            Line2D(
+                [0], [0],
+                color="black",
+                marker="o",
+                linestyle="",
+                alpha=1.0,
+                label=r"$\tau^{+}$",
+            )
+        )
+        handles.append(
+            Line2D(
+                [0], [0],
+                color="black",
+                marker="o",
+                linestyle="",
+                alpha=0.3,
+                label=r"$\tau^{-}$",
+            )
+        )
+
+        self.ax.legend(handles=handles, loc="upper left", prop={"size": 20})
 
     def save(self, output_path):
         self.fig.savefig(output_path, format="pdf")
@@ -684,7 +761,6 @@ class EfficiencyPlot:
         ax.set_ylim(tuple(ylim))
         ax.tick_params(axis="x", labelsize=30)
         ax.tick_params(axis="y", labelsize=30)
-        plt.grid()
         return fig, ax
 
     def save(self, output_path):
@@ -748,7 +824,6 @@ class FakeRatePlot:
         ax.set_ylim(ylim)
         ax.tick_params(axis="x", labelsize=30)
         ax.tick_params(axis="y", labelsize=30)
-        plt.grid()
         return fig, ax
 
     def save(self, output_path):
@@ -781,13 +856,19 @@ class AsymmetryPlot:
         marker = evaluator.cfg.metrics.ALGORITHM_PLOT_STYLES[evaluator.algorithm].marker
         algorithm_label = _get_charge_label(evaluator.cfg, evaluator.algorithm)
 
+        valid = np.isfinite(pos) & np.isfinite(neg)
+        x = x[valid]
+        pos = pos[valid]
+        neg = neg[valid]
+
         self.ax.plot(
             x,
             pos,
             color=pos_color,
             marker=marker,
             linewidth=1.8,
-            markersize=5,
+            markersize=10,
+            markevery=1,
             label=rf"{algorithm_label} $\tau^{{+}}$",
         )
         self.ax.plot(
@@ -796,7 +877,8 @@ class AsymmetryPlot:
             color=neg_color,
             marker=marker,
             linewidth=1.8,
-            markersize=5,
+            markersize=10,
+            markevery=1,
             label=rf"{algorithm_label} $\tau^{{-}}$",
         )
 
@@ -812,7 +894,8 @@ class AsymmetryPlot:
             color=pos_color,
             marker=marker,
             linewidth=1.6,
-            markersize=4.5,
+            markersize=10,
+            markevery=1,
             label=algorithm_label,
         )
 
@@ -822,14 +905,25 @@ class AsymmetryPlot:
             1,
             figsize=(10, 10),
             sharex=True,
-            gridspec_kw={"height_ratios": [3, 1]},
+            gridspec_kw={"height_ratios": [3, 1], "hspace": 0},
         )
 
-        locator = ticker.MultipleLocator(
-            self.cfg.metrics.tagging.metrics[self.metric].x_maj_tick_spacing
-        )
+        if self.metric == "pt":
+            locator = ticker.MultipleLocator(10)
+        else:
+            locator = ticker.MultipleLocator(
+                self.cfg.metrics.tagging.metrics[self.metric].x_maj_tick_spacing
+            )
+
         ax.xaxis.set_major_locator(locator)
         ax_ratio.xaxis.set_major_locator(locator)
+
+        if self.metric == "pt":
+            xmin, xmax = 10, 50
+        else:
+            xmin, xmax = self.cfg.metrics.tagging.metrics[self.metric].x_range
+        ax.set_xlim(xmin, xmax)
+        ax_ratio.set_xlim(xmin, xmax)
 
         if self.quantity == "efficiency":
             ylabel = self.cfg.metrics.tagging.performances.efficiency.ylabel
@@ -842,11 +936,15 @@ class AsymmetryPlot:
 
         ax.set_ylabel(rf"{ylabel}", fontsize=24)
         ax.set_yscale(yscale)
-        if ylim is not None:
-            ax.set_ylim(tuple(ylim))
+        if self.quantity == "fakerate":
+            ax.set_ylim(2*1e-4, 1e-1)
+        elif self.quantity == "efficiency":
+            ax.set_ylim(0.7, 1.0)
+        # if ylim is not None:
+        #     ax.set_ylim(tuple(ylim))
         ax.tick_params(axis="x", labelsize=24)
         ax.tick_params(axis="y", labelsize=24)
-        ax.grid()
+        ax.tick_params(labelbottom=False)
         ax.text(
             0.98,
             0.95,
@@ -870,12 +968,11 @@ class AsymmetryPlot:
         ax_ratio.axhline(1.0, color="gray", linestyle="--", linewidth=1.0)
         ax_ratio.tick_params(axis="x", labelsize=24)
         ax_ratio.tick_params(axis="y", labelsize=20)
-        ax_ratio.grid()
         return fig, (ax, ax_ratio)
 
     def save(self, output_path):
-        self.ax.legend(loc="best", prop={"size": 14})
-        self.ax_ratio.legend(loc="best", prop={"size": 11})
+        # self.ax.legend(loc="best", prop={"size": 14})
+        # self.ax_ratio.legend(loc="best", prop={"size": 11})
         self.fig.savefig(output_path, format="pdf", bbox_inches="tight")
         plt.close("all")
 
@@ -986,6 +1083,7 @@ class ChargeMultiEvaluator:
                 self.fakerate_plots[metric].add_line(evaluator)
                 self.efficiency_asymmetry_plots[metric].add_line(evaluator)
                 self.fakerate_asymmetry_plots[metric].add_line(evaluator)
+        self.roc_plot.finalize_legend()
 
     def save(self):
         for metric in self.metrics:

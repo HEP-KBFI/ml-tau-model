@@ -21,7 +21,7 @@ tagging:
             yscale: "log"
             ylim: [5e-6, 1e0]
     cuts:
-        min_pt: 20
+        min_pt: 10
         min_theta: 10
         max_theta: 170
     metrics:

@@ -85,7 +85,7 @@ class ParTau(ParticleTransformer):
         # Regression head kinematic reconstruction [pT_vis, theta, phi, m_vis]
         self.regression_head = nn.Linear(
             embed_dim, 5
-        )  # [log_pt, deta, sin(dphi), cos(dphi), log_m]
+        )  # [log_pt, deta, delta_sin(phi), delta_cos(phi), log_m]
         # Binary heads for tau-tagging and charge reco
         self.tau_id_head = nn.Linear(embed_dim, 1)
         self.tau_charge_head = nn.Linear(embed_dim, 1)
@@ -176,7 +176,7 @@ class ParTau(ParticleTransformer):
                 ),  # (N, num_dm_classes) - raw logits
                 "kinematics": self.regression_head(
                     x_kinematics
-                ),  # (N, 5) - [log_pt, deta, sin(dphi), cos(dphi), log_m]
+                ),  # (N, 5) - [log_pt, deta, delta_sin(phi), delta_cos(phi), log_m]
             }
 
             return output

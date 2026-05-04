@@ -194,16 +194,16 @@ class ParTauModule(L.LightningModule):
         deta_loss = self.kinematics_loss(predictions[:, 1], targets[:, 1])  # delta eta
 
         # Angular terms using sin/cos representation
-        sin_dphi_loss = self.kinematics_loss(
+        dsin_phi_loss = self.kinematics_loss(
             predictions[:, 2], targets[:, 2]
-        )  # sin(dphi)
-        cos_dphi_loss = self.kinematics_loss(
+        )  # delta_sin(phi)
+        dcos_phi_loss = self.kinematics_loss(
             predictions[:, 3], targets[:, 3]
-        )  # cos(dphi)
+        )  # delta_cos(phi)
 
         # Average all components weighted by their importance
         return (
-            log_pt_loss + deta_loss + sin_dphi_loss + cos_dphi_loss + l_m * log_m_loss
+            log_pt_loss + deta_loss + dsin_phi_loss + dcos_phi_loss + l_m * log_m_loss
         ) / (
             4.0 + l_m
         )  # Normalize by sum of weights: 4 * 1.0 + l_m

@@ -542,8 +542,8 @@ class KinematicsEvaluator:
                 sample_name=self.sample_name,
             ),
             "phi": RegressionEvaluator(
-                prediction=self.predicted_p4.phi,
-                truth=self.true_p4.phi,
+                prediction=np.rad2deg(np.asarray(self.predicted_p4.phi)),
+                truth=np.rad2deg(np.asarray(self.true_p4.phi)),
                 bin_edges=self.cfg.metrics.kinematics.phi.bin_edges[self.sample_name],
                 algorithm=self.algorithm,
                 sample_name=self.sample_name,
