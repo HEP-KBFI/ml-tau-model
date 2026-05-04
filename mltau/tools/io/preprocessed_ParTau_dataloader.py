@@ -2,9 +2,10 @@ import os
 import glob
 import math
 import torch
+import numpy as np
 
 from torch.utils.data import DataLoader, IterableDataset
-from omegaconf import DictConfig
+from omegaconf import DictConfig, OmegaConf
 from lightning import LightningDataModule
 
 
@@ -111,6 +112,133 @@ def _load_and_split(pt_paths: list[str], train_frac: float) -> tuple:
 
     return _slice(0, n_train), _slice(n_train, N)
 
+#
+### Add helper functions for input feature scaling
+#
+
+# Metadata for recording the input features order in the .npz file
+_CAND_FEATURE_NAMES = np.array([
+    "cand_deta", "cand_dphi", "cand_logpt", "cand_loge",
+    "cand_logptrel", "cand_logerel", "cand_deltaR", "cand_charge",
+    "isElectron", "isMuon", "isPhoton", "isChargedHadron",
+    "isNeutralHadron", "cand_dz", "cand_dz_error", "cand_dxy",
+    "cand_dxy_error",
+])
+
+def _input_scaling_enabled(cfg: DictConfig) -> bool:
+    """ Checks whether training.input_scaling.enabled exists and is true. (False by default so that old configs still run normally). """
+    scaling_cfg = OmegaConf.select(cfg, "training.input_scaling")
+    return scaling_cfg is not None and bool(scaling_cfg.enabled)
+
+
+def _scaler_path(cfg: DictConfig) -> str:
+    """ Turns the configured path into an absolute path. This is where the scaler gets saved and later loaded. """
+    return os.path.abspath(os.path.expanduser(str(cfg.training.input_scaling.scaler_path)))
+
+
+def _feature_indices(cfg: DictConfig) -> list[int]:
+    """ Reads the list of continuous feature indices from config. This lets us scale only the features we list in the config. """
+    return [int(i) for i in cfg.training.input_scaling.continuous_feature_indices]
+
+def _fit_feature_scaler(cand_features, mask, feature_indices, eps=1e-6, chunk_size=200_000):
+    """ Computes mean and std from the actual training slice only. It uses valid = mask.squeeze(1).bool() so that padded candidates are ignored. 
+    It loops in chunks to avoid making a huge flattened copy of all candidates at once. 
+    mean = sum / count
+    std = sqrt(sum_x2 / count - mean^2) 
+    """
+    idx = torch.as_tensor(feature_indices, dtype=torch.long)
+    valid = mask.squeeze(1).bool()
+    total = torch.zeros(len(feature_indices), dtype=torch.float64)
+    total_sq = torch.zeros(len(feature_indices), dtype=torch.float64)
+    count = 0
+
+    for start in range(0, cand_features.shape[0], chunk_size):
+        end = min(start + chunk_size, cand_features.shape[0])
+        x = cand_features[start:end].permute(0, 2, 1)  # [N, P, C]
+        m = valid[start:end]
+        vals = x[..., idx][m].to(torch.float64)
+        if vals.numel() == 0:
+            continue
+        total += vals.sum(dim=0)
+        total_sq += (vals * vals).sum(dim=0)
+        count += vals.shape[0]
+
+    if count == 0:
+        raise RuntimeError("No valid candidates found while fitting input scaler.")
+
+    mean = total / count
+    var = torch.clamp(total_sq / count - mean * mean, min=0.0)
+    std = torch.sqrt(var)
+    std = torch.where(std < eps, torch.ones_like(std), std)
+    return mean.float().numpy(), std.float().numpy()
+
+
+def _apply_feature_scaler(tensors, mean, std, feature_indices):
+    """ Applies x = (x - mean) / std only to selected cand_features channels.
+        It leaves cand_kinematics, targets, weights, and p4 dictionaries untouched.
+        cf.mul_(msk.to(dtype=cf.dtype)) resets padded candidates back to exactly zero after scaling.
+    """
+    cf, ck, tgt, msk, wt, gt, rc, gj = tensors
+    idx = torch.as_tensor(feature_indices, dtype=torch.long)
+    mean_t = torch.as_tensor(mean, dtype=cf.dtype).view(1, -1, 1)
+    std_t = torch.as_tensor(std, dtype=cf.dtype).view(1, -1, 1)
+
+    cf[:, idx, :] = (cf[:, idx, :] - mean_t) / std_t
+    cf.mul_(msk.to(dtype=cf.dtype))  # keep padded candidates exactly zero
+    return cf, ck, tgt, msk, wt, gt, rc, gj
+
+
+def fit_and_apply_input_scaling(train_tensors, val_tensors, cfg: DictConfig):
+    """ This is the training-time entry point:
+        1. If scaling is disabled, return tensors unchanged.
+        2. Fit scaler on train_tensors only.
+        3. Save mean, std, feature_indices, and feature_names to .npz.
+        4. Apply the same scaler to both train and val.
+    """
+    if not _input_scaling_enabled(cfg):
+        return train_tensors, val_tensors
+
+    feature_indices = _feature_indices(cfg)
+    mean, std = _fit_feature_scaler(train_tensors[0], train_tensors[3], feature_indices)
+
+    path = _scaler_path(cfg)
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    np.savez(
+        path,
+        mean=mean,
+        std=std,
+        feature_indices=np.asarray(feature_indices, dtype=np.int64),
+        feature_names=_CAND_FEATURE_NAMES,
+    )
+    print(f"[input scaling] Saved scaler to {path}", flush=True)
+
+    return (
+        _apply_feature_scaler(train_tensors, mean, std, feature_indices),
+        _apply_feature_scaler(val_tensors, mean, std, feature_indices),
+    )
+
+
+def apply_saved_input_scaling_from_cfg(tensors, cfg: DictConfig):
+    """ This is the test/inference-time entry point:
+        1. If scaling is disabled, return tensors unchanged.
+        2. Load the saved .npz.
+        3. Apply the same train-derived scaler to test/prediction tensors.
+    """
+    if not _input_scaling_enabled(cfg):
+        return tensors
+
+    path = _scaler_path(cfg)
+    if not os.path.exists(path):
+        raise RuntimeError(f"Input scaling is enabled, but scaler was not found: {path}")
+
+    scaler = np.load(path)
+    mean = scaler["mean"]
+    std = scaler["std"]
+    feature_indices = scaler["feature_indices"].astype(np.int64).tolist()
+    print(f"[input scaling] Loaded scaler from {path}", flush=True)
+
+    return _apply_feature_scaler(tensors, mean, std, feature_indices)
+
 
 class ParTDataModule(LightningDataModule):
     def __init__(self, cfg: DictConfig, debug_run: bool = False):
@@ -163,12 +291,18 @@ class ParTDataModule(LightningDataModule):
             total = sum(self.cfg.dataset.relative_sizes[s] for s in ["train", "val"])
             train_frac = self.cfg.dataset.relative_sizes["train"] / total
             train_tensors, val_tensors = _load_and_split(all_train_paths, train_frac)
+            # Add the scaling call
+            train_tensors, val_tensors = fit_and_apply_input_scaling(
+                train_tensors, val_tensors, self.cfg
+            )
             self.train_loader = self._make_loader(train_tensors, batch_size)
             self.val_loader = self._make_loader(val_tensors, batch_size)
         elif stage == "test" or stage == "predict":
             test_paths = self._get_pt_paths("test")
             # For test, use all data (no split needed)
             test_tensors, _ = _load_and_split(test_paths, train_frac=1.0)
+            # Add the scaling call
+            test_tensors = apply_saved_input_scaling_from_cfg(test_tensors, self.cfg)
             self.test_loader = self._make_loader(test_tensors, batch_size)
         else:
             raise ValueError(f"Unexpected stage: {stage}")
