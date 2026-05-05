@@ -19,6 +19,6 @@ training:
     prefetch_factor: 100
 
   input_scaling:
-    enabled: false
+    enabled: true #false
     scaler_path: ${output_dir}/scaler/cand_feature_scaler.npz
     continuous_feature_indices: [0, 1, 2, 3, 4, 5, 6, 13, 14, 15, 16]

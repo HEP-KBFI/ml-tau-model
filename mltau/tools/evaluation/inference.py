@@ -219,7 +219,8 @@ def create_predictions_file(
 ):
     # Load your .pt file and build the dataset
     tensors = load_tensors(input_path)
-    # Add scaling call
+    # Add scaling calls
+    print("[DEBUG] Active scaler:", cfg.training.input_scaling.scaler_path)
     tensors = apply_saved_input_scaling_from_cfg(tensors, cfg)
     dataset = ParticleTransformerDataset(
         tensors,
@@ -263,6 +264,12 @@ def create_predictions_file(
     with tqdm(dataloader, desc=progress_desc, unit="batch") as progress:
         for i, batch in enumerate(progress):
             batch_on_device = _move_to_device(batch, device)
+            if i == 0:  # only first batch
+                cf_batch = batch[0]  # cand_features
+
+                print("\n[DEBUG] First batch stats BEFORE model:")
+                print("mean:", cf_batch.mean().item())
+                print("std:", cf_batch.std().item())
             with torch.no_grad():
                 preds = best_model.predict_step(batch_on_device, i)
 

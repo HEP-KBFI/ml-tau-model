@@ -183,7 +183,9 @@ def _apply_feature_scaler(tensors, mean, std, feature_indices):
     mean_t = torch.as_tensor(mean, dtype=cf.dtype).view(1, -1, 1)
     std_t = torch.as_tensor(std, dtype=cf.dtype).view(1, -1, 1)
 
-    cf[:, idx, :] = (cf[:, idx, :] - mean_t) / std_t
+    # cf[:, idx, :] = (cf[:, idx, :] - mean_t) / std_t
+    cf_scaled = (cf[:, idx, :] - mean_t) / std_t
+    cf[:, idx, :] = cf_scaled.clone()
     cf.mul_(msk.to(dtype=cf.dtype))  # keep padded candidates exactly zero
     return cf, ck, tgt, msk, wt, gt, rc, gj
 
@@ -295,6 +297,14 @@ class ParTDataModule(LightningDataModule):
             train_tensors, val_tensors = fit_and_apply_input_scaling(
                 train_tensors, val_tensors, self.cfg
             )
+            cf_train = train_tensors[0]
+            cf_val = val_tensors[0]
+
+            print("\n[DEBUG] TRAIN scaled stats:")
+            print("mean:", cf_train.mean().item(), "std:", cf_train.std().item())
+
+            print("\n[DEBUG] VAL scaled stats:")
+            print("mean:", cf_val.mean().item(), "std:", cf_val.std().item())
             self.train_loader = self._make_loader(train_tensors, batch_size)
             self.val_loader = self._make_loader(val_tensors, batch_size)
         elif stage == "test" or stage == "predict":
@@ -303,6 +313,9 @@ class ParTDataModule(LightningDataModule):
             test_tensors, _ = _load_and_split(test_paths, train_frac=1.0)
             # Add the scaling call
             test_tensors = apply_saved_input_scaling_from_cfg(test_tensors, self.cfg)
+            cf_test = test_tensors[0]
+            print("\n[DEBUG] TEST scaled stats:")
+            print("mean:", cf_test.mean().item(), "std:", cf_test.std().item())
             self.test_loader = self._make_loader(test_tensors, batch_size)
         else:
             raise ValueError(f"Unexpected stage: {stage}")
