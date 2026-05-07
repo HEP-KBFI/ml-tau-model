@@ -71,7 +71,7 @@ class ParTau(ParticleTransformer):
             # Classification head for decay mode classification
             self.classification_head = nn.Linear(embed_dim, num_dm_classes)
         elif self.task == "kinematics":
-            # Regression head: [log(pt_gen/pt_reco), delta_eta, sin(delta_phi), cos(delta_phi), log(m_gen/m_reco)]
+            # Regression head: [log(pt_gen/pt_reco), delta_eta, delta_sin(phi), delta_cos(phi), log(m_gen/m_reco)]
             self.regression_head = nn.Linear(embed_dim, 5)
         elif self.task == "is_tau":
             # Binary head for tau-tagging
@@ -135,7 +135,7 @@ class ParTau(ParticleTransformer):
                     self.classification_head(x_cls),
                 )  # (N, num_dm_classes) raw logits
             elif self.task == "kinematics":
-                # Regression output: [log(pt_gen/pt_reco), delta_eta, sin(delta_phi), cos(delta_phi), log(m_gen/m_reco)]
+                # Regression output: [log(pt_gen/pt_reco), delta_eta, delta_sin(phi), delta_cos(phi), log(m_gen/m_reco)]
                 output = (self.regression_head(x_cls),)  # (N, 5)
             elif self.task == "is_tau":
                 # Return logits; sigmoid is applied outside for logging and evaluation.

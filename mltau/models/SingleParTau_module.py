@@ -53,8 +53,8 @@ class ParTauModule(L.LightningModule):
                 [
                     "kinematics_log_pt_loss",
                     "kinematics_delta_eta_loss",
-                    "kinematics_sin_delta_phi_loss",
-                    "kinematics_cos_delta_phi_loss",
+                    "kinematics_delta_sin_phi_loss",
+                    "kinematics_delta_cos_phi_loss",
                     "kinematics_log_mass_loss",
                 ]
             )
@@ -112,67 +112,6 @@ class ParTauModule(L.LightningModule):
         )
         return [optimizer], [{"scheduler": lr_scheduler, "interval": "step"}]
 
-    def _calculate_baseline_charges(self, inputs):
-        """Calculate baseline jet charge using Q*kappa weighting."""
-        cand_charges = inputs.cand_features[:, 7, :]
-        cand_mask = inputs.cand_mask[:, 0, :]
-
-        px = inputs.cand_kinematics_pxpypze[:, 0, :]
-        py = inputs.cand_kinematics_pxpypze[:, 1, :]
-        cand_pts = torch.sqrt(px**2 + py**2)
-
-        try:
-            reco_jet_p4s_ak = ak.Array(inputs.reco_jet_p4s)
-            reco_jet_p4s = g.reinitialize_p4(reco_jet_p4s_ak)
-
-            pt_values = reco_jet_p4s.pt
-            if hasattr(pt_values, "to_numpy"):
-                pt_numpy = pt_values.to_numpy()
-            else:
-                pt_numpy = ak.to_numpy(pt_values)
-
-            if pt_numpy.ndim == 0:
-                pt_numpy = np.array([pt_numpy])
-            elif pt_numpy.ndim > 1:
-                pt_numpy = pt_numpy.flatten()[: len(cand_charges)]
-
-            jet_pts = torch.tensor(
-                pt_numpy, dtype=torch.float32, device=cand_charges.device
-            )
-
-            if len(jet_pts) != len(cand_charges):
-                if len(jet_pts) == 1:
-                    jet_pts = jet_pts.repeat(len(cand_charges))
-                else:
-                    jet_pts = jet_pts[: len(cand_charges)]
-        except Exception:
-            jet_pts = torch.sum(cand_pts * cand_mask, dim=1)
-
-        cand_charges_masked = cand_charges * cand_mask
-        cand_pts_masked = cand_pts * cand_mask
-
-        kappa = 0.2
-        numer = torch.sum(cand_charges_masked * (cand_pts_masked**kappa), dim=1)
-        denom = jet_pts**kappa
-        denom = torch.where(denom == 0, torch.ones_like(denom), denom)
-
-        baseline_charges = numer / denom
-        return baseline_charges.detach().cpu().numpy()
-
-    # def configure_optimizers(self):
-    #     optimizer = torch.optim.RAdam(
-    #         params=self.ParTau.parameters(),
-    #         lr=self.cfg.training.lr,
-    #         betas=(0.95, 0.999),
-    #         eps=1e-5,
-    #     )
-    #     lr_scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
-    #         optimizer,
-    #         T_max=20000 * self.cfg.training.trainer.max_epochs,
-    #         eta_min=self.cfg.training.lr * 0.01,
-    #     )
-    #     return [optimizer], [lr_scheduler]
-
     def forward(self, batch):
         inputs = BatchInputs(*batch)
         model_output = self.ParTau(
@@ -225,8 +164,8 @@ class ParTauModule(L.LightningModule):
                 self._loss_key(): loss,
                 "kinematics_log_pt_loss": component_loss[0],
                 "kinematics_delta_eta_loss": component_loss[1],
-                "kinematics_sin_delta_phi_loss": component_loss[2],
-                "kinematics_cos_delta_phi_loss": component_loss[3],
+                "kinematics_delta_sin_phi_loss": component_loss[2],
+                "kinematics_delta_cos_phi_loss": component_loss[3],
                 "kinematics_log_mass_loss": component_loss[4],
             }
             return metrics
@@ -372,12 +311,6 @@ class ParTauModule(L.LightningModule):
             reco_jet_p4s = ak.Array(all_reco_jet_p4s)
             gen_jet_tau_p4s = ak.Array(all_gen_jet_tau_p4s)
 
-            all_baseline_charges = None
-            if self.task == "charge" and all_inputs:
-                baseline_chunks = [
-                    self._calculate_baseline_charges(inputs) for inputs in all_inputs
-                ]
-                all_baseline_charges = np.concatenate(baseline_chunks, axis=0)
 
             self._log_task_metrics(
                 targets=all_targets,
@@ -388,7 +321,6 @@ class ParTauModule(L.LightningModule):
                 tb_logger=self.logger.experiment,
                 current_epoch=self.current_epoch,
                 dataset=dataset,
-                baseline_charges=all_baseline_charges,
             )
 
             dataset_outputs.clear()
