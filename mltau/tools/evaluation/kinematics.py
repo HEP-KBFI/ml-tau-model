@@ -107,12 +107,18 @@ class RegressionEvaluator:
         bin_edges: np.array,
         algorithm: str,
         sample_name: str = "",
+        mode: str = "ratio",
     ):
         self.prediction = np.array(prediction)
         self.truth = np.array(truth)
         self.gen_tau_pt = self.truth
         self.algorithm = algorithm
-        self.ratios = self.prediction / self.truth
+        self.mode = mode
+
+        if self.mode == "ratio":
+            self.ratios = self.prediction / self.truth
+        else:
+            self.ratios = self.prediction - self.truth
 
         self.resolution_function = IQR
         self.sample = sample_name
@@ -141,13 +147,18 @@ class RegressionEvaluator:
         responses = np.array(
             [self.response_function(r) if len(r) > 0 else np.nan for r in binned_ratios]
         )
-        return resolutions / responses, responses, binned_ratios
+        if self.mode == "ratio":
+            return resolutions / responses, responses, binned_ratios
+        else:
+            return resolutions, responses, binned_ratios
 
     def _get_overall_resoluton_response(self):
         response = self.response_function(self.ratios)
         resolution = self.resolution_function(self.ratios)
-        resolution = resolution / response
+        if self.mode == "ratio":
+            resolution = resolution / response
         return resolution, response
+
 
     def print_results(self):
         print("----------------------------")
@@ -185,9 +196,10 @@ class DeltaREvaluator:
 
 
 class RangeContentPlot:
-    def __init__(self, bin_edges: np.array, xlabel: str):
+    def __init__(self, bin_edges: np.array, xlabel: str, mode: str = "ratio"):
         self.bin_edges = np.array(bin_edges)
         self.xlabel = xlabel
+        self.mode = mode
         self.fig, self.axes = self.plot()
 
     def plot(self):
@@ -202,12 +214,19 @@ class RangeContentPlot:
                 + f"$[{self.bin_edges[i]}, {self.bin_edges[i + 1]}]$",
                 fontsize=12,
             )
-            ax.set_xlim(0.5, 1.5)
-            ax.set_xlabel("$q$", fontsize=12)
+            if self.mode == "ratio":
+                ax.set_xlim(0.5, 1.5)
+                ax.set_xlabel("$q$", fontsize=12)
+            else:
+                ax.set_xlim(-5.0, 5.0)  # Center on 0 for differences
+                ax.set_xlabel(r"$\Delta$", fontsize=12)
         return fig, axes
 
     def add_line(self, evaluator):
-        bins = np.linspace(0.5, 1.5, 101)
+        if self.mode == "ratio":
+            bins = np.linspace(0.5, 1.5, 101)
+        else:
+            bins = np.linspace(-5.0, 5.0, 101)
         for ax, data in zip(self.axes, evaluator.binned_ratios):
             if len(data) > 0:
                 hep.histplot(
@@ -222,8 +241,9 @@ class RangeContentPlot:
                 0.95,
                 (
                     f"IQR = {IQR(data) / np.median(data):.3f}"
-                    if len(data) > 0
-                    else "IQR/median = N/A"
+                    if self.mode == "ratio" and len(data) > 0
+                    else f"IQR = {IQR(data):.3f}" if len(data) > 0
+                    else "N/A"
                 ),
                 transform=ax.transAxes,
                 fontsize=8,
@@ -461,7 +481,7 @@ class RegressionMultiEvaluator:
                 evaluator.bin_edges, evaluator, xlabel=self.var_cfg.response_plot.xlabel
             )
             self.bin_distributions_plots[evaluator.algorithm] = RangeContentPlot(
-                evaluator.bin_edges, xlabel=self.var_cfg.response_plot.xlabel
+                evaluator.bin_edges, xlabel=self.var_cfg.response_plot.xlabel, mode=evaluator.mode
             )
             self.bin_distributions_plots[evaluator.algorithm].add_line(evaluator)
             if evaluator.sample not in self.resolution_performance_info.keys():
@@ -526,6 +546,7 @@ class KinematicsEvaluator:
                 bin_edges=self.cfg.metrics.kinematics.pt.bin_edges[self.sample_name],
                 algorithm=self.algorithm,
                 sample_name=self.sample_name,
+                mode="ratio",
             ),
             "eta": RegressionEvaluator(
                 prediction=self.predicted_p4.eta,
@@ -533,6 +554,7 @@ class KinematicsEvaluator:
                 bin_edges=self.cfg.metrics.kinematics.eta.bin_edges[self.sample_name],
                 algorithm=self.algorithm,
                 sample_name=self.sample_name,
+                mode="diff",
             ),
             "theta": RegressionEvaluator(
                 prediction=self.predicted_p4.theta,
@@ -540,6 +562,7 @@ class KinematicsEvaluator:
                 bin_edges=self.cfg.metrics.kinematics.theta.bin_edges[self.sample_name],
                 algorithm=self.algorithm,
                 sample_name=self.sample_name,
+                mode="diff",
             ),
             "phi": RegressionEvaluator(
                 prediction=np.rad2deg(np.asarray(self.predicted_p4.phi)),
@@ -547,6 +570,7 @@ class KinematicsEvaluator:
                 bin_edges=self.cfg.metrics.kinematics.phi.bin_edges[self.sample_name],
                 algorithm=self.algorithm,
                 sample_name=self.sample_name,
+                mode="diff",
             ),
             "m_vis": RegressionEvaluator(
                 prediction=self.predicted_p4.mass,
@@ -554,6 +578,7 @@ class KinematicsEvaluator:
                 bin_edges=self.cfg.metrics.kinematics.m_vis.bin_edges[self.sample_name],
                 algorithm=self.algorithm,
                 sample_name=self.sample_name,
+                mode="ratio",
             ),
             "energy": RegressionEvaluator(
                 prediction=self.predicted_p4.energy,
@@ -563,6 +588,7 @@ class KinematicsEvaluator:
                 ],
                 algorithm=self.algorithm,
                 sample_name=self.sample_name,
+                mode="ratio",
             ),
             "deltaR": DeltaREvaluator(
                 deltaR=deltaR,

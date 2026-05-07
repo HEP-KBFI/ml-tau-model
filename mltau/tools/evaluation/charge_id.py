@@ -76,7 +76,7 @@ class ChargeIdEvaluator:
             )
         )
 
-        # Define charge masks early - needed by baseline calculations
+        # Define charge masks
         self.true_positive_charge_mask = self.truth == 1
         self.true_negative_charge_mask = self.truth == 0
         self.efficiencies, self.eff_denominator_masks = self._calculate_eff_fake(

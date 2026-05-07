@@ -34,6 +34,7 @@ def _log_single_variable(
     tb_logger,
     current_epoch: int,
     reco_pred: np.ndarray | None = None,
+    mode: str = "ratio",
 ):
     """Log response, resolution, 2D resolution, and bin distribution plots for one variable."""
     evaluator = k.RegressionEvaluator(
@@ -42,6 +43,7 @@ def _log_single_variable(
         bin_edges=var_cfg.bin_edges["all"],
         algorithm="all",
         sample_name="all",
+        mode=mode,
     )
     reco_evaluator = None
     if reco_pred is not None:
@@ -51,6 +53,7 @@ def _log_single_variable(
             bin_edges=var_cfg.bin_edges["all"],
             algorithm="all",
             sample_name="reco",
+            mode=mode,
         )
 
     response_lineplot = k.LinePlot(
@@ -122,7 +125,7 @@ def _log_single_variable(
     plt.close(resolution_2d_plot.fig)
 
     bin_distributions = k.RangeContentPlot(
-        var_cfg.bin_edges["all"], xlabel=var_cfg.response_plot.xlabel
+        var_cfg.bin_edges["all"], xlabel=var_cfg.response_plot.xlabel, mode=mode
     )
     bin_distributions.add_line(evaluator)
     tb_logger.add_figure(
@@ -176,6 +179,7 @@ def log_all_kinematics_metrics(
         tb_logger,
         current_epoch,
         reco_pred=np.array(reco.pt),
+        mode="ratio",
     )
 
     # --- eta (direct: index 1 is delta_eta = gen_eta - reco_eta) ---
@@ -190,6 +194,7 @@ def log_all_kinematics_metrics(
         tb_logger,
         current_epoch,
         reco_pred=np.array(reco.eta),
+        mode="diff",
     )
 
     # --- theta (derived from eta; radians → degrees) ---
@@ -207,6 +212,7 @@ def log_all_kinematics_metrics(
         tb_logger,
         current_epoch,
         reco_pred=reco_theta_deg,
+        mode="diff",
     )
 
     # --- phi (indices 2,3 are sin/cos of delta_phi; radians → degrees) ---
@@ -230,6 +236,7 @@ def log_all_kinematics_metrics(
         tb_logger,
         current_epoch,
         reco_pred=np.rad2deg(np.array(reco.phi)),
+        mode="diff",
     )
 
     # --- m_vis (index 4 is log(m_gen / m_reco)) ---
@@ -244,6 +251,7 @@ def log_all_kinematics_metrics(
         tb_logger,
         current_epoch,
         reco_pred=np.array(reco.mass),
+        mode="ratio",
     )
 
     # --- energy (derived from pt and theta) ---
@@ -258,6 +266,7 @@ def log_all_kinematics_metrics(
         tb_logger,
         current_epoch,
         reco_pred=np.array(reco.energy),
+        mode="ratio",
     )
 
     # --- deltaR (predicted tau vs gen_tau, binned by true pT) ---
