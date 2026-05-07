@@ -48,7 +48,6 @@ class ChargeIdEvaluator:
         output_dir: str = "",
         sample: str = "",
         algorithm: str = "",
-        baseline_charges: np.array = None,
     ):
         self.output_dir = output_dir
         if self.output_dir != "":
@@ -80,31 +79,6 @@ class ChargeIdEvaluator:
         # Define charge masks early - needed by baseline calculations
         self.true_positive_charge_mask = self.truth == 1
         self.true_negative_charge_mask = self.truth == 0
-
-        # Handle baseline charges if provided (range -1 to +1)
-        self.baseline_charges = baseline_charges
-        if self.baseline_charges is not None:
-            # Convert baseline charges from [-1, +1] to [0, 1] for compatibility
-            self.baseline_charges_normalized = (self.baseline_charges + 1) / 2
-            # Create thresholds for baseline charges
-            self.baseline_cuts = np.unique(
-                np.concatenate(
-                    [
-                        [0],
-                        np.quantile(
-                            self.baseline_charges_normalized, np.linspace(0, 1, 1000)
-                        ),
-                        [1],
-                    ]
-                )
-            )
-            # Calculate baseline efficiency and fake rates
-            self.baseline_efficiencies, self.baseline_eff_masks = (
-                self._calculate_baseline_eff_fake(eff_fake="eff")
-            )
-            self.baseline_fakerates, self.baseline_fake_masks = (
-                self._calculate_baseline_eff_fake(eff_fake="fake")
-            )
         self.efficiencies, self.eff_denominator_masks = self._calculate_eff_fake(
             eff_fake="eff"
         )
@@ -170,26 +144,26 @@ class ChargeIdEvaluator:
         return np.asarray(values)
 
     def _base_mask(self):
-        ref_var_pt_mask = self.gen_jet_tau_p4s.pt > self.cfg.metrics.tagging.cuts.min_pt
+        ref_var_pt_mask = self.gen_jet_tau_p4s.pt > self.cfg.metrics.charge.cuts.min_pt
         ref_var_theta_mask1 = (
             abs(np.rad2deg(self.gen_jet_tau_p4s.theta))
-            < self.cfg.metrics.tagging.cuts.max_theta
+            < self.cfg.metrics.charge.cuts.max_theta
         )
         ref_var_theta_mask2 = (
             abs(np.rad2deg(self.gen_jet_tau_p4s.theta))
-            > self.cfg.metrics.tagging.cuts.min_theta
+            > self.cfg.metrics.charge.cuts.min_theta
         )
         gen_denominator_mask = (
             ref_var_pt_mask * ref_var_theta_mask1 * ref_var_theta_mask2
         )
-        tau_pt_mask = self.reco_jet_p4s.pt > self.cfg.metrics.tagging.cuts.min_pt
+        tau_pt_mask = self.reco_jet_p4s.pt > self.cfg.metrics.charge.cuts.min_pt
         tau_theta_mask1 = (
             abs(np.rad2deg(self.reco_jet_p4s.theta))
-            < self.cfg.metrics.tagging.cuts.max_theta
+            < self.cfg.metrics.charge.cuts.max_theta
         )
         tau_theta_mask2 = (
             abs(np.rad2deg(self.reco_jet_p4s.theta))
-            > self.cfg.metrics.tagging.cuts.min_theta
+            > self.cfg.metrics.charge.cuts.min_theta
         )
         reco_denominator_mask = tau_pt_mask * tau_theta_mask1 * tau_theta_mask2
         return gen_denominator_mask * reco_denominator_mask
@@ -199,15 +173,9 @@ class ChargeIdEvaluator:
     ):
         values = self._metric_values(metric)
         metric_cfg = self.cfg.metrics.charge.metrics[metric]
-        # bin_edges = np.linspace(
-        #     metric_cfg.x_range[0], metric_cfg.x_range[1], metric_cfg.n_bins + 1
-        # )
-        if metric == "pt":
-            bin_edges = np.array([10, 20, 30, 40, 50])
-        else:
-            bin_edges = np.linspace(
-                metric_cfg.x_range[0], metric_cfg.x_range[1], metric_cfg.n_bins + 1
-            )
+        bin_edges = np.linspace(
+            metric_cfg.x_range[0], metric_cfg.x_range[1], metric_cfg.n_bins + 1
+        )
         centers = 0.5 * (bin_edges[:-1] + bin_edges[1:])
         threshold_pos = self.choose_threshold_for_target_eff_per_class(
             target_eff, "positive"
@@ -230,17 +198,11 @@ class ChargeIdEvaluator:
             neg_sel = metric_mask & neg_truth
             pos_sel = metric_mask & pos_truth
             fake_pos.append(
-                np.mean(pred_charge_pos[neg_sel]) if np.sum(neg_sel) > 5 else np.nan
+                np.mean(pred_charge_pos[neg_sel]) if np.any(neg_sel) else np.nan
             )
             fake_neg.append(
-                np.mean(pred_charge_neg[pos_sel]) if np.sum(pos_sel) > 5 else np.nan
+                np.mean(pred_charge_neg[pos_sel]) if np.any(pos_sel) else np.nan
             )
-            # fake_pos.append(
-            #     np.mean(pred_charge_pos[neg_sel]) if np.any(neg_sel) else np.nan
-            # )
-            # fake_neg.append(
-            #     np.mean(pred_charge_neg[pos_sel]) if np.any(pos_sel) else np.nan
-            # )
 
         return centers, np.asarray(fake_pos), np.asarray(fake_neg)
 
@@ -249,15 +211,9 @@ class ChargeIdEvaluator:
     ):
         values = self._metric_values(metric)
         metric_cfg = self.cfg.metrics.charge.metrics[metric]
-        # bin_edges = np.linspace(
-        #     metric_cfg.x_range[0], metric_cfg.x_range[1], metric_cfg.n_bins + 1
-        # )
-        if metric == "pt":
-            bin_edges = np.array([10, 20, 30, 40, 50])
-        else:
-            bin_edges = np.linspace(
-                metric_cfg.x_range[0], metric_cfg.x_range[1], metric_cfg.n_bins + 1
-            )
+        bin_edges = np.linspace(
+            metric_cfg.x_range[0], metric_cfg.x_range[1], metric_cfg.n_bins + 1
+        )
         centers = 0.5 * (bin_edges[:-1] + bin_edges[1:])
         threshold_pos = self.choose_threshold_for_target_eff_per_class(
             target_eff, "positive"
@@ -280,17 +236,11 @@ class ChargeIdEvaluator:
             pos_sel = metric_mask & pos_truth
             neg_sel = metric_mask & neg_truth
             eff_pos.append(
-                np.mean(pred_charge_pos[pos_sel]) if np.sum(pos_sel) > 5 else np.nan
+                np.mean(pred_charge_pos[pos_sel]) if np.any(pos_sel) else np.nan
             )
             eff_neg.append(
-                np.mean(pred_charge_neg[neg_sel]) if np.sum(neg_sel) > 5 else np.nan
+                np.mean(pred_charge_neg[neg_sel]) if np.any(neg_sel) else np.nan
             )
-            # eff_pos.append(
-            #     np.mean(pred_charge_pos[pos_sel]) if np.any(pos_sel) else np.nan
-            # )
-            # eff_neg.append(
-            #     np.mean(pred_charge_neg[neg_sel]) if np.any(neg_sel) else np.nan
-            # )
 
         return centers, np.asarray(eff_pos), np.asarray(eff_neg)
 
@@ -306,28 +256,28 @@ class ChargeIdEvaluator:
             if eff_fake == "eff"
             else self.true_positive_charge_mask
         )
-        ref_var_pt_mask = self.gen_jet_tau_p4s.pt > self.cfg.metrics.tagging.cuts.min_pt
+        ref_var_pt_mask = self.gen_jet_tau_p4s.pt > self.cfg.metrics.charge.cuts.min_pt
         ref_var_theta_mask1 = (
             abs(np.rad2deg(self.gen_jet_tau_p4s.theta))
-            < self.cfg.metrics.tagging.cuts.max_theta
+            < self.cfg.metrics.charge.cuts.max_theta
         )
         ref_var_theta_mask2 = (
             abs(np.rad2deg(self.gen_jet_tau_p4s.theta))
-            > self.cfg.metrics.tagging.cuts.min_theta
+            > self.cfg.metrics.charge.cuts.min_theta
         )
         gen_denominator_mask = (
             ref_var_pt_mask * ref_var_theta_mask1 * ref_var_theta_mask2
         )
         # As we are only assigning charge for tau (candidates) that are tagged, then to have the correct total
         # number of jets, we need to add the cuts on the reco jet also to the denominator
-        tau_pt_mask = self.reco_jet_p4s.pt > self.cfg.metrics.tagging.cuts.min_pt
+        tau_pt_mask = self.reco_jet_p4s.pt > self.cfg.metrics.charge.cuts.min_pt
         tau_theta_mask1 = (
             abs(np.rad2deg(self.reco_jet_p4s.theta))
-            < self.cfg.metrics.tagging.cuts.max_theta
+            < self.cfg.metrics.charge.cuts.max_theta
         )
         tau_theta_mask2 = (
             abs(np.rad2deg(self.reco_jet_p4s.theta))
-            > self.cfg.metrics.tagging.cuts.min_theta
+            > self.cfg.metrics.charge.cuts.min_theta
         )
         reco_denominator_mask = tau_pt_mask * tau_theta_mask1 * tau_theta_mask2
         base_denominator_mask = gen_denominator_mask * reco_denominator_mask
@@ -364,81 +314,7 @@ class ChargeIdEvaluator:
             else:
                 _eff_fake["negative"].append(0.0)
         return _eff_fake, denominator_masks
-
-    def _calculate_baseline_eff_fake(self, eff_fake: str = "eff"):
-        """Calculate efficiency/fake rates for baseline charge method."""
-        _eff_fake = {"positive": [], "negative": []}
-        positive_mask = (
-            self.true_positive_charge_mask
-            if eff_fake == "eff"
-            else self.true_negative_charge_mask
-        )
-        negative_mask = (
-            self.true_negative_charge_mask
-            if eff_fake == "eff"
-            else self.true_positive_charge_mask
-        )
-        ref_var_pt_mask = self.gen_jet_tau_p4s.pt > self.cfg.metrics.tagging.cuts.min_pt
-        ref_var_theta_mask1 = (
-            abs(np.rad2deg(self.gen_jet_tau_p4s.theta))
-            < self.cfg.metrics.tagging.cuts.max_theta
-        )
-        ref_var_theta_mask2 = (
-            abs(np.rad2deg(self.gen_jet_tau_p4s.theta))
-            > self.cfg.metrics.tagging.cuts.min_theta
-        )
-        gen_denominator_mask = (
-            ref_var_pt_mask * ref_var_theta_mask1 * ref_var_theta_mask2
-        )
-        # As we are only assigning charge for tau (candidates) that are tagged, then to have the correct total
-        # number of jets, we need to add the cuts on the reco jet also to the denominator
-        tau_pt_mask = self.reco_jet_p4s.pt > self.cfg.metrics.tagging.cuts.min_pt
-        tau_theta_mask1 = (
-            abs(np.rad2deg(self.reco_jet_p4s.theta))
-            < self.cfg.metrics.tagging.cuts.max_theta
-        )
-        tau_theta_mask2 = (
-            abs(np.rad2deg(self.reco_jet_p4s.theta))
-            > self.cfg.metrics.tagging.cuts.min_theta
-        )
-        reco_denominator_mask = tau_pt_mask * tau_theta_mask1 * tau_theta_mask2
-        base_denominator_mask = gen_denominator_mask * reco_denominator_mask
-
-        pos_denominator_mask = base_denominator_mask * positive_mask
-        neg_denominator_mask = base_denominator_mask * negative_mask
-        denominator_masks = {
-            "positive": pos_denominator_mask,
-            "negative": neg_denominator_mask,
-        }
-        neg_all = np.sum(neg_denominator_mask)
-        pos_all = np.sum(pos_denominator_mask)
-        for cut in self.baseline_cuts:  # Use baseline_cuts for baseline method
-            # Use baseline charges instead of ML model predictions
-            pos_passing_cut = np.sum(
-                self.baseline_charges_normalized[pos_denominator_mask] >= cut
-            )
-            # Alternative 1: Use same threshold for both (current method)
-            neg_passing_cut = np.sum(
-                (1 - self.baseline_charges_normalized[neg_denominator_mask]) >= cut
-            )
-
-            # Alternative 2: Use direct thresholding (uncomment to test)
-            # neg_passing_cut = np.sum(
-            #     self.baseline_charges_normalized[neg_denominator_mask] <= (1 - cut)
-            # )
-
-            # Add zero-division protection
-            if pos_all > 0:
-                _eff_fake["positive"].append(pos_passing_cut / pos_all)
-            else:
-                _eff_fake["positive"].append(0.0)
-
-            if neg_all > 0:
-                _eff_fake["negative"].append(neg_passing_cut / neg_all)
-            else:
-                _eff_fake["negative"].append(0.0)
-        return _eff_fake, denominator_masks
-
+    
     ###################################
     ###################################
     ###################################
@@ -533,10 +409,8 @@ class ChargeClassifierPlot:
         hep.histplot(
             pos_histogram,
             bins=self.bin_edges,
-            # histtype="step",
             histtype="fill",
             label=rf"{algorithm_label} $\tau^{{+}}$",
-            # ls=linestyle,
             color=pos_color,
             alpha=0.6,
             hatch="\\",
@@ -546,10 +420,8 @@ class ChargeClassifierPlot:
         hep.histplot(
             neg_histogram,
             bins=self.bin_edges,
-            # histtype="step",
             histtype="fill",
             label=rf"{algorithm_label} $\tau^{{-}}$",
-            # ls=linestyle,
             color=neg_color,
             alpha=0.6,
             hatch="//",
@@ -597,7 +469,6 @@ class ROCPlot:
             evaluator.fakerates["positive"],
             color=pos_color,
             marker=marker,
-            # label=rf"{algorithm_label} $\tau^{{+}}$",
             label=None,
             ms=8,
             ls="",
@@ -607,47 +478,17 @@ class ROCPlot:
             evaluator.fakerates["negative"],
             color=neg_color,
             marker=marker,
-            # label=rf"{algorithm_label} $\tau^{{-}}$",
             label=None,
             ms=8,
             ls="",
         )
 
-        # Baseline charge curves
-        if (
-            hasattr(evaluator, "baseline_efficiencies")
-            and evaluator.baseline_efficiencies is not None
-        ):
-            baseline_pos, baseline_neg = _get_charge_colors(evaluator.cfg, "QKappa")
-            self.ax.plot(
-                evaluator.baseline_efficiencies["positive"],
-                evaluator.baseline_fakerates["positive"],
-                color=baseline_pos,
-                marker="o",
-                # label=r"QKappa $\tau^{+}$",
-                label=None,
-                ms=6,
-                ls="--",
-                alpha=0.7,
-            )
-            self.ax.plot(
-                evaluator.baseline_efficiencies["negative"],
-                evaluator.baseline_fakerates["negative"],
-                color=baseline_neg,
-                marker="v",
-                # label=r"QKappa $\tau^{-}$",
-                label=None,
-                ms=6,
-                ls="--",
-                alpha=0.7,
-            )
-        # self.ax.legend(loc="upper left", prop={"size": 20})
     # Create a custom legend for the ROC
     def finalize_legend(self):
         handles = []
 
         # --- Models (ONLY positive colors)
-        wanted_algos = ["SingleParTau", "MultiParTau"]
+        wanted_algos = ["SingleParTau", "MultiParTau", "QKappa"]
 
         for algo in wanted_algos:
             style = self.cfg.metrics.ALGORITHM_PLOT_STYLES[algo]
@@ -661,41 +502,6 @@ class ROCPlot:
                     markersize=8,
                 )
             )
-
-        # --- Baseline (QKappa)
-        style = self.cfg.metrics.ALGORITHM_PLOT_STYLES["QKappa"]
-        handles.append(
-            Line2D(
-                [0], [0],
-                color=style.color,
-                marker=style.marker,
-                linestyle="",
-                label=style.name,
-                markersize=8,
-            )
-        )
-
-        # --- Charge encoding (THIS is the key part)
-        handles.append(
-            Line2D(
-                [0], [0],
-                color="black",
-                marker="o",
-                linestyle="",
-                alpha=1.0,
-                label=r"$\tau^{+}$",
-            )
-        )
-        handles.append(
-            Line2D(
-                [0], [0],
-                color="black",
-                marker="o",
-                linestyle="",
-                alpha=0.3,
-                label=r"$\tau^{-}$",
-            )
-        )
 
         self.ax.legend(handles=handles, loc="upper left", prop={"size": 20})
 
@@ -742,22 +548,22 @@ class EfficiencyPlot:
         fig, ax = plt.subplots(figsize=(10, 10))
         ax.xaxis.set_major_locator(
             ticker.MultipleLocator(
-                self.cfg.metrics.tagging.metrics[self.metric].x_maj_tick_spacing
+                self.cfg.metrics.charge.metrics[self.metric].x_maj_tick_spacing
             )
         )
         ax.set_xlabel(
-            rf"{self.cfg.metrics.tagging.performances.efficiency.xlabel[self.metric]}",
+            rf"{self.cfg.metrics.charge.performances.efficiency.xlabel[self.metric]}",
             fontsize=30,
         )
         ax.set_ylabel(
-            rf"{self.cfg.metrics.tagging.performances.efficiency.ylabel}",
+            rf"{self.cfg.metrics.charge.performances.efficiency.ylabel}",
             fontsize=30,
         )
-        ax.set_yscale(self.cfg.metrics.tagging.performances.efficiency.yscale)
-        if self.cfg.metrics.tagging.performances.efficiency.ylim is not None:
-            ylim = tuple(self.cfg.metrics.tagging.performances.efficiency.ylim)
+        ax.set_yscale(self.cfg.metrics.charge.performances.efficiency.yscale)
+        if self.cfg.metrics.charge.performances.efficiency.ylim is not None:
+            ylim = tuple(self.cfg.metrics.charge.performances.efficiency.ylim)
         else:
-            ylim = self.cfg.metrics.tagging.performances.efficiency.ylim
+            ylim = self.cfg.metrics.charge.performances.efficiency.ylim
         ax.set_ylim(tuple(ylim))
         ax.tick_params(axis="x", labelsize=30)
         ax.tick_params(axis="y", labelsize=30)
@@ -806,21 +612,21 @@ class FakeRatePlot:
         fig, ax = plt.subplots(figsize=(10, 10))
         ax.xaxis.set_major_locator(
             ticker.MultipleLocator(
-                self.cfg.metrics.tagging.metrics[self.metric].x_maj_tick_spacing
+                self.cfg.metrics.charge.metrics[self.metric].x_maj_tick_spacing
             )
         )
         ax.set_xlabel(
-            rf"{self.cfg.metrics.tagging.performances.fakerate.xlabel[self.metric]}",
+            rf"{self.cfg.metrics.charge.performances.fakerate.xlabel[self.metric]}",
             fontsize=30,
         )
         ax.set_ylabel(
-            rf"{self.cfg.metrics.tagging.performances.fakerate.ylabel}", fontsize=30
+            rf"{self.cfg.metrics.charge.performances.fakerate.ylabel}", fontsize=30
         )
-        ax.set_yscale(self.cfg.metrics.tagging.performances.fakerate.yscale)
-        if self.cfg.metrics.tagging.performances.fakerate.ylim is not None:
-            ylim = tuple(self.cfg.metrics.tagging.performances.fakerate.ylim)
+        ax.set_yscale(self.cfg.metrics.charge.performances.fakerate.yscale)
+        if self.cfg.metrics.charge.performances.fakerate.ylim is not None:
+            ylim = tuple(self.cfg.metrics.charge.performances.fakerate.ylim)
         else:
-            ylim = self.cfg.metrics.tagging.performances.fakerate.ylim
+            ylim = self.cfg.metrics.charge.performances.fakerate.ylim
         ax.set_ylim(ylim)
         ax.tick_params(axis="x", labelsize=30)
         ax.tick_params(axis="y", labelsize=30)
@@ -908,40 +714,29 @@ class AsymmetryPlot:
             gridspec_kw={"height_ratios": [3, 1], "hspace": 0},
         )
 
-        if self.metric == "pt":
-            locator = ticker.MultipleLocator(10)
-        else:
-            locator = ticker.MultipleLocator(
-                self.cfg.metrics.tagging.metrics[self.metric].x_maj_tick_spacing
-            )
-
+        locator = ticker.MultipleLocator(
+            self.cfg.metrics.charge.metrics[self.metric].x_maj_tick_spacing
+        )
         ax.xaxis.set_major_locator(locator)
         ax_ratio.xaxis.set_major_locator(locator)
 
-        if self.metric == "pt":
-            xmin, xmax = 10, 50
-        else:
-            xmin, xmax = self.cfg.metrics.tagging.metrics[self.metric].x_range
+        xmin, xmax = self.cfg.metrics.charge.metrics[self.metric].x_range
         ax.set_xlim(xmin, xmax)
         ax_ratio.set_xlim(xmin, xmax)
 
         if self.quantity == "efficiency":
-            ylabel = self.cfg.metrics.tagging.performances.efficiency.ylabel
-            yscale = self.cfg.metrics.tagging.performances.efficiency.yscale
-            ylim = self.cfg.metrics.tagging.performances.efficiency.ylim
+            ylabel = self.cfg.metrics.charge.performances.efficiency.ylabel
+            yscale = self.cfg.metrics.charge.performances.efficiency.yscale
+            ylim = self.cfg.metrics.charge.performances.efficiency.ylim
         else:
-            ylabel = self.cfg.metrics.tagging.performances.fakerate.ylabel
-            yscale = self.cfg.metrics.tagging.performances.fakerate.yscale
-            ylim = self.cfg.metrics.tagging.performances.fakerate.ylim
+            ylabel = self.cfg.metrics.charge.performances.fakerate.ylabel
+            yscale = self.cfg.metrics.charge.performances.fakerate.yscale
+            ylim = self.cfg.metrics.charge.performances.fakerate.ylim
 
         ax.set_ylabel(rf"{ylabel}", fontsize=24)
         ax.set_yscale(yscale)
-        if self.quantity == "fakerate":
-            ax.set_ylim(2*1e-4, 1e-1)
-        elif self.quantity == "efficiency":
-            ax.set_ylim(0.7, 1.0)
-        # if ylim is not None:
-        #     ax.set_ylim(tuple(ylim))
+        if ylim is not None:
+            ax.set_ylim(tuple(ylim))
         ax.tick_params(axis="x", labelsize=24)
         ax.tick_params(axis="y", labelsize=24)
         ax.tick_params(labelbottom=False)
@@ -956,7 +751,7 @@ class AsymmetryPlot:
         )
 
         ax_ratio.set_xlabel(
-            rf"{self.cfg.metrics.tagging.performances.fakerate.xlabel[self.metric]}",
+            rf"{self.cfg.metrics.charge.performances.fakerate.xlabel[self.metric]}",
             fontsize=24,
         )
         ratio_label = (
@@ -971,8 +766,6 @@ class AsymmetryPlot:
         return fig, (ax, ax_ratio)
 
     def save(self, output_path):
-        # self.ax.legend(loc="best", prop={"size": 14})
-        # self.ax_ratio.legend(loc="best", prop={"size": 11})
         self.fig.savefig(output_path, format="pdf", bbox_inches="tight")
         plt.close("all")
 
