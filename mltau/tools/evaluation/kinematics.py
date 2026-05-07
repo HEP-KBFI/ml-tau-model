@@ -152,8 +152,7 @@ class RegressionEvaluator:
     def _get_overall_resoluton_response(self):
         response = self.response_function(self.ratios)
         resolution = self.resolution_function(self.ratios)
-        if self.mode == "ratio":
-            resolution = resolution / response
+        resolution = resolution / response
         return resolution, response
 
 
