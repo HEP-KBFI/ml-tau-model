@@ -147,10 +147,7 @@ class RegressionEvaluator:
         responses = np.array(
             [self.response_function(r) if len(r) > 0 else np.nan for r in binned_ratios]
         )
-        if self.mode == "ratio":
-            return resolutions / responses, responses, binned_ratios
-        else:
-            return resolutions, responses, binned_ratios
+        return resolutions / responses, responses, binned_ratios
 
     def _get_overall_resoluton_response(self):
         response = self.response_function(self.ratios)
