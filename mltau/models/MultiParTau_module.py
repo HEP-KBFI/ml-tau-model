@@ -45,25 +45,134 @@ class ParTauModule(L.LightningModule):
         self.task_weights = nn.Parameter(torch.ones(self.num_tasks))
         # Store initial losses for GradNorm
         self.initial_losses = None
+        # GradNorm hyperparameter: higher alpha → faster equalization of training rates
+        self.gradnorm_alpha = 1.5
+        # Only recompute gradient norms every N steps; task weights are slow-moving
+        # so there is no accuracy benefit to running GradNorm every step.
+        self.gradnorm_update_freq = 20
+        # Disable automatic optimization so we can run two separate backward passes
+        self.automatic_optimization = False
 
     def training_step(self, batch, batch_idx):
-        predictions, targets, weights = self.forward(batch)
+        net_opt, w_opt = self.optimizers()
 
-        metrics = self.calculate_metrics(
-            targets=targets, predictions=predictions, weights=weights
+        predictions, targets, sample_weights = self.forward(batch)
+
+        # Per-task scalar losses with gradient graph: [tag, dm, charge, kin]
+        task_losses = self._compute_per_task_losses(
+            predictions, targets, sample_weights
         )
-        for key, value in metrics.items():
+
+        # Initialise reference losses on the very first training step
+        if self.initial_losses is None:
+            self.initial_losses = task_losses.detach().clone()
+
+        # Normalise task weights: non-negative, sum == num_tasks
+        task_w = torch.relu(self.task_weights)
+        task_w = task_w * (self.num_tasks / task_w.sum().clamp(min=1e-6))
+
+        # Combined weighted task loss (network update — task_w detached so gradients
+        # flow only through network params).
+        combined_loss = (task_w.detach() * task_losses).sum()
+
+        run_gradnorm = batch_idx % self.gradnorm_update_freq == 0
+
+        if run_gradnorm:
+            # ---------------------------------------------------------------- #
+            # GradNorm: ||∇_W L_i|| measured on a SINGLE representative param  #
+            # (fc2.weight of the last shared block) — avoids iterating over all #
+            # block parameters while still capturing relative task magnitudes.  #
+            # retain_graph=True on all calls so the graph survives for          #
+            # combined_loss.backward() below.                                   #
+            # ---------------------------------------------------------------- #
+            rep_param = [self.ParTau.blocks[-1].fc2.weight]
+            raw_grad_norms = []
+            for i in range(self.num_tasks):
+                (gj,) = torch.autograd.grad(
+                    task_losses[i],
+                    rep_param,
+                    retain_graph=True,
+                    create_graph=False,
+                    allow_unused=True,
+                )
+                if gj is not None:
+                    norm = gj.float().norm().detach()
+                else:
+                    norm = task_losses.new_zeros(())
+                raw_grad_norms.append(norm)
+            raw_grad_norms = torch.stack(raw_grad_norms)  # [4], detached
+
+            # Weighted norms G_i = w_i * ||∇_W L_i||  (differentiable through task_w)
+            weighted_grad_norms = task_w * raw_grad_norms
+
+            G_bar = weighted_grad_norms.detach().mean()
+            loss_ratios = task_losses.detach() / (self.initial_losses + 1e-12)
+            r_i = loss_ratios / (loss_ratios.mean() + 1e-12)
+            G_targets = (G_bar * r_i.pow(self.gradnorm_alpha)).detach()
+
+            gradnorm_loss = (weighted_grad_norms - G_targets).abs().sum()
+
+        # ---- Update network weights (one backward pass) ----
+        net_opt.zero_grad()
+        self.manual_backward(combined_loss)
+        torch.nn.utils.clip_grad_norm_(self.ParTau.parameters(), 1.0)
+        net_opt.step()
+
+        if run_gradnorm:
+            # ---- Update task weights ----
+            w_opt.zero_grad()
+            self.manual_backward(gradnorm_loss)
+            w_opt.step()
+
+            # Renormalise task weights so they sum to num_tasks.
+            # Floor at 0.1 so GradNorm can never fully suppress a task
+            # (with weight → 0, AdamW weight decay would destroy that head).
+            with torch.no_grad():
+                self.task_weights.clamp_(min=0.1)
+                s = self.task_weights.sum()
+                if s > 1e-6:
+                    self.task_weights.mul_(self.num_tasks / s)
+
+        sch = self.lr_schedulers()
+        if sch is not None:
+            sch.step()
+
+        # Accumulate individual task losses for epoch-level logging
+        with torch.no_grad():
+            loss_dict = {
+                "loss": combined_loss,
+                "tau_id_loss": task_losses[0],
+                "decay_mode_loss": task_losses[1],
+                "charge_loss": task_losses[2],
+                "kinematics_loss": task_losses[3],
+            }
+        for key, value in loss_dict.items():
             self.training_loss_accumulator[key].append(value.detach())
 
+        # Step-level logs
         self.log(
             "LR",
-            self.optimizers().param_groups[0]["lr"],
+            net_opt.param_groups[0]["lr"],
             on_step=True,
             on_epoch=False,
             prog_bar=True,
         )
+        (
+            self.log(
+                "train/gradnorm_loss",
+                gradnorm_loss.detach(),
+                on_step=True,
+                on_epoch=False,
+            )
+            if run_gradnorm
+            else None
+        )
+        for i, name in enumerate(["tagging", "decay_mode", "charge", "kinematics"]):
+            self.log(
+                f"task_weights/{name}", task_w[i].detach(), on_step=True, on_epoch=False
+            )
 
-        return metrics["loss"]
+        return combined_loss
 
     def predict_step(self, batch, _batch_idx):
         """
@@ -85,9 +194,14 @@ class ParTauModule(L.LightningModule):
 
     def configure_optimizers(self):
         # AdamW is generally preferred for transformer architectures
-        optimizer = torch.optim.AdamW(
+        net_optimizer = torch.optim.AdamW(
             params=self.ParTau.parameters(),
             lr=self.cfg.training.lr,
+        )
+        # Separate Adam optimizer for GradNorm task weights (small, fixed LR)
+        w_optimizer = torch.optim.Adam(
+            params=[self.task_weights],
+            lr=0.025,
         )
         # if self.cfg.training.optimizer.use_lookahead:
         #     optimizer = Lookahead(base_optimizer=optimizer, k=6, alpha=0.5)
@@ -111,11 +225,13 @@ class ParTauModule(L.LightningModule):
             print(f"Using calculated T_max={T_max} from estimated_stepping_batches")
 
         lr_scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
-            optimizer,
+            net_optimizer,
             T_max=T_max,
             eta_min=self.cfg.training.lr * 0.01,
         )
-        return [optimizer], [{"scheduler": lr_scheduler, "interval": "step"}]
+        return [net_optimizer, w_optimizer], [
+            {"scheduler": lr_scheduler, "interval": "step"}
+        ]
 
     def _convert_logits_to_predictions(self, logits_dict):
         """Convert model logits to probabilities/predictions for evaluation and logging."""
@@ -188,6 +304,54 @@ class ParTauModule(L.LightningModule):
         ) / (
             4.0 + l_m
         )  # Normalize by sum of weights: 4 * 1.0 + l_m
+
+    def _compute_per_task_losses(self, predictions, targets, sample_weights):
+        """
+        Return a [4] tensor [tag_loss, dm_loss, charge_loss, kin_loss] — each a
+        sample-weighted scalar with a gradient graph attached (for GradNorm).
+
+        The three signal-only tasks (dm, charge, kin) require at least one tau jet
+        in the batch; if there are none they are returned as zero tensors so that
+        GradNorm can still run without crashing (their gradient norm will be 0 and
+        their target G_target will be pulled toward 0 as well).
+        """
+        is_tau_mask = targets["is_tau"].bool()
+
+        # Tagging loss — all jets
+        tag_per_jet = self.tagging_loss_fn(predictions["is_tau"], targets["is_tau"])
+        tag_loss = (tag_per_jet * sample_weights).mean()
+
+        if not is_tau_mask.any():
+            zero = tag_loss.new_zeros(())
+            return torch.stack([tag_loss, zero, zero, zero])
+
+        tau_weights = sample_weights[is_tau_mask]
+
+        dm_loss = (
+            self.decay_mode_loss_fn(
+                predictions["decay_mode"][is_tau_mask],
+                targets["decay_mode"][is_tau_mask],
+            )
+            * tau_weights
+        ).mean()
+
+        charge_loss = (
+            self.charge_loss_fn(
+                predictions["charge"][is_tau_mask],
+                targets["charge"][is_tau_mask],
+            )
+            * tau_weights
+        ).mean()
+
+        kin_loss = (
+            self.kinematics_loss_fn(
+                predictions["kinematics"][is_tau_mask],
+                targets["kinematics"][is_tau_mask],
+            )
+            * tau_weights
+        ).mean()
+
+        return torch.stack([tag_loss, dm_loss, charge_loss, kin_loss])
 
     def calculate_metrics(
         self, targets, predictions, weights, w_kin=1, w_dm=1, w_tag=1, w_charge=1

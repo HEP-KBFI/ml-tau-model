@@ -1,7 +1,7 @@
 #!/bin/bash
 #SBATCH -p gpu
-#SBATCH --gres gpu:rtx
-#SBATCH --mem-per-gpu 40G
+#SBATCH --gres gpu:l40:1
+#SBATCH --mem-per-gpu 64G
 #SBATCH -o logs/slurm-%x-%j-%N.out
 
 # To select the model, pass Hydra overrides as extra arguments, e.g.:

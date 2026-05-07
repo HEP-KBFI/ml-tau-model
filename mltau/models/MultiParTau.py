@@ -80,8 +80,14 @@ class ParTau(ParticleTransformer):
         trunc_normal_(self.cls_token_decay_mode, std=0.02)
         trunc_normal_(self.cls_token_kinematics, std=0.02)
 
-        # Classification head for decay mode classification
-        self.classification_head = nn.Linear(embed_dim, num_dm_classes)
+        # Classification head for decay mode classification.
+        # Takes the DM CLS embedding concatenated with the kinematics CLS embedding
+        # so the DM head can learn its own projection of what is kinematically
+        # relevant (particle multiplicity, track topology, etc.) — richer than
+        # the 5-dim logit bottleneck.
+        self.classification_head = nn.Linear(embed_dim + embed_dim, num_dm_classes)
+        # Logits version (smaller, inductive bias toward visible mass):
+        # self.classification_head = nn.Linear(embed_dim + 5, num_dm_classes)
         # Regression head kinematic reconstruction [pT_vis, theta, phi, m_vis]
         self.regression_head = nn.Linear(
             embed_dim, 5
@@ -166,13 +172,19 @@ class ParTau(ParticleTransformer):
             # Now introduce the different heads also here.
             # Output raw logits - activations will be applied by loss functions or during inference
 
+            # Compute kinematics embedding first so it can be reused by the DM head.
+            # Gradients are not detached: DM supervision flows back into the kin
+            # head, which is physically motivated (mass → decay mode).
+            kin_logits = self.regression_head(x_kinematics)  # (N, 5)
+
             output = {
                 "is_tau": self.tau_id_head(x_tagging).squeeze(-1),  # (N,) - raw logits
                 "charge": self.tau_charge_head(x_charge).squeeze(
                     -1
                 ),  # (N,) - raw logits
+                # Embedding version: DM head sees full kin CLS token (256+256 → 6)
                 "decay_mode": self.classification_head(
-                    x_decay_mode
+                    torch.cat([x_decay_mode, x_kinematics], dim=-1)
                 ),  # (N, num_dm_classes) - raw logits
                 "kinematics": self.regression_head(
                     x_kinematics
