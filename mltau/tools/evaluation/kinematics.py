@@ -553,8 +553,8 @@ class KinematicsEvaluator:
                 mode="diff",
             ),
             "theta": RegressionEvaluator(
-                prediction=self.predicted_p4.theta,
-                truth=self.true_p4.theta,
+                prediction=np.rad2deg(self.predicted_p4.theta),
+                truth=np.rad2deg(self.true_p4.theta),
                 bin_edges=self.cfg.metrics.kinematics.theta.bin_edges[self.sample_name],
                 algorithm=self.algorithm,
                 sample_name=self.sample_name,
