@@ -1,11 +1,11 @@
 training:
   debug_run: False
-  lr: 0.001
+  lr: 0.0001
   model:
     name: MultiParTau  # MultiParTau | SingleParTau
     task: is_tau       # SingleParTau only: is_tau | charge | decay_mode | kinematics
   trainer:
-    max_epochs: 100
+    max_epochs: 250
 
   task_weights:
     tau_id: 1.0
@@ -14,7 +14,7 @@ training:
     kinematics: 1.0
 
   dataloader:
-    batch_size: 2048 #4096
+    batch_size: 12288 #10240 #2048 #4096
     num_dataloader_workers: 8
     prefetch_factor: 100
 

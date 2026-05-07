@@ -1,6 +1,6 @@
 dataset:
   max_cands: 20
-  data_dir: /home/laurits/0430_New_split_new_kin_target/
+  data_dir: /scratch/persistent/laurits/ml-tau/0506_lifetime_significance
   relative_sizes:
     train: 0.7
     val: 0.1

@@ -179,14 +179,18 @@ class ParticleTransformerDataset(IterableDataset):
             np.maximum(jet_en**2 - (jet_pt * np.cosh(jet_eta)) ** 2, 0.0)
         )
         _vis_m_ratio = np.maximum(_mass_gen / np.maximum(_mass_reco, eps), eps)
+        # Clamp log-ratio targets to ±5 (≈ factor-of-150 correction).
+        # Without this, massless reco jets give log(_mass_gen/eps) ≈ 14, which
+        # dominates the loss and causes GradNorm to suppress the kin head weight.
+        _LOG_CLAMP = 5.0
         kinematics_tensor = torch.from_numpy(
             np.stack(
                 [
-                    np.log(_vis_pt_ratio),
+                    np.clip(np.log(_vis_pt_ratio), -_LOG_CLAMP, _LOG_CLAMP),
                     _deta,
                     np.sin(_dphi),
                     np.cos(_dphi),
-                    np.log(_vis_m_ratio),
+                    np.clip(np.log(_vis_m_ratio), -_LOG_CLAMP, _LOG_CLAMP),
                 ],
                 axis=-1,
             )
