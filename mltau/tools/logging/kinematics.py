@@ -44,6 +44,7 @@ def _log_single_variable(
         algorithm="all",
         sample_name="all",
         mode=mode,
+        variable=var_name,
     )
     reco_evaluator = None
     if reco_pred is not None:
@@ -54,6 +55,7 @@ def _log_single_variable(
             algorithm="all",
             sample_name="reco",
             mode=mode,
+            variable=var_name,
         )
 
     response_lineplot = k.LinePlot(

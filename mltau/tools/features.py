@@ -71,6 +71,12 @@ def signedDeltaPhi(phi1, phi2):
     return np.arctan2(np.sin(diff), np.cos(diff))
 
 
+def signedDeltaPhi_deg(phi1_deg, phi2_deg):
+    """Degree-safe phi difference, wrapped to (−180, 180]."""
+    diff = phi1_deg - phi2_deg
+    return ((diff + 180.0) % 360.0) - 180.0
+
+
 # @numba.njit()
 def deltaTheta(theta1, theta2):
     """Calculates the difference in polar angle of two objects.

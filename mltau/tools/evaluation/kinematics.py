@@ -17,7 +17,7 @@ plt.rcParams["mathtext.fontset"] = "stix"
 
 
 DIFF_FUNCTIONS = {
-    "phi": f.signedDeltaPhi,
+    "phi": f.signedDeltaPhi_deg,
     "eta": f.signedDeltaEta,
     "theta": f.signedDeltaTheta,
 }
@@ -568,6 +568,7 @@ class KinematicsEvaluator:
                 bin_edges=self.cfg.metrics.kinematics.pt.bin_edges[self.sample_name],
                 algorithm=self.algorithm,
                 sample_name=self.sample_name,
+                variable="pt",
                 mode="ratio",
             ),
             "eta": RegressionEvaluator(
@@ -576,6 +577,7 @@ class KinematicsEvaluator:
                 bin_edges=self.cfg.metrics.kinematics.eta.bin_edges[self.sample_name],
                 algorithm=self.algorithm,
                 sample_name=self.sample_name,
+                variable="eta",
                 mode="diff",
             ),
             "theta": RegressionEvaluator(
@@ -584,6 +586,7 @@ class KinematicsEvaluator:
                 bin_edges=self.cfg.metrics.kinematics.theta.bin_edges[self.sample_name],
                 algorithm=self.algorithm,
                 sample_name=self.sample_name,
+                variable="theta",
                 mode="diff",
             ),
             "phi": RegressionEvaluator(
@@ -592,6 +595,7 @@ class KinematicsEvaluator:
                 bin_edges=self.cfg.metrics.kinematics.phi.bin_edges[self.sample_name],
                 algorithm=self.algorithm,
                 sample_name=self.sample_name,
+                variable="phi",
                 mode="diff",
             ),
             "m_vis": RegressionEvaluator(
@@ -600,6 +604,7 @@ class KinematicsEvaluator:
                 bin_edges=self.cfg.metrics.kinematics.m_vis.bin_edges[self.sample_name],
                 algorithm=self.algorithm,
                 sample_name=self.sample_name,
+                variable="m_vis",
                 mode="ratio",
             ),
             "energy": RegressionEvaluator(
@@ -610,6 +615,7 @@ class KinematicsEvaluator:
                 ],
                 algorithm=self.algorithm,
                 sample_name=self.sample_name,
+                variable="energy",
                 mode="ratio",
             ),
             "deltaR": DeltaREvaluator(

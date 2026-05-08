@@ -118,10 +118,10 @@ kinematics:
             yscale: "linear"
             nticks: 3
     deltaR:
-        content_xlim: [0.0, 0.5]
+        content_xlim: [0.0, 0.25]
         median_plot:
             ylabel: "Median $\\Delta R$"
-            ylim: [0, 0.3]
+            ylim: [0, 0.02]
             xlabel: "$p_T^{gen-vis}$ [GeV]"
             xscale: "linear"
             yscale: "linear"
