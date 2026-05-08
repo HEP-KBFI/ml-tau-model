@@ -68,8 +68,14 @@ class ParTau(ParticleTransformer):
 
         embed_dim = embed_dims[-1] if len(embed_dims) > 0 else input_dim
         if self.task == "decay_mode":
-            # Classification head for decay mode classification
-            self.classification_head = nn.Linear(embed_dim, num_dm_classes)
+            # MLP head: 256 → 128 → 6; non-linear compression helps separate the
+            # 6 DM classes whose boundaries are non-trivial (e.g. DM 1 vs DM 2).
+            dm_hidden = embed_dim // 2
+            self.classification_head = nn.Sequential(
+                nn.Linear(embed_dim, dm_hidden),
+                nn.GELU(),
+                nn.Linear(dm_hidden, num_dm_classes),
+            )
         elif self.task == "kinematics":
             # Regression head: small MLP for richer non-linear mapping from CLS to targets.
             # [log(pt_gen/pt_reco), delta_eta, delta_sin(phi), delta_cos(phi), log(m_gen/m_reco)]

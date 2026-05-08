@@ -84,7 +84,17 @@ class ParTau(ParticleTransformer):
         # Takes the DM CLS embedding concatenated with the (detached) kinematics
         # CLS embedding so the DM head can exploit kinematic context without
         # sending classification gradients back into the kinematics CLS token.
-        self.classification_head = nn.Linear(embed_dim + embed_dim, num_dm_classes)
+        # 512 → 128 → 6: the compression layer helps separate the 6 DM classes
+        # whose boundaries are non-trivial (e.g. DM 1 vs 2 differ by one π⁰).
+        # Charge and tagging are left as single linear heads — they are simple
+        # binary decisions well-represented in a 256-dim embedding and deeper
+        # heads would only add overfit risk.
+        dm_hidden = embed_dim // 2
+        self.classification_head = nn.Sequential(
+            nn.Linear(embed_dim + embed_dim, dm_hidden),
+            nn.GELU(),
+            nn.Linear(dm_hidden, num_dm_classes),
+        )
         # Regression head: small MLP for richer non-linear mapping from CLS to targets.
         # [log_pt, deta, delta_sin(phi), delta_cos(phi), log_m]
         hidden_dim = embed_dim // 2
