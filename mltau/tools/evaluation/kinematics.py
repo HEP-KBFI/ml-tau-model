@@ -10,10 +10,17 @@ import matplotlib.colors as colors
 import matplotlib.ticker as ticker
 from mltau.tools.io.general import NpEncoder
 from mltau.tools.general import reinitialize_p4
-from mltau.tools.features import deltaR_thetaPhi
+from mltau.tools import features as f
 
 hep.style.use(hep.styles.CMS)
 plt.rcParams["mathtext.fontset"] = "stix"
+
+
+DIFF_FUNCTIONS = {
+    "phi": f.signedDeltaPhi,
+    "eta": f.signedDeltaEta,
+    "theta": f.signedDeltaTheta,
+}
 
 
 def plot_regression_confusion_matrix(
@@ -108,6 +115,7 @@ class RegressionEvaluator:
         algorithm: str,
         sample_name: str = "",
         mode: str = "ratio",
+        variable: str = "phi",
     ):
         self.prediction = np.array(prediction)
         self.truth = np.array(truth)
@@ -118,7 +126,8 @@ class RegressionEvaluator:
         if self.mode == "ratio":
             self.ratios = self.prediction / self.truth
         else:
-            self.ratios = self.prediction - self.truth
+            diff_function = DIFF_FUNCTIONS[variable]
+            self.ratios = diff_function(self.prediction, self.truth)
 
         self.resolution_function = IQR
         self.sample = sample_name
@@ -147,14 +156,18 @@ class RegressionEvaluator:
         responses = np.array(
             [self.response_function(r) if len(r) > 0 else np.nan for r in binned_ratios]
         )
-        return resolutions / responses, responses, binned_ratios
+        if self.mode == "ratio":
+            return resolutions / responses, responses, binned_ratios
+        else:
+            return resolutions, responses, binned_ratios
 
     def _get_overall_resoluton_response(self):
         response = self.response_function(self.ratios)
         resolution = self.resolution_function(self.ratios)
-        resolution = resolution / response
-        return resolution, response
-
+        if self.mode == "ratio":
+            return resolution / response, response
+        else:
+            return resolution, response
 
     def print_results(self):
         print("----------------------------")
@@ -238,8 +251,7 @@ class RangeContentPlot:
                 (
                     f"IQR = {IQR(data) / np.median(data):.3f}"
                     if self.mode == "ratio" and len(data) > 0
-                    else f"IQR = {IQR(data):.3f}" if len(data) > 0
-                    else "N/A"
+                    else f"IQR = {IQR(data):.3f}" if len(data) > 0 else "N/A"
                 ),
                 transform=ax.transAxes,
                 fontsize=8,
@@ -316,6 +328,7 @@ class LinePlot:
         ymin: float = 0,
         ymax: float = 1,
         nticks: int = 7,
+        axhline_loc=None,
     ):
         self.cfg = cfg
         self.xlabel = xlabel
@@ -325,6 +338,7 @@ class LinePlot:
         self.nticks = nticks
         self.ymin, self.ymax = ymin, ymax
         self._y_values = []
+        self.axhline_loc = axhline_loc
         self.fig, self.ax = self.plot()
 
     def add_line(self, x_values, y_values, algorithm, label=""):
@@ -389,6 +403,8 @@ class LinePlot:
         ax.set_yscale(self.yscale)
         ax.set_xscale(self.xscale)
         ax.set_ylim((self.ymin, self.ymax))
+        if self.axhline_loc is not None:
+            ax.axhline(self.axhline_loc, ls="--", color="k")
         ax.grid()
         start, end = ax.get_ylim()
         ax.yaxis.set_ticks(np.linspace(start, end, self.nticks))
@@ -429,7 +445,14 @@ class Resolution2DPlot:
 
 
 class RegressionMultiEvaluator:
-    def __init__(self, output_dir: str, cfg: DictConfig, sample: str, var_cfg):
+    def __init__(
+        self,
+        output_dir: str,
+        cfg: DictConfig,
+        sample: str,
+        var_cfg,
+        axhline_loc: float = 0.0,
+    ):
         self.output_dir = output_dir
         os.makedirs(self.output_dir, exist_ok=True)
         self.cfg = cfg
@@ -444,6 +467,7 @@ class RegressionMultiEvaluator:
             ymin=var_cfg.response_plot.ylim[0],
             ymax=var_cfg.response_plot.ylim[1],
             nticks=var_cfg.response_plot.nticks,
+            axhline_loc=axhline_loc,
         )
         self.resolution_lineplot = LinePlot(
             cfg=self.cfg,
@@ -477,7 +501,9 @@ class RegressionMultiEvaluator:
                 evaluator.bin_edges, evaluator, xlabel=self.var_cfg.response_plot.xlabel
             )
             self.bin_distributions_plots[evaluator.algorithm] = RangeContentPlot(
-                evaluator.bin_edges, xlabel=self.var_cfg.response_plot.xlabel, mode=evaluator.mode
+                evaluator.bin_edges,
+                xlabel=self.var_cfg.response_plot.xlabel,
+                mode=evaluator.mode,
             )
             self.bin_distributions_plots[evaluator.algorithm].add_line(evaluator)
             if evaluator.sample not in self.resolution_performance_info.keys():
@@ -529,7 +555,7 @@ class KinematicsEvaluator:
         self.var_evaluators = self._fill_evaluators()
 
     def _fill_evaluators(self):
-        deltaR = deltaR_thetaPhi(
+        deltaR = f.deltaR_thetaPhi(
             theta1=self.predicted_p4.theta,
             phi1=self.predicted_p4.phi,
             theta2=self.true_p4.theta,
@@ -602,18 +628,26 @@ class KinematicsMultiEvaluator:
         self.cfg = cfg
         self.sample = sample
         self.cfg = cfg
-        self.variables = ["pt", "eta", "phi", "theta", "m_vis", "energy"]
+        self.variables = {
+            "pt": "ratio",
+            "eta": "diff",
+            "phi": "diff",
+            "theta": "diff",
+            "m_vis": "ratio",
+            "energy": "ratio",
+        }
         self.multi_evaluators = {}
         self._init_plots()
 
     def _init_plots(self):
         plots = {}
-        for variable in self.variables:
+        for variable, mode in self.variables.items():
             var_cfg = self.cfg.metrics.kinematics[variable]
             vme_output_dir = os.path.join(self.output_dir, variable)
             os.makedirs(vme_output_dir, exist_ok=True)
+            axhline_loc = 1.0 if mode == "ratio" else 0.0
             self.multi_evaluators[variable] = RegressionMultiEvaluator(
-                vme_output_dir, self.cfg, self.sample, var_cfg
+                vme_output_dir, self.cfg, self.sample, var_cfg, axhline_loc=axhline_loc
             )
         dr_cfg = self.cfg.metrics.kinematics.deltaR
         self.multi_evaluators["deltaR"] = LinePlot(
@@ -650,6 +684,3 @@ class KinematicsMultiEvaluator:
         os.makedirs(deltaR_output_dir, exist_ok=True)
         deltaR_output_path = os.path.join(deltaR_output_dir, "median_plot.pdf")
         self.multi_evaluators["deltaR"].save(deltaR_output_path)
-
-
-# TODO: Add reco_jet as a baseline algorithm.

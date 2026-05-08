@@ -9,8 +9,8 @@ Model output dict:
   predictions["kinematics"]  shape (N, 5)  raw regression:
       [:,0] = log(pt_gen / pt_reco)              → pred_pt   = exp(pred[:,0]) * reco.pt
       [:,1] = delta_eta (gen - reco)             → pred_eta  = pred[:,1] + reco.eta
-      [:,2] = delta_sin(phi) (gen - reco)        ↘
-      [:,3] = delta_cos(phi) (gen - reco)        → pred_phi  = atan2(true_sin_phi, true_cos_phi), where true_sin/cos_phi = pred[:, 2]/[:, 3] + sin/cos(reco.phi)
+      [:,2] = sin(phi_gen) - sin(phi_reco)          ↘
+      [:,3] = cos(phi_gen) - cos(phi_reco)          → pred_phi = atan2(pred[:,2]+sin(reco.phi), pred[:,3]+cos(reco.phi))
       [:,4] = log(m_gen / m_reco)                → pred_mass = exp(pred[:,4]) * reco.mass
 
 Output awkward array fields per candidate:
@@ -38,8 +38,10 @@ from tqdm.auto import tqdm
 
 from mltau.tools.general import reinitialize_p4, one_hot_decoding
 from mltau.tools.io.general import BatchInputs
-from mltau.tools.io.preprocessed_ParTau_dataloader import ParticleTransformerDataset, apply_saved_input_scaling_from_cfg
-
+from mltau.tools.io.preprocessed_ParTau_dataloader import (
+    ParticleTransformerDataset,
+    apply_saved_input_scaling_from_cfg,
+)
 
 # def softmax(x):
 #     # x shape: (N, 6)
@@ -69,10 +71,11 @@ def decode_kinematic_predictions(predictions: dict, reco_jet_p4s: ak.Array) -> a
 
     pred_pt = np.exp(kin[:, 0]) * reco_pt
     pred_eta = kin[:, 1] + reco_eta
+    # kin[:,2] = sin(phi_gen) - sin(phi_reco),  kin[:,3] = cos(phi_gen) - cos(phi_reco)
+    # Reconstruction: sin(phi_gen) = kin[:,2] + sin(phi_reco), similarly for cos
     true_sin_phi = kin[:, 2] + sin_reco_phi
     true_cos_phi = kin[:, 3] + cos_reco_phi
-    pred_phi = np.arctan2(true_sin_phi, true_cos_phi)  # atan2(sin, cos)
-    # pred_phi = reco_phi + np.arctan2(kin[:, 2], kin[:, 3])  # atan2(sin, cos)
+    pred_phi = np.arctan2(true_sin_phi, true_cos_phi)
     pred_mass = np.exp(kin[:, 4]) * reco_mass
 
     # energy:  E = sqrt(pt^2 * cosh^2(eta) + m^2)  [via p = pt*cosh(eta)]
@@ -286,49 +289,29 @@ def create_predictions_file(
             )
             all_is_tau.append(inputs.target["is_tau"].detach().cpu().numpy())
 
-            # --- Candidate mask: 1 for real, 0 for padded ---
+            # cand_features:   (n_jets, n_cands, n_features) – padded slots already 0
+            # cand_kinematics: (n_jets, n_cands, 4)          – padded slots already 0
             cand_features = (
                 inputs.cand_features.detach().cpu().numpy()
             )  # (n_jets, n_cands, n_features)
             cand_kinematics = (
                 inputs.cand_kinematics_pxpypze.detach().cpu().numpy()
             )  # (n_jets, n_cands, 4)
-            cand_mask = (
-                inputs.cand_mask.detach().cpu().numpy().astype(bool)
-            )  # (n_jets, n_cands)
 
-            # --- Feature index for charge ---
             charge_idx = 7  # Feature index 7 is charge
-            batch_cand_charges = []
-            batch_cand_p4 = []
-            n_jets, n_cands, _ = cand_features.shape
-            for jet_idx in range(n_jets):
-                mask = cand_mask[jet_idx]  # (n_cands,)
-                real_idx = np.where(mask)[0]
-                if len(real_idx) == 0:
-                    batch_cand_charges.append(np.array([]))
-                    batch_cand_p4.append(
-                        {
-                            "px": np.array([]),
-                            "py": np.array([]),
-                            "pz": np.array([]),
-                            "energy": np.array([]),
-                        }
-                    )
-                    continue
-                charges = cand_features[jet_idx, real_idx, charge_idx]
-                kin = cand_kinematics[jet_idx, real_idx, :]
-                batch_cand_charges.append(charges)
-                batch_cand_p4.append(
-                    {
-                        "px": kin[:, 0],
-                        "py": kin[:, 1],
-                        "pz": kin[:, 2],
-                        "energy": kin[:, 3],
-                    }
-                )
+            # Extract all candidates (including padded); padded slots have charge=0
+            # and p4=(0,0,0,0), so they contribute 0 to any subsequent sum.
+            batch_cand_charges = cand_features[:, :, charge_idx]  # (n_jets, n_cands)
+            batch_cand_p4 = ak.Array(
+                {
+                    "px": cand_kinematics[:, :, 0],
+                    "py": cand_kinematics[:, :, 1],
+                    "pz": cand_kinematics[:, :, 2],
+                    "energy": cand_kinematics[:, :, 3],
+                }
+            )
             all_cand_charges.append(ak.Array(batch_cand_charges))
-            all_cand_p4.append(ak.Array(batch_cand_p4))
+            all_cand_p4.append(batch_cand_p4)
 
             post = postprocess_predictions(
                 preds, ak.Array(inputs.reco_jet_p4s), model_name, cfg

@@ -71,8 +71,14 @@ class ParTau(ParticleTransformer):
             # Classification head for decay mode classification
             self.classification_head = nn.Linear(embed_dim, num_dm_classes)
         elif self.task == "kinematics":
-            # Regression head: [log(pt_gen/pt_reco), delta_eta, delta_sin(phi), delta_cos(phi), log(m_gen/m_reco)]
-            self.regression_head = nn.Linear(embed_dim, 5)
+            # Regression head: small MLP for richer non-linear mapping from CLS to targets.
+            # [log(pt_gen/pt_reco), delta_eta, delta_sin(phi), delta_cos(phi), log(m_gen/m_reco)]
+            hidden_dim = embed_dim // 2
+            self.regression_head = nn.Sequential(
+                nn.Linear(embed_dim, hidden_dim),
+                nn.GELU(),
+                nn.Linear(hidden_dim, 5),
+            )
         elif self.task == "is_tau":
             # Binary head for tau-tagging
             self.binary_head = nn.Linear(embed_dim, 1)

@@ -41,8 +41,10 @@ class ParTauModule(L.LightningModule):
         self.kinematics_loss = nn.HuberLoss(reduction="none", delta=1.0)
 
         self.num_tasks = 4
-        # Learnable loss weights (initialized equally)
-        self.task_weights = nn.Parameter(torch.ones(self.num_tasks))
+        # Task order: [tagging, decay_mode, charge, kinematics]
+        # Kinematics is the hardest regression task and benefits from a higher
+        # initial weight so it competes with the classification heads early on.
+        self.task_weights = nn.Parameter(torch.tensor([1.0, 1.0, 1.0, 2.0]))
         # Store initial losses for GradNorm
         self.initial_losses = None
         # GradNorm hyperparameter: higher alpha → faster equalization of training rates

@@ -88,6 +88,22 @@ def deltaTheta(theta1, theta2):
     return np.abs(theta1 - theta2)
 
 
+def signedDeltaTheta(theta1, theta2):
+    """Calculates the difference in polar angle of two objects.
+
+    Args:
+        theta1 : float
+            The theta coordinate of the first object.
+        theta2 : float
+            The theta coordinate of the second object.
+
+    Returns:
+        dTheta : float
+            The difference in polar angle
+    """
+    return theta1 - theta2
+
+
 # @numba.njit()
 def deltaEta(eta1, eta2):
     """Calculates the difference in pseudorapidity of two objects.

@@ -139,17 +139,6 @@ def _log_single_variable(
     tb_logger.add_scalar(
         f"kinematics/{var_name}/response", evaluator.response, current_epoch
     )
-    if reco_evaluator is not None:
-        tb_logger.add_scalar(
-            f"kinematics/{var_name}/reco_resolution",
-            reco_evaluator.resolution,
-            current_epoch,
-        )
-        tb_logger.add_scalar(
-            f"kinematics/{var_name}/reco_response",
-            reco_evaluator.response,
-            current_epoch,
-        )
 
 
 def log_all_kinematics_metrics(
@@ -215,8 +204,7 @@ def log_all_kinematics_metrics(
         mode="diff",
     )
 
-    # --- phi (indices 2,3 are sin/cos of delta_phi; radians → degrees) ---
-
+    # --- phi (indices 2,3 are sin(phi_gen)-sin(phi_reco) and cos(phi_gen)-cos(phi_reco))
     pred_sin_phi = np.array(signal_predictions[:, 2]) + np.sin(reco.phi)
     pred_cos_phi = np.array(signal_predictions[:, 3]) + np.cos(reco.phi)
     pred_phi = np.arctan2(pred_sin_phi, pred_cos_phi)
@@ -340,13 +328,7 @@ def log_all_kinematics_metrics(
         "kinematics/deltaR/median", deltaR_evaluator.median, current_epoch
     )
     tb_logger.add_scalar(
-        "kinematics/deltaR/reco_median", reco_deltaR_evaluator.median, current_epoch
-    )
-    tb_logger.add_scalar(
         "kinematics/deltaR/mean", float(np.mean(deltaR)), current_epoch
-    )
-    tb_logger.add_scalar(
-        "kinematics/deltaR/reco_mean", float(np.mean(reco_deltaR)), current_epoch
     )
     tb_logger.add_scalar(
         "kinematics/energy/mean_diff",
