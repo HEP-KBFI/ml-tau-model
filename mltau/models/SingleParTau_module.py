@@ -53,8 +53,7 @@ class ParTauModule(L.LightningModule):
                 [
                     "kinematics_log_pt_loss",
                     "kinematics_delta_eta_loss",
-                    "kinematics_delta_sin_phi_loss",
-                    "kinematics_delta_cos_phi_loss",
+                    "kinematics_phi_chord_loss",
                     "kinematics_log_mass_loss",
                 ]
             )
@@ -149,24 +148,29 @@ class ParTauModule(L.LightningModule):
         if self.task == "kinematics":
             component_raw_loss = self.loss_fn(pred, target)
             is_tau_mask = targets["is_tau"].bool()
-            masked_component_loss = component_raw_loss[is_tau_mask]
-            component_loss = masked_component_loss.mean(dim=0)
+            masked = component_raw_loss[is_tau_mask]  # (N_tau, 5)
+            pred_tau = pred[is_tau_mask]
+            tgt_tau = target[is_tau_mask]
             l_m = 0.2
-            loss = (
-                component_loss[0]
-                + component_loss[1]
-                + component_loss[2]
-                + component_loss[3]
-                + l_m * component_loss[4]
-            ) / (4.0 + l_m)
+            log_pt_loss = masked[:, 0].mean()
+            deta_loss = masked[:, 1].mean()
+            # Phi chord loss: 2D coupled gradient for (sin, cos) components
+            phi_chord_loss = torch.sqrt(
+                (pred_tau[:, 2] - tgt_tau[:, 2]) ** 2
+                + (pred_tau[:, 3] - tgt_tau[:, 3]) ** 2
+                + 1e-8
+            ).mean()
+            log_m_loss = masked[:, 4].mean()
+            loss = (log_pt_loss + deta_loss + phi_chord_loss + l_m * log_m_loss) / (
+                3.0 + l_m
+            )
             metrics = {
                 "loss": loss,
                 self._loss_key(): loss,
-                "kinematics_log_pt_loss": component_loss[0],
-                "kinematics_delta_eta_loss": component_loss[1],
-                "kinematics_delta_sin_phi_loss": component_loss[2],
-                "kinematics_delta_cos_phi_loss": component_loss[3],
-                "kinematics_log_mass_loss": component_loss[4],
+                "kinematics_log_pt_loss": log_pt_loss,
+                "kinematics_delta_eta_loss": deta_loss,
+                "kinematics_phi_chord_loss": phi_chord_loss,
+                "kinematics_log_mass_loss": log_m_loss,
             }
             return metrics
         elif self.task == "is_tau":
@@ -310,7 +314,6 @@ class ParTauModule(L.LightningModule):
             gen_jet_p4s = ak.Array(all_gen_jet_p4s)
             reco_jet_p4s = ak.Array(all_reco_jet_p4s)
             gen_jet_tau_p4s = ak.Array(all_gen_jet_tau_p4s)
-
 
             self._log_task_metrics(
                 targets=all_targets,

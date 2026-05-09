@@ -292,20 +292,19 @@ class ParTauModule(L.LightningModule):
         # Delta eta term
         deta_loss = self.kinematics_loss(predictions[:, 1], targets[:, 1])  # delta eta
 
-        # Angular terms using sin/cos representation
-        dsin_phi_loss = self.kinematics_loss(
-            predictions[:, 2], targets[:, 2]
-        )  # delta_sin(phi)
-        dcos_phi_loss = self.kinematics_loss(
-            predictions[:, 3], targets[:, 3]
-        )  # delta_cos(phi)
+        # Phi chord loss: treat (sin, cos) as a 2D unit-vector difference so that
+        # the gradient corrects the angular direction jointly rather than pushing
+        # sin and cos independently.  The chord distance equals 2|sin(Δφ/2)|.
+        phi_chord_loss = torch.sqrt(
+            (predictions[:, 2] - targets[:, 2]) ** 2
+            + (predictions[:, 3] - targets[:, 3]) ** 2
+            + 1e-8
+        )  # shape [N], differentiable everywhere
 
-        # Average all components weighted by their importance
-        return (
-            log_pt_loss + deta_loss + dsin_phi_loss + dcos_phi_loss + l_m * log_m_loss
-        ) / (
-            4.0 + l_m
-        )  # Normalize by sum of weights: 4 * 1.0 + l_m
+        # 3 independent components + mass, normalise by sum of weights
+        return (log_pt_loss + deta_loss + phi_chord_loss + l_m * log_m_loss) / (
+            3.0 + l_m
+        )
 
     def _compute_per_task_losses(self, predictions, targets, sample_weights):
         """
