@@ -8,6 +8,7 @@ import matplotlib.pyplot as plt
 from omegaconf import DictConfig
 import matplotlib.colors as colors
 import matplotlib.ticker as ticker
+from mpl_toolkits.axes_grid1 import make_axes_locatable
 from mltau.tools.io.general import NpEncoder
 from mltau.tools.general import reinitialize_p4
 from mltau.tools import features as f
@@ -34,6 +35,7 @@ def plot_regression_confusion_matrix(
     y_label: str = "Predicted",
     x_label: str = "Truth",
     title: str = "Confusion matrix",
+    show_projections: bool = True,
 ):
     """Plots the confusion matrix for the regression task. Although confusion
     matrix is in principle meant for classification task, the problem can be
@@ -62,27 +64,76 @@ def plot_regression_confusion_matrix(
             [default: "Truth"] The label for the x-axis
         title : str
             [default: "Confusion matrix"] The title for the plot
+        show_projections : bool
+            [default: True] Whether to draw marginal density projections on the
+            top (gen/truth) and right (reco/predicted) sides of the matrix
 
     """
     bin_edges = np.linspace(left_bin_edge, right_bin_edge, num=n_bins + 1)
     fig, ax = plt.subplots(figsize=figsize)
-    ax.label_outer()
     bin_counts = np.histogram2d(y_true, y_pred, bins=[bin_edges, bin_edges])[0]
-    im = ax.pcolor(bin_edges, bin_edges, bin_counts.T, cmap=cmap)
-    # im = ax.pcolor(bin_edges, bin_edges, bin_counts.T, cmap=cmap, norm=colors.LogNorm())
-    # fig.colorbar(im, ax=ax)
-    fig.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
+    total = bin_counts.sum()
+    bin_density = bin_counts / total if total > 0 else bin_counts
+    im = ax.pcolor(bin_edges, bin_edges, bin_density.T, cmap=cmap)
     ax.set_aspect("equal")
     ax.set_ylabel(f"{y_label}")
     ax.set_xlabel(f"{x_label}")
-    ax.set_title(
-        title,
-        fontsize=18,
-        loc="center",
-        fontweight="bold",
-        style="italic",
-        family="monospace",
-    )
+
+    divider = make_axes_locatable(ax)
+
+    if show_projections:
+        ax_top = divider.append_axes("top", size="25%", pad=0.05, sharex=ax)
+        ax_right = divider.append_axes("right", size="25%", pad=0.05, sharey=ax)
+        ax_cbar = divider.append_axes("right", size="5%", pad=0.15)
+
+        # Gen (truth) distribution on top x-axis
+        ax_top.hist(
+            y_true,
+            bins=bin_edges,
+            density=True,
+            color="k",
+            histtype="step",
+            alpha=0.7,
+        )
+        ax_top.tick_params(left=False, bottom=False, labelleft=False, labelbottom=False)
+        ax_top.set_ylabel("")
+        if title is not None:
+            ax_top.set_title(
+                title,
+                fontsize=18,
+                loc="center",
+                fontweight="bold",
+                style="italic",
+                family="monospace",
+            )
+
+        # Reco (predicted) distribution on right y-axis
+        ax_right.hist(
+            y_pred,
+            bins=bin_edges,
+            density=True,
+            orientation="horizontal",
+            color="k",
+            histtype="step",
+            alpha=0.7,
+        )
+        ax_right.tick_params(
+            left=False, bottom=False, labelleft=False, labelbottom=False
+        )
+        ax_right.set_xlabel("")
+    else:
+        ax_cbar = divider.append_axes("right", size="5%", pad=0.15)
+        if title is not None:
+            ax.set_title(
+                title,
+                fontsize=18,
+                loc="center",
+                fontweight="bold",
+                style="italic",
+                family="monospace",
+            )
+
+    fig.colorbar(im, cax=ax_cbar)
     return fig, ax
 
 
