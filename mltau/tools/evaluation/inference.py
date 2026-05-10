@@ -9,8 +9,8 @@ Model output dict:
   predictions["kinematics"]  shape (N, 5)  raw regression:
       [:,0] = log(pt_gen / pt_reco)              → pred_pt   = exp(pred[:,0]) * reco.pt
       [:,1] = delta_eta (gen - reco)             → pred_eta  = pred[:,1] + reco.eta
-      [:,2] = sin(phi_gen) - sin(phi_reco)          ↘
-      [:,3] = cos(phi_gen) - cos(phi_reco)          → pred_phi = atan2(pred[:,2]+sin(reco.phi), pred[:,3]+cos(reco.phi))
+      [:,2] = sin(phi_gen - phi_reco)          ↘
+      [:,3] = cos(phi_gen - phi_reco)          → pred_phi = reco.phi + atan2(pred[:,2], pred[:,3])
       [:,4] = log(m_gen / m_reco)                → pred_mass = exp(pred[:,4]) * reco.mass
 
 Output awkward array fields per candidate:
@@ -62,8 +62,6 @@ def decode_kinematic_predictions(predictions: dict, reco_jet_p4s: ak.Array) -> a
     reco_pt = np.asarray(reco.pt)
     reco_eta = np.asarray(reco.eta)
     reco_phi = np.asarray(reco.phi)
-    sin_reco_phi = np.sin(reco_phi)
-    cos_reco_phi = np.cos(reco_phi)
     reco_mass = np.asarray(reco.mass)
 
     # --- decode kinematics ---
@@ -71,11 +69,8 @@ def decode_kinematic_predictions(predictions: dict, reco_jet_p4s: ak.Array) -> a
 
     pred_pt = np.exp(kin[:, 0]) * reco_pt
     pred_eta = kin[:, 1] + reco_eta
-    # kin[:,2] = sin(phi_gen) - sin(phi_reco),  kin[:,3] = cos(phi_gen) - cos(phi_reco)
-    # Reconstruction: sin(phi_gen) = kin[:,2] + sin(phi_reco), similarly for cos
-    true_sin_phi = kin[:, 2] + sin_reco_phi
-    true_cos_phi = kin[:, 3] + cos_reco_phi
-    pred_phi = np.arctan2(true_sin_phi, true_cos_phi)
+    # kin[:,2] = sin(Δφ),  kin[:,3] = cos(Δφ),  where Δφ = phi_gen - phi_reco
+    pred_phi = reco_phi + np.arctan2(kin[:, 2], kin[:, 3])
     pred_mass = np.exp(kin[:, 4]) * reco_mass
 
     # energy:  E = sqrt(pt^2 * cosh^2(eta) + m^2)  [via p = pt*cosh(eta)]

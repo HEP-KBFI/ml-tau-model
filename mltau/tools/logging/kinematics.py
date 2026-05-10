@@ -206,14 +206,13 @@ def log_all_kinematics_metrics(
         mode="diff",
     )
 
-    # --- phi (indices 2,3 are sin(phi_gen)-sin(phi_reco) and cos(phi_gen)-cos(phi_reco))
-    pred_sin_phi = np.array(signal_predictions[:, 2]) + np.sin(reco.phi)
-    pred_cos_phi = np.array(signal_predictions[:, 3]) + np.cos(reco.phi)
-    pred_phi = np.arctan2(pred_sin_phi, pred_cos_phi)
-
-    true_sin_phi = np.array(signal_targets[:, 2]) + np.sin(reco.phi)
-    true_cos_phi = np.array(signal_targets[:, 3]) + np.cos(reco.phi)
-    true_phi = np.arctan2(true_sin_phi, true_cos_phi)
+    # --- phi (indices 2,3 are sin(Δφ) and cos(Δφ), where Δφ = phi_gen - phi_reco)
+    pred_phi = np.array(reco.phi) + np.arctan2(
+        signal_predictions[:, 2], signal_predictions[:, 3]
+    )
+    true_phi = np.array(reco.phi) + np.arctan2(
+        signal_targets[:, 2], signal_targets[:, 3]
+    )
 
     pred_phi_deg = np.rad2deg(pred_phi)
     true_phi_deg = np.rad2deg(true_phi)
