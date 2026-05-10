@@ -41,103 +41,93 @@ class ParTauModule(L.LightningModule):
         self.kinematics_loss = nn.HuberLoss(reduction="none", delta=1.0)
 
         self.num_tasks = 4
-        # Task order: [tagging, decay_mode, charge, kinematics]
-        # Kinematics is the hardest regression task and benefits from a higher
-        # initial weight so it competes with the classification heads early on.
-        self.task_weights = nn.Parameter(torch.tensor([1.0, 1.0, 1.0, 2.0]))
-        # Store initial losses for GradNorm
-        self.initial_losses = None
-        # GradNorm hyperparameter: higher alpha → faster equalization of training rates
-        self.gradnorm_alpha = 1.5
-        # Only recompute gradient norms every N steps; task weights are slow-moving
-        # so there is no accuracy benefit to running GradNorm every step.
-        self.gradnorm_update_freq = 20
-        # Disable automatic optimization so we can run two separate backward passes
+        # Disable automatic optimization so PCGrad can do per-task backward passes
         self.automatic_optimization = False
 
     def training_step(self, batch, batch_idx):
-        net_opt, w_opt = self.optimizers()
+        net_opt = self.optimizers()
 
         predictions, targets, sample_weights = self.forward(batch)
 
-        # Per-task scalar losses with gradient graph: [tag, dm, charge, kin]
+        # Per-task scalar losses: [tag, dm, charge, kin]
         task_losses = self._compute_per_task_losses(
             predictions, targets, sample_weights
         )
 
-        # Initialise reference losses on the very first training step
-        if self.initial_losses is None:
-            self.initial_losses = task_losses.detach().clone()
-
-        # Normalise task weights: non-negative, sum == num_tasks
-        task_w = torch.relu(self.task_weights)
-        task_w = task_w * (self.num_tasks / task_w.sum().clamp(min=1e-6))
-
-        # Combined weighted task loss (network update — task_w detached so gradients
-        # flow only through network params).
-        combined_loss = (task_w.detach() * task_losses).sum()
-
-        run_gradnorm = batch_idx % self.gradnorm_update_freq == 0
-
-        if run_gradnorm:
-            # ---------------------------------------------------------------- #
-            # GradNorm: ||∇_W L_i|| measured on a SINGLE representative param  #
-            # (fc2.weight of the last shared block) — avoids iterating over all #
-            # block parameters while still capturing relative task magnitudes.  #
-            # retain_graph=True on all calls so the graph survives for          #
-            # combined_loss.backward() below.                                   #
-            # ---------------------------------------------------------------- #
-            rep_param = [self.ParTau.blocks[-1].fc2.weight]
-            raw_grad_norms = []
-            for i in range(self.num_tasks):
-                (gj,) = torch.autograd.grad(
-                    task_losses[i],
-                    rep_param,
-                    retain_graph=True,
-                    create_graph=False,
-                    allow_unused=True,
-                )
-                if gj is not None:
-                    norm = gj.float().norm().detach()
-                else:
-                    norm = task_losses.new_zeros(())
-                raw_grad_norms.append(norm)
-            raw_grad_norms = torch.stack(raw_grad_norms)  # [4], detached
-
-            # Weighted norms G_i = w_i * ||∇_W L_i||  (differentiable through task_w)
-            weighted_grad_norms = task_w * raw_grad_norms
-
-            G_bar = weighted_grad_norms.detach().mean()
-            loss_ratios = task_losses.detach() / (self.initial_losses + 1e-12)
-            r_i = loss_ratios / (loss_ratios.mean() + 1e-12)
-            G_targets = (G_bar * r_i.pow(self.gradnorm_alpha)).detach()
-
-            gradnorm_loss = (weighted_grad_norms - G_targets).abs().sum()
-
-        # ---- Update network weights (one backward pass) ----
+        # ------------------------------------------------------------------ #
+        # PCGrad: for each task i, compute its gradient then subtract the     #
+        # projection onto any task j whose gradient conflicts (dot < 0).      #
+        # This eliminates destructive interference in the shared backbone      #
+        # without requiring learned task weights.                              #
+        #                                                                      #
+        # AMP note: we scale each loss with the GradScaler before autograd.   #
+        # grad so the scaler is properly initialised, then manually unscale   #
+        # and step the raw optimizer — bypassing Lightning's wrapper which     #
+        # would otherwise double-unscale and crash.                            #
+        # ------------------------------------------------------------------ #
+        params = list(self.ParTau.parameters())
         net_opt.zero_grad()
-        self.manual_backward(combined_loss)
-        torch.nn.utils.clip_grad_norm_(self.ParTau.parameters(), 1.0)
-        net_opt.step()
 
-        if run_gradnorm:
-            # ---- Update task weights ----
-            w_opt.zero_grad()
-            self.manual_backward(gradnorm_loss)
-            w_opt.step()
+        # Detect AMP GradScaler (None when not using AMP)
+        scaler = getattr(self.trainer.precision_plugin, "scaler", None)
 
-            # Renormalise task weights so they sum to num_tasks.
-            # Floor at 0.1 so GradNorm can never fully suppress a task
-            # (with weight → 0, AdamW weight decay would destroy that head).
-            with torch.no_grad():
-                self.task_weights.clamp_(min=0.1)
-                s = self.task_weights.sum()
-                if s > 1e-6:
-                    self.task_weights.mul_(self.num_tasks / s)
+        # Possibly scale losses so the GradScaler's internal state is initialised
+        if scaler is not None:
+            losses_for_grad = [scaler.scale(l) for l in task_losses]
+        else:
+            losses_for_grad = list(task_losses)
+
+        # 1. Collect per-task gradient vectors (retain graph for all but last)
+        task_grads = []
+        for i, loss in enumerate(losses_for_grad):
+            retain = i < self.num_tasks - 1
+            grads = torch.autograd.grad(
+                loss,
+                params,
+                retain_graph=retain,
+                create_graph=False,
+                allow_unused=True,
+            )
+            # Replace None (unused param) with zero tensor of matching shape
+            grads = [
+                g.float() if g is not None else torch.zeros_like(p, dtype=torch.float32)
+                for g, p in zip(grads, params)
+            ]
+            task_grads.append(grads)
+
+        # 2. Project conflicting gradients
+        pc_grads = [list(g) for g in task_grads]  # mutable copy
+        for i in range(self.num_tasks):
+            for j in range(self.num_tasks):
+                if i == j:
+                    continue
+                for k, (gi, gj) in enumerate(zip(pc_grads[i], task_grads[j])):
+                    dot = (gi * gj).sum()
+                    if dot < 0:  # conflict: remove component along gj
+                        pc_grads[i][k] = gi - dot / (gj.norm().pow(2) + 1e-12) * gj
+
+        # 3. Sum projected gradients and write into .grad
+        for k, p in enumerate(params):
+            merged = sum(pc_grads[i][k] for i in range(self.num_tasks))
+            p.grad = merged.to(p.dtype)
+
+        # 4. Unscale → clip → step (handle AMP and non-AMP separately to avoid
+        #    Lightning's wrapper calling unscale_ a second time)
+        if scaler is not None:
+            raw_opt = net_opt.optimizer  # unwrap LightningOptimizer
+            scaler.unscale_(raw_opt)
+            torch.nn.utils.clip_grad_norm_(params, 1.0)
+            scaler.step(raw_opt)
+            scaler.update()
+        else:
+            torch.nn.utils.clip_grad_norm_(params, 1.0)
+            net_opt.step()
 
         sch = self.lr_schedulers()
         if sch is not None:
             sch.step()
+
+        combined_loss = task_losses.sum().detach()
 
         # Accumulate individual task losses for epoch-level logging
         with torch.no_grad():
@@ -151,7 +141,6 @@ class ParTauModule(L.LightningModule):
         for key, value in loss_dict.items():
             self.training_loss_accumulator[key].append(value.detach())
 
-        # Step-level logs
         self.log(
             "LR",
             net_opt.param_groups[0]["lr"],
@@ -159,20 +148,6 @@ class ParTauModule(L.LightningModule):
             on_epoch=False,
             prog_bar=True,
         )
-        (
-            self.log(
-                "train/gradnorm_loss",
-                gradnorm_loss.detach(),
-                on_step=True,
-                on_epoch=False,
-            )
-            if run_gradnorm
-            else None
-        )
-        for i, name in enumerate(["tagging", "decay_mode", "charge", "kinematics"]):
-            self.log(
-                f"task_weights/{name}", task_w[i].detach(), on_step=True, on_epoch=False
-            )
 
         return combined_loss
 
@@ -200,11 +175,6 @@ class ParTauModule(L.LightningModule):
             params=self.ParTau.parameters(),
             lr=self.cfg.training.lr,
         )
-        # Separate Adam optimizer for GradNorm task weights (small, fixed LR)
-        w_optimizer = torch.optim.Adam(
-            params=[self.task_weights],
-            lr=0.025,
-        )
         # if self.cfg.training.optimizer.use_lookahead:
         #     optimizer = Lookahead(base_optimizer=optimizer, k=6, alpha=0.5)
 
@@ -231,9 +201,7 @@ class ParTauModule(L.LightningModule):
             T_max=T_max,
             eta_min=self.cfg.training.lr * 0.01,
         )
-        return [net_optimizer, w_optimizer], [
-            {"scheduler": lr_scheduler, "interval": "step"}
-        ]
+        return [net_optimizer], [{"scheduler": lr_scheduler, "interval": "step"}]
 
     def _convert_logits_to_predictions(self, logits_dict):
         """Convert model logits to probabilities/predictions for evaluation and logging."""
