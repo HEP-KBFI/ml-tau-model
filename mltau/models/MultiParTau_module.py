@@ -29,13 +29,13 @@ class ParTauModule(L.LightningModule):
             use_pre_activation_pair=False,
             for_inference=False,
             use_amp=False,
-            metric="eta-phi",
+            metric="theta-phi",
         )
 
         # Initialize loss functions once to avoid memory allocation overhead
         self.charge_loss = nn.BCEWithLogitsLoss(reduction="none")
         self.tagging_loss = SigmoidFocalLoss(
-            alpha=0.2, gamma=2.0, reduction="none"
+            alpha=0.1, gamma=2.0, reduction="none"
         )  # class imbalance
         self.decay_mode_loss = nn.CrossEntropyLoss(reduction="none")
         self.kinematics_loss = nn.HuberLoss(reduction="none", delta=1.0)
@@ -65,33 +65,44 @@ class ParTauModule(L.LightningModule):
         # and step the raw optimizer — bypassing Lightning's wrapper which     #
         # would otherwise double-unscale and crash.                            #
         # ------------------------------------------------------------------ #
-        params = list(self.ParTau.parameters())
-        net_opt.zero_grad()
+        # Only include parameters that are actually being trained — frozen params
+        # (Phase 2) must be excluded so PCGrad does not write zero .grad values
+        # into them, which would cause AdamW to treat them as having gradients.
+        params = [p for p in self.ParTau.parameters() if p.requires_grad]
 
-        # Detect AMP GradScaler (None when not using AMP)
-        scaler = getattr(self.trainer.precision_plugin, "scaler", None)
+        # Apply per-task loss weights from config before PCGrad so that tasks
+        # with higher weight have proportionally larger gradient magnitudes.
+        # This makes it harder for PCGrad to cancel the weighted task's gradients
+        # when conflicts arise (e.g. kinematics: 2.0 makes kin twice as resistant).
+        # Note: unweighted losses are still stored in task_losses for logging.
+        tw = self.cfg.training.task_weights
+        task_weight_tensor = task_losses.new_tensor(
+            [tw.tau_id, tw.decay_mode, tw.charge, tw.kinematics]
+        )
+        weighted_task_losses = task_losses * task_weight_tensor
 
-        # Possibly scale losses so the GradScaler's internal state is initialised
-        if scaler is not None:
-            losses_for_grad = [scaler.scale(l) for l in task_losses]
-        else:
-            losses_for_grad = list(task_losses)
-
-        # 1. Collect per-task gradient vectors (retain graph for all but last)
+        # 1. Collect per-task gradient vectors.
+        # Use self.manual_backward() instead of torch.autograd.grad so that
+        # Lightning's internal result collection is properly triggered on each
+        # training step.  Without at least one manual_backward() call,
+        # callback_metrics is never populated (automatic_optimization=False
+        # skips the normal result-collection pathway), which silently prevents
+        # ModelCheckpoint from saving.
+        # manual_backward also handles AMP scaling internally, so no need to
+        # call scaler.scale() manually here.
         task_grads = []
-        for i, loss in enumerate(losses_for_grad):
-            retain = i < self.num_tasks - 1
-            grads = torch.autograd.grad(
-                loss,
-                params,
-                retain_graph=retain,
-                create_graph=False,
-                allow_unused=True,
+        for i in range(self.num_tasks):
+            net_opt.zero_grad()
+            self.manual_backward(
+                weighted_task_losses[i], retain_graph=(i < self.num_tasks - 1)
             )
-            # Replace None (unused param) with zero tensor of matching shape
             grads = [
-                g.float() if g is not None else torch.zeros_like(p, dtype=torch.float32)
-                for g, p in zip(grads, params)
+                (
+                    p.grad.float().clone()
+                    if p.grad is not None
+                    else torch.zeros_like(p, dtype=torch.float32)
+                )
+                for p in params
             ]
             task_grads.append(grads)
 
@@ -111,17 +122,10 @@ class ParTauModule(L.LightningModule):
             merged = sum(pc_grads[i][k] for i in range(self.num_tasks))
             p.grad = merged.to(p.dtype)
 
-        # 4. Unscale → clip → step (handle AMP and non-AMP separately to avoid
-        #    Lightning's wrapper calling unscale_ a second time)
-        if scaler is not None:
-            raw_opt = net_opt.optimizer  # unwrap LightningOptimizer
-            scaler.unscale_(raw_opt)
-            torch.nn.utils.clip_grad_norm_(params, 1.0)
-            scaler.step(raw_opt)
-            scaler.update()
-        else:
-            torch.nn.utils.clip_grad_norm_(params, 1.0)
-            net_opt.step()
+        # 4. Clip → step.
+        # manual_backward() already handled AMP scaling/unscaling internally.
+        torch.nn.utils.clip_grad_norm_(params, 1.0)
+        net_opt.step()
 
         sch = self.lr_schedulers()
         if sch is not None:
@@ -169,11 +173,62 @@ class ParTauModule(L.LightningModule):
     def test_step(self, batch, _batch_idx):
         return self.forward(batch)[0]
 
+    def reinitialize_optimizer_for_phase2(self):
+        """Replace the optimizer with one that contains only regression_head params.
+
+        Simply calling requires_grad_(False) is not enough — AdamW keeps momentum
+        buffers for every parameter that was registered at construction time and
+        still updates them on each step() regardless of requires_grad.  Rebuilding
+        the optimizer with only the trainable params ensures frozen params are
+        truly frozen.
+        """
+        base_lr = self.cfg.training.lr
+        kin_lr = base_lr * self.cfg.training.kinematics_lr_multiplier
+        kin_params = list(self.ParTau.regression_head.parameters())
+        new_optimizer = torch.optim.AdamW(kin_params, lr=kin_lr, weight_decay=1e-2)
+        # Estimate remaining steps for a short cosine tail.
+        remaining = max(
+            1, self.trainer.estimated_stepping_batches - self.trainer.global_step
+        )
+
+        new_scheduler = torch.optim.lr_scheduler.OneCycleLR(
+            new_optimizer,
+            max_lr=kin_lr,
+            total_steps=remaining,
+            anneal_strategy="cos",
+        )
+        self.trainer.optimizers = [new_optimizer]
+        self.trainer.lr_scheduler_configs[0].scheduler = new_scheduler
+        print(
+            f"[Phase 2] Optimizer replaced. Trainable params: "
+            f"{sum(p.numel() for p in kin_params):,} (regression_head only)"
+        )
+
     def configure_optimizers(self):
-        # AdamW is generally preferred for transformer architectures
+        # AdamW is generally preferred for transformer architectures.
+        # Split into two param groups: the kinematics-exclusive parameters
+        # (regression_head + cls_token_kinematics) get a higher LR to help them
+        # catch up with the other heads.  The backbone LR is unchanged — the
+        # backbone gradient is the PCGrad-merged sum and is unaffected by
+        # per-head learning rates.
+        base_lr = self.cfg.training.lr
+        kin_lr = base_lr * self.cfg.training.kinematics_lr_multiplier
+
+        kin_param_ids = {
+            id(p)
+            for p in list(self.ParTau.regression_head.parameters())
+            + [self.ParTau.cls_token_kinematics]
+        }
+        kin_params = [p for p in self.ParTau.parameters() if id(p) in kin_param_ids]
+        other_params = [
+            p for p in self.ParTau.parameters() if id(p) not in kin_param_ids
+        ]
+
         net_optimizer = torch.optim.AdamW(
-            params=self.ParTau.parameters(),
-            lr=self.cfg.training.lr,
+            [
+                {"params": other_params, "lr": base_lr},
+                {"params": kin_params, "lr": kin_lr},
+            ]
         )
         # if self.cfg.training.optimizer.use_lookahead:
         #     optimizer = Lookahead(base_optimizer=optimizer, k=6, alpha=0.5)
@@ -196,10 +251,11 @@ class ParTauModule(L.LightningModule):
             T_max = estimated_steps
             print(f"Using calculated T_max={T_max} from estimated_stepping_batches")
 
-        lr_scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+        lr_scheduler = torch.optim.lr_scheduler.OneCycleLR(
             net_optimizer,
-            T_max=T_max,
-            eta_min=self.cfg.training.lr * 0.01,
+            max_lr=[base_lr, kin_lr],
+            total_steps=T_max,
+            anneal_strategy="cos",
         )
         return [net_optimizer], [{"scheduler": lr_scheduler, "interval": "step"}]
 
@@ -400,6 +456,7 @@ class ParTauModule(L.LightningModule):
         self.validation_outputs.append(output)
         for key, value in metrics.items():
             self.validation_loss_accumulator[key].append(value.detach())
+
         return metrics["loss"]
 
     def on_validation_epoch_start(self):
@@ -498,8 +555,6 @@ class ParTauModule(L.LightningModule):
             reco_jet_p4s = ak.Array(all_reco_jet_p4s)
             gen_jet_tau_p4s = ak.Array(all_gen_jet_tau_p4s)
 
-            # all_weights = ak.concatenate(all_weights, dim=0)
-
             # Log comprehensive metrics with full validation dataset
             current_epoch = self.current_epoch
             tb_logger = self.logger.experiment
@@ -514,7 +569,6 @@ class ParTauModule(L.LightningModule):
                 current_epoch=current_epoch,
                 dataset=dataset,
             )
-
             # Clear outputs to free memory
             dataset_outputs.clear()
 
