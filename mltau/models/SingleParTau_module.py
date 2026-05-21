@@ -30,10 +30,10 @@ class ParTauModule(L.LightningModule):
             use_pre_activation_pair=False,
             for_inference=False,
             use_amp=False,
-            metric="eta-phi",
+            metric="theta-phi",
         )
         if task == "is_tau":
-            self.loss_fn = SigmoidFocalLoss(alpha=0.75, gamma=2.0, reduction="none")
+            self.loss_fn = SigmoidFocalLoss(alpha=0.1, gamma=2.0, reduction="none")
         elif task == "charge":
             self.loss_fn = nn.CrossEntropyLoss(reduction="none")
         elif task == "decay_mode":
@@ -83,8 +83,7 @@ class ParTauModule(L.LightningModule):
 
     def configure_optimizers(self):
         optimizer = torch.optim.AdamW(
-            params=self.ParTau.parameters(),
-            lr=self.cfg.training.lr,
+            params=self.ParTau.parameters(), lr=self.cfg.training.lr, weight_decay=1e-2
         )
 
         # Check if estimated_stepping_batches is available and valid
@@ -104,10 +103,16 @@ class ParTauModule(L.LightningModule):
             T_max = estimated_steps
             print(f"Using calculated T_max={T_max} from estimated_stepping_batches")
 
-        lr_scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+        # lr_scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+        #     optimizer,
+        #     T_max=T_max,
+        #     eta_min=self.cfg.training.lr * 0.01,
+        # )
+        lr_scheduler = torch.optim.lr_scheduler.OneCycleLR(
             optimizer,
-            T_max=T_max,
-            eta_min=self.cfg.training.lr * 0.01,
+            max_lr=self.cfg.training.lr,
+            total_steps=T_max,
+            anneal_strategy="cos",
         )
         return [optimizer], [{"scheduler": lr_scheduler, "interval": "step"}]
 
