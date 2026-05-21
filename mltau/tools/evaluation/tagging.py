@@ -230,6 +230,7 @@ class ROCPlot:
         self.ax.legend(prop={"size": 30})
 
     def save(self, output_path):
+        self.fig.tight_layout(pad=1.5)
         self.fig.savefig(output_path, format="pdf")
         plt.close("all")
 
@@ -280,6 +281,7 @@ class FakeRatePlot:
         return fig, ax
 
     def save(self, output_path):
+        self.fig.tight_layout(pad=1.5)
         self.fig.savefig(output_path, format="pdf")
         plt.close("all")
 
@@ -331,6 +333,7 @@ class EfficiencyPlot:
         return fig, ax
 
     def save(self, output_path):
+        self.fig.tight_layout(pad=1.5)
         self.fig.savefig(output_path, format="pdf")
         plt.close("all")
 

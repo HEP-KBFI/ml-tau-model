@@ -12,32 +12,46 @@ def reinitialize_p4(p4_obj: ak.Array):
 
     Returns:
         p4 : ak.Array
-            Particle with initialized 4-momenta.
+            Particle with initialized 4-momenta, normalized to (rho, eta, phi, t).
     """
-    # Initialize from all the p4 fields
+    # Normalise field names (aliases → canonical).
     name_map = {
+        "rho": "pt",
         "x": "px",
         "y": "py",
         "z": "pz",
-        "tau": "mass",
         "t": "energy",
-        "rho": "pt",
+        "e": "energy",
+        "tau": "mass",
+        "m": "mass",
     }
-    p4 = vector.awk(
-        ak.zip({name_map.get(field, field): p4_obj[field] for field in p4_obj.fields})
-    )
-    # Now make it so that the 4-vector is always saved in a similar fashion:
-    p4 = vector.awk(
-        ak.zip(
-            {
-                "pt": p4.pt,
-                "eta": p4.eta,
-                "phi": p4.phi,
-                "energy": p4.t,
-            }
+    renamed = {name_map.get(f, f): p4_obj[f] for f in p4_obj.fields}
+
+    # Pick the first complete non-redundant basis present in the data.
+    # Mixing cylindrical (pt) and Cartesian (px/py) triggers vector's
+    # "duplicate coordinates through momentum-aliases" error.
+    for basis in (
+        ("pt", "eta", "phi", "energy"),
+        ("pt", "eta", "phi", "mass"),
+        ("pt", "theta", "phi", "energy"),
+        ("pt", "theta", "phi", "mass"),
+        ("px", "py", "pz", "energy"),
+        ("px", "py", "pz", "mass"),
+    ):
+        if all(k in renamed for k in basis):
+            coords = {k: renamed[k] for k in basis}
+            break
+    else:
+        raise ValueError(
+            f"No supported 4-vector basis found in fields: {list(renamed)}"
         )
+
+    p4 = vector.awk(ak.zip(coords))
+    # Always return in (pt, eta, phi, energy) so downstream code can rely on
+    # these being stored fields, not just computed properties.
+    return vector.awk(
+        ak.zip({"pt": p4.pt, "eta": p4.eta, "phi": p4.phi, "energy": p4.energy})
     )
-    return p4
 
 
 def get_reduced_decaymodes(decaymodes: np.array):

@@ -158,3 +158,41 @@ class BatchInputs:
     gen_jet_tau_p4s: ak.Array
     reco_jet_p4s: ak.Array
     gen_jet_p4s: ak.Array
+
+
+def load_all_data(
+    input_loc: list, nfiles: int = None, columns: list = None, n_files: int = None
+):
+    input_files = get_all_paths(input_loc=input_loc, n_files=n_files)
+    input_data = []
+    # for file_path in tqdm.tqdm(sorted(input_files)):
+    for i, file_path in enumerate(sorted(input_files)):
+        print(f"[{i+1}/{len(input_files)}] Loading from {file_path}")
+        try:
+            input_data.append(load_parquet(file_path, columns=columns))
+        except ValueError:
+            print(f"{file_path} does not exist")
+    if len(input_data) > 0:
+        data = ak.concatenate(input_data)
+        print("Input data loaded")
+        return data
+    else:
+        raise ValueError("No data loaded")
+
+
+def load_parquet(input_path: str, columns: list = None) -> ak.Array:
+    """Loads the contents of the .parquet file specified by the input_path
+
+    Args:
+        input_path : str
+            The path to the .parquet file to be loaded.
+        columns : list
+            Names of the columns/branches to be loaded from the .parquet file
+
+    Returns:
+        input_data : ak.Array
+            The data from the .parquet file
+    """
+    ret = ak.from_parquet(input_path, columns=columns)
+    ret = ak.Array({k: ret[k] for k in ret.fields})
+    return ret
