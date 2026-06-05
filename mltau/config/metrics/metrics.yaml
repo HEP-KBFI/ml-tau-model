@@ -12,7 +12,7 @@ ALGORITHM_PLOT_STYLES:
         name: RecoJet
         marker: "^"
         hatch: "."
-        color: "tab:blue"
+        color: "#61c6bf" #"tab:blue"
         light_color: "#8ecae6"
         ls: "solid"
         label: RecoJet
@@ -22,7 +22,7 @@ ALGORITHM_PLOT_STYLES:
         name: SingleParTau
         marker: "v"
         hatch: "."
-        color: "red"
+        color: "#fd084a" #"red"
         light_color: "#f4a3a3"
         ls: "solid"
         label: SingleParTau
@@ -32,17 +32,17 @@ ALGORITHM_PLOT_STYLES:
         name: MultiParTau
         marker: "s"
         hatch: "."
-        color: "green"
-        light_color: "#8fd694"
+        color: "#494fc1" #"green"
+        light_color: "#a8abe1"
         ls: "solid"
         label: MultiParTau
         lw: 3
         marker_size: 15
     QKappa:
         name: QKappa
-        marker: "s"
+        marker: "^"
         hatch: "."
-        color: "tab:blue"
+        color: "#61c6bf" #"tab:blue"
         light_color: "#8ecae6"
         ls: "dashed"
         label: QKappa
