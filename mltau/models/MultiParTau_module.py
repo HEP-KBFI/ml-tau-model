@@ -8,7 +8,7 @@ from mltau.tools import general as g
 
 # from mltau.tools.optimizers.lookahead import Lookahead
 from mltau.tools.io.general import BatchInputs
-from mltau.tools.losses import SigmoidFocalLoss
+
 from mltau.tools.logging import logger
 from mltau.models.MultiParTau import ParTau
 
@@ -34,9 +34,9 @@ class ParTauModule(L.LightningModule):
 
         # Initialize loss functions once to avoid memory allocation overhead
         self.charge_loss = nn.BCEWithLogitsLoss(reduction="none")
-        self.tagging_loss = SigmoidFocalLoss(
-            alpha=0.1, gamma=2.0, reduction="none"
-        )  # class imbalance
+        self.tagging_loss = nn.CrossEntropyLoss(
+            reduction="none", label_smoothing=0.1
+        )  # background=0, signal=1; label_smoothing reduces overconfidence oscillations
         self.decay_mode_loss = nn.CrossEntropyLoss(reduction="none")
         self.kinematics_loss = nn.HuberLoss(reduction="none", delta=1.0)
 
@@ -106,9 +106,15 @@ class ParTauModule(L.LightningModule):
             ]
             task_grads.append(grads)
 
-        # 2. Project conflicting gradients
+        # 2. Project conflicting gradients (asymmetric: kinematics gradient is never
+        # projected away from other tasks so its direction in the shared backbone is
+        # always fully preserved.  Classification tasks are still projected away from
+        # kinematics when they conflict, which further protects the kin gradient).
+        KIN_IDX = self.num_tasks - 1  # kinematics is the last task
         pc_grads = [list(g) for g in task_grads]  # mutable copy
         for i in range(self.num_tasks):
+            if i == KIN_IDX:  # never reduce the kinematics gradient
+                continue
             for j in range(self.num_tasks):
                 if i == j:
                     continue
@@ -174,34 +180,60 @@ class ParTauModule(L.LightningModule):
         return self.forward(batch)[0]
 
     def reinitialize_optimizer_for_phase2(self):
-        """Replace the optimizer with one that contains only regression_head params.
+        """Freeze the shared backbone; fine-tune kinematics params + DM head.
 
-        Simply calling requires_grad_(False) is not enough — AdamW keeps momentum
-        buffers for every parameter that was registered at construction time and
-        still updates them on each step() regardless of requires_grad.  Rebuilding
-        the optimizer with only the trainable params ensures frozen params are
-        truly frozen.
+        The DM head must remain trainable because it uses x_kinematics as input
+        (via torch.cat([x_shared, x_kinematics.detach()])).  As kinematics
+        continues to train, x_kinematics drifts from its phase-1 representation;
+        if DM is frozen it silently degrades.  The .detach() ensures DM gradients
+        still cannot flow back into the kinematics pathway, so kinematics training
+        is unaffected by keeping DM unfrozen.
+
+        Both steps are required:
+          1. requires_grad_(False) on frozen params so PCGrad's `params` list
+             excludes them (no spurious zero gradients written into them).
+          2. Rebuild the AdamW optimizer with only the unfrozen params so that
+             momentum buffers are not accumulated for frozen weights.
         """
+        # 1. Freeze everything, then selectively unfreeze.
+        self.ParTau.requires_grad_(False)
+        kin_params = (
+            list(self.ParTau.regression_head.parameters())
+            + list(self.ParTau.cls_blocks_kinematics.parameters())
+            + list(self.ParTau.norm_kinematics.parameters())
+            + [self.ParTau.cls_token_kinematics]
+        )
+        # DM head must adapt as kinematics representation changes.
+        dm_params = list(self.ParTau.classification_head.parameters())
+        for p in kin_params + dm_params:
+            p.requires_grad_(True)
+
         base_lr = self.cfg.training.lr
         kin_lr = base_lr * self.cfg.training.kinematics_lr_multiplier
-        kin_params = list(self.ParTau.regression_head.parameters())
-        new_optimizer = torch.optim.AdamW(kin_params, lr=kin_lr, weight_decay=1e-2)
+        new_optimizer = torch.optim.AdamW(
+            [
+                {"params": kin_params, "lr": kin_lr},
+                {"params": dm_params, "lr": base_lr},
+            ],
+            weight_decay=1e-2,
+        )
         # Estimate remaining steps for a short cosine tail.
         remaining = max(
             1, self.trainer.estimated_stepping_batches - self.trainer.global_step
         )
-
         new_scheduler = torch.optim.lr_scheduler.OneCycleLR(
             new_optimizer,
-            max_lr=kin_lr,
+            max_lr=[kin_lr, base_lr],
             total_steps=remaining,
             anneal_strategy="cos",
         )
         self.trainer.optimizers = [new_optimizer]
         self.trainer.lr_scheduler_configs[0].scheduler = new_scheduler
+        n_kin = sum(p.numel() for p in kin_params)
+        n_dm = sum(p.numel() for p in dm_params)
         print(
-            f"[Phase 2] Optimizer replaced. Trainable params: "
-            f"{sum(p.numel() for p in kin_params):,} (regression_head only)"
+            f"[Phase 2 @ epoch {self.current_epoch}] Backbone frozen. "
+            f"Trainable: {n_kin:,} kin params + {n_dm:,} DM head params"
         )
 
     def configure_optimizers(self):
@@ -217,6 +249,8 @@ class ParTauModule(L.LightningModule):
         kin_param_ids = {
             id(p)
             for p in list(self.ParTau.regression_head.parameters())
+            + list(self.ParTau.cls_blocks_kinematics.parameters())
+            + list(self.ParTau.norm_kinematics.parameters())
             + [self.ParTau.cls_token_kinematics]
         }
         kin_params = [p for p in self.ParTau.parameters() if id(p) in kin_param_ids]
@@ -272,7 +306,9 @@ class ParTauModule(L.LightningModule):
                 logits_tensor = logits
 
             # Apply appropriate activation
-            if key in ["is_tau", "charge"]:  # Binary classification heads
+            if key == "is_tau":  # Two-class head; return signal probability (class 1)
+                pred_tensor = torch.softmax(logits_tensor, dim=-1)[:, 1]
+            elif key == "charge":  # Binary classification head
                 pred_tensor = torch.sigmoid(logits_tensor)
             elif key == "decay_mode":  # Multiclass classification
                 pred_tensor = torch.softmax(logits_tensor, dim=-1)
@@ -303,7 +339,7 @@ class ParTauModule(L.LightningModule):
         return self.charge_loss(predictions, targets)
 
     def tagging_loss_fn(self, predictions, targets):
-        return self.tagging_loss(predictions, targets)
+        return self.tagging_loss(predictions, targets.long())
 
     def decay_mode_loss_fn(self, predictions, targets):
         return self.decay_mode_loss(predictions, targets)
@@ -584,6 +620,11 @@ class ParTauModule(L.LightningModule):
         self._log_at_epoch_end(dataset="val")
 
     def on_train_epoch_start(self):
+        # Automatically trigger phase-2 kinematics fine-tuning when configured.
+        phase2_epoch = getattr(self.cfg.training, "phase2_start_epoch", None)
+        if phase2_epoch is not None and self.current_epoch == phase2_epoch:
+            self.reinitialize_optimizer_for_phase2()
+
         self.training_loss_accumulator = {
             key: []
             for key in [

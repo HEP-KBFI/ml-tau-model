@@ -7,7 +7,7 @@ from omegaconf import DictConfig
 
 from mltau.tools.io.general import BatchInputs
 from mltau.tools import general as g
-from mltau.tools.losses import FocalLoss, SigmoidFocalLoss
+from mltau.tools.losses import FocalLoss
 from mltau.tools.logging import tagging, kinematics, decay_mode, charge_id
 from mltau.models.SingleParTau import ParTau
 
@@ -33,7 +33,7 @@ class ParTauModule(L.LightningModule):
             metric="theta-phi",
         )
         if task == "is_tau":
-            self.loss_fn = SigmoidFocalLoss(alpha=0.1, gamma=2.0, reduction="none")
+            self.loss_fn = nn.CrossEntropyLoss(reduction="none", label_smoothing=0.1)
         elif task == "charge":
             self.loss_fn = nn.CrossEntropyLoss(reduction="none")
         elif task == "decay_mode":
@@ -139,7 +139,7 @@ class ParTauModule(L.LightningModule):
         elif self.task == "is_tau":
             tau_logits = model_output[0]
             predictions = {
-                self.task: torch.sigmoid(tau_logits),
+                self.task: torch.softmax(tau_logits, dim=-1)[:, 1],
                 "is_tau_logits": tau_logits,
             }
         else:
@@ -179,7 +179,9 @@ class ParTauModule(L.LightningModule):
             }
             return metrics
         elif self.task == "is_tau":
-            loss = (self.loss_fn(predictions["is_tau_logits"], target) * weights).mean()
+            loss = (
+                self.loss_fn(predictions["is_tau_logits"], target.long()) * weights
+            ).mean()
         elif self.task == "charge":
             loss = self.loss_fn(
                 predictions["charge_logits"], targets["charge"].long()

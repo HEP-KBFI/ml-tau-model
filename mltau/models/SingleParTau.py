@@ -86,8 +86,8 @@ class ParTau(ParticleTransformer):
                 nn.Linear(hidden_dim, 5),
             )
         elif self.task == "is_tau":
-            # Binary head for tau-tagging
-            self.binary_head = nn.Linear(embed_dim, 1)
+            # Two-class head for tau-tagging (background = class 0, signal = class 1)
+            self.binary_head = nn.Linear(embed_dim, 2)
         elif self.task == "charge":
             # Two-logit head to match the en-reg charge-classification setup
             self.binary_head = nn.Linear(embed_dim, 2)
@@ -150,8 +150,8 @@ class ParTau(ParticleTransformer):
                 # Regression output: [log(pt_gen/pt_reco), delta_eta, delta_sin(phi), delta_cos(phi), log(m_gen/m_reco)]
                 output = (self.regression_head(x_cls),)  # (N, 5)
             elif self.task == "is_tau":
-                # Return logits; sigmoid is applied outside for logging and evaluation.
-                output = (self.binary_head(x_cls).squeeze(-1),)  # (N,)
+                # Return 2-class logits; signal is class 1.
+                output = (self.binary_head(x_cls),)  # (N, 2)
             elif self.task == "charge":
                 # Two-class logits for charge classification
                 output = (self.binary_head(x_cls),)  # (N, 2)

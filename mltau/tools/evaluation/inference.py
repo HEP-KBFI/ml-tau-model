@@ -3,7 +3,7 @@ Inference postprocessor: translates raw ParTau model predictions into physical q
 and packages them as an awkward array.
 
 Model output dict:
-  predictions["is_tau"]      shape (N,)    sigmoid score ∈ [0, 1]
+  predictions["is_tau"]      shape (N,)    softmax signal probability ∈ [0, 1] (class 1 of 2-class CE head)
   predictions["charge"]      shape (N,)    sigmoid score ∈ [0, 1]  (1 = positive charge)
   predictions["decay_mode"]  shape (N, 6)  softmax probabilities over DM classes [0,1,2,10,11,15]
   predictions["kinematics"]  shape (N, 5)  raw regression:
@@ -116,7 +116,12 @@ def postprocess_multi_predictions(
             pred_p4 (vector p4 with pt, eta, phi, energy)
     """
     # --- pass-through scores ---
-    tagging_score = to_np(predictions["is_tau"])  # (N,)
+    is_tau_raw = to_np(predictions["is_tau"])
+    if is_tau_raw.ndim == 2:  # raw (N, 2) logits — take softmax signal probability
+        e = np.exp(is_tau_raw - is_tau_raw.max(axis=1, keepdims=True))
+        tagging_score = (e / e.sum(axis=1, keepdims=True))[:, 1]
+    else:
+        tagging_score = is_tau_raw  # already (N,) probability
     charge_score = to_np(predictions["charge"])  # (N,)
     dm_class, dm_probs = decode_decay_mode_predictions(predictions["decay_mode"])
     pred_p4 = decode_kinematic_predictions(predictions["kinematics"], reco_jet_p4s)
@@ -146,7 +151,12 @@ def postprocess_single_predictions(predictions, reco_jet_p4s, task):
             }
         )
     elif task == "is_tau":
-        tagging_score = to_np(predictions[task])  # (N,)
+        is_tau_raw = to_np(predictions[task])
+        if is_tau_raw.ndim == 2:  # raw (N, 2) logits
+            e = np.exp(is_tau_raw - is_tau_raw.max(axis=1, keepdims=True))
+            tagging_score = (e / e.sum(axis=1, keepdims=True))[:, 1]
+        else:
+            tagging_score = is_tau_raw  # already (N,) probability
         ret = ak.Array({"tau_tagging_score": tagging_score})
     elif task == "charge":
         charge_score = to_np(predictions[task])  # (N,)

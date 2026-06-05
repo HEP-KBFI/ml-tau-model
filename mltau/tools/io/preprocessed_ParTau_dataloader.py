@@ -112,39 +112,60 @@ def _load_and_split(pt_paths: list[str], train_frac: float) -> tuple:
 
     return _slice(0, n_train), _slice(n_train, N)
 
+
 #
 ### Add helper functions for input feature scaling
 #
 
 # Metadata for recording the input features order in the .npz file
-_CAND_FEATURE_NAMES = np.array([
-    "cand_deta", "cand_dphi", "cand_logpt", "cand_loge",
-    "cand_logptrel", "cand_logerel", "cand_deltaR", "cand_charge",
-    "isElectron", "isMuon", "isPhoton", "isChargedHadron",
-    "isNeutralHadron", "cand_dz", "cand_dz_error", "cand_dxy",
-    "cand_dxy_error",
-])
+_CAND_FEATURE_NAMES = np.array(
+    [
+        "cand_deta",
+        "cand_dphi",
+        "cand_logpt",
+        "cand_loge",
+        "cand_logptrel",
+        "cand_logerel",
+        "cand_deltaR",
+        "cand_charge",
+        "isElectron",
+        "isMuon",
+        "isPhoton",
+        "isChargedHadron",
+        "isNeutralHadron",
+        "cand_dz",
+        "cand_dz_error",
+        "cand_dxy",
+        "cand_dxy_error",
+    ]
+)
+
 
 def _input_scaling_enabled(cfg: DictConfig) -> bool:
-    """ Checks whether training.input_scaling.enabled exists and is true. (False by default so that old configs still run normally). """
+    """Checks whether training.input_scaling.enabled exists and is true. (False by default so that old configs still run normally)."""
     scaling_cfg = OmegaConf.select(cfg, "training.input_scaling")
     return scaling_cfg is not None and bool(scaling_cfg.enabled)
 
 
 def _scaler_path(cfg: DictConfig) -> str:
-    """ Turns the configured path into an absolute path. This is where the scaler gets saved and later loaded. """
-    return os.path.abspath(os.path.expanduser(str(cfg.training.input_scaling.scaler_path)))
+    """Turns the configured path into an absolute path. This is where the scaler gets saved and later loaded."""
+    return os.path.abspath(
+        os.path.expanduser(str(cfg.training.input_scaling.scaler_path))
+    )
 
 
 def _feature_indices(cfg: DictConfig) -> list[int]:
-    """ Reads the list of continuous feature indices from config. This lets us scale only the features we list in the config. """
+    """Reads the list of continuous feature indices from config. This lets us scale only the features we list in the config."""
     return [int(i) for i in cfg.training.input_scaling.continuous_feature_indices]
 
-def _fit_feature_scaler(cand_features, mask, feature_indices, eps=1e-6, chunk_size=200_000):
-    """ Computes mean and std from the actual training slice only. It uses valid = mask.squeeze(1).bool() so that padded candidates are ignored. 
-    It loops in chunks to avoid making a huge flattened copy of all candidates at once. 
+
+def _fit_feature_scaler(
+    cand_features, mask, feature_indices, eps=1e-6, chunk_size=200_000
+):
+    """Computes mean and std from the actual training slice only. It uses valid = mask.squeeze(1).bool() so that padded candidates are ignored.
+    It loops in chunks to avoid making a huge flattened copy of all candidates at once.
     mean = sum / count
-    std = sqrt(sum_x2 / count - mean^2) 
+    std = sqrt(sum_x2 / count - mean^2)
     """
     idx = torch.as_tensor(feature_indices, dtype=torch.long)
     valid = mask.squeeze(1).bool()
@@ -174,9 +195,9 @@ def _fit_feature_scaler(cand_features, mask, feature_indices, eps=1e-6, chunk_si
 
 
 def _apply_feature_scaler(tensors, mean, std, feature_indices):
-    """ Applies x = (x - mean) / std only to selected cand_features channels.
-        It leaves cand_kinematics, targets, weights, and p4 dictionaries untouched.
-        cf.mul_(msk.to(dtype=cf.dtype)) resets padded candidates back to exactly zero after scaling.
+    """Applies x = (x - mean) / std only to selected cand_features channels.
+    It leaves cand_kinematics, targets, weights, and p4 dictionaries untouched.
+    cf.mul_(msk.to(dtype=cf.dtype)) resets padded candidates back to exactly zero after scaling.
     """
     cf, ck, tgt, msk, wt, gt, rc, gj = tensors
     idx = torch.as_tensor(feature_indices, dtype=torch.long)
@@ -191,11 +212,11 @@ def _apply_feature_scaler(tensors, mean, std, feature_indices):
 
 
 def fit_and_apply_input_scaling(train_tensors, val_tensors, cfg: DictConfig):
-    """ This is the training-time entry point:
-        1. If scaling is disabled, return tensors unchanged.
-        2. Fit scaler on train_tensors only.
-        3. Save mean, std, feature_indices, and feature_names to .npz.
-        4. Apply the same scaler to both train and val.
+    """This is the training-time entry point:
+    1. If scaling is disabled, return tensors unchanged.
+    2. Fit scaler on train_tensors only.
+    3. Save mean, std, feature_indices, and feature_names to .npz.
+    4. Apply the same scaler to both train and val.
     """
     if not _input_scaling_enabled(cfg):
         return train_tensors, val_tensors
@@ -221,17 +242,19 @@ def fit_and_apply_input_scaling(train_tensors, val_tensors, cfg: DictConfig):
 
 
 def apply_saved_input_scaling_from_cfg(tensors, cfg: DictConfig):
-    """ This is the test/inference-time entry point:
-        1. If scaling is disabled, return tensors unchanged.
-        2. Load the saved .npz.
-        3. Apply the same train-derived scaler to test/prediction tensors.
+    """This is the test/inference-time entry point:
+    1. If scaling is disabled, return tensors unchanged.
+    2. Load the saved .npz.
+    3. Apply the same train-derived scaler to test/prediction tensors.
     """
     if not _input_scaling_enabled(cfg):
         return tensors
 
     path = _scaler_path(cfg)
     if not os.path.exists(path):
-        raise RuntimeError(f"Input scaling is enabled, but scaler was not found: {path}")
+        raise RuntimeError(
+            f"Input scaling is enabled, but scaler was not found: {path}"
+        )
 
     scaler = np.load(path)
     mean = scaler["mean"]
@@ -265,8 +288,12 @@ class ParTDataModule(LightningDataModule):
         )
         return paths
 
-    def _make_loader(self, tensors: tuple, batch_size: int) -> DataLoader:
-        dataset = ParticleTransformerDataset(tensors=tensors, batch_size=batch_size)
+    def _make_loader(
+        self, tensors: tuple, batch_size: int, shuffle: bool = True
+    ) -> DataLoader:
+        dataset = ParticleTransformerDataset(
+            tensors=tensors, batch_size=batch_size, shuffle=shuffle
+        )
         num_workers = (
             0 if self.debug_run else self.cfg.training.dataloader.num_dataloader_workers
         )
@@ -305,8 +332,10 @@ class ParTDataModule(LightningDataModule):
 
             print("\n[DEBUG] VAL scaled stats:")
             print("mean:", cf_val.mean().item(), "std:", cf_val.std().item())
-            self.train_loader = self._make_loader(train_tensors, batch_size)
-            self.val_loader = self._make_loader(val_tensors, batch_size)
+            self.train_loader = self._make_loader(
+                train_tensors, batch_size, shuffle=True
+            )
+            self.val_loader = self._make_loader(val_tensors, batch_size, shuffle=False)
         elif stage == "test" or stage == "predict":
             test_paths = self._get_pt_paths("test")
             # For test, use all data (no split needed)
@@ -316,7 +345,9 @@ class ParTDataModule(LightningDataModule):
             cf_test = test_tensors[0]
             print("\n[DEBUG] TEST scaled stats:")
             print("mean:", cf_test.mean().item(), "std:", cf_test.std().item())
-            self.test_loader = self._make_loader(test_tensors, batch_size)
+            self.test_loader = self._make_loader(
+                test_tensors, batch_size, shuffle=False
+            )
         else:
             raise ValueError(f"Unexpected stage: {stage}")
 

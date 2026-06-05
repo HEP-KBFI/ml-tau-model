@@ -1,4 +1,5 @@
 import contextlib
+import copy
 import torch
 import torch.nn as nn
 from mltau.models.ParticleTransformer import ParticleTransformer, trunc_normal_
@@ -83,6 +84,13 @@ class ParTau(ParticleTransformer):
         trunc_normal_(self.cls_token_shared, std=0.02)
         trunc_normal_(self.cls_token_kinematics, std=0.02)
 
+        # Dedicated cls_blocks and norm for the kinematics pathway.  Copied from
+        # the inherited (shared) cls_blocks so the architecture is identical, but
+        # weights are independent so classification gradients cannot corrupt the
+        # kinematics attention layers.
+        self.cls_blocks_kinematics = copy.deepcopy(self.cls_blocks)
+        self.norm_kinematics = copy.deepcopy(self.norm)
+
         # Classification head for decay mode classification.
         # Takes the DM CLS embedding concatenated with the (detached) kinematics
         # CLS embedding so the DM head can exploit kinematic context without
@@ -109,9 +117,10 @@ class ParTau(ParticleTransformer):
         )
         # Tagging is the second hardest task so use half the dropout rate to
         # avoid over-regularizing it relative to charge.
+        # Two-class head: background = class 0, signal = class 1.
         self.tau_id_head = nn.Sequential(
             nn.Dropout(head_dropout / 2),
-            nn.Linear(embed_dim, 1),
+            nn.Linear(embed_dim, 2),
         )
         self.tau_charge_head = nn.Sequential(
             nn.Dropout(head_dropout),
@@ -143,13 +152,19 @@ class ParTau(ParticleTransformer):
             cand_features_embed = self.embed(cand_features).masked_fill(
                 ~cand_mask.permute(2, 0, 1), 0
             )  # (P, N, C)
+            # Keep a snapshot of the raw embedding before the shared backbone
+            # transforms it.  The kinematics cls_blocks will attend to this instead
+            # of the backbone output, so the regression pathway is never exposed to
+            # the classification-biased representation learned by self.blocks.
+            cand_features_embed_raw = cand_features_embed  # same storage, no copy
+
             attn_mask = None
             if cand_kinematics_pxpypze is not None and self.pair_embed is not None:
                 attn_mask = self.pair_embed(cand_kinematics_pxpypze).view(
                     -1, num_particles, num_particles
                 )  # (N*num_heads, P, P)
 
-            # transform particles
+            # transform particles (shared backbone — classification pathway only)
             for block in self.blocks:
                 cand_features_embed = block(
                     cand_features_embed,
@@ -159,33 +174,35 @@ class ParTau(ParticleTransformer):
                 )
 
             # transform per-jet class tokens
-            # The cls_blocks are designed for a single CLS token per sample.
-            # To give each task its own private CLS token, we tile the particle
-            # features 4x along the batch dimension so each task slot runs as an
-            # independent sample through the cls_blocks in one efficient pass.
             N = cand_features_embed.size(1)
-            # Tile particle features 2x along batch dim so both tokens run in one pass.
-            feat_2x = cand_features_embed.repeat(1, 2, 1)  # (P, 2N, C)
-            mask_2x = padding_mask.repeat(2, 1)  # (2N, P)
-            cls_tokens = torch.cat(
-                [
-                    self.cls_token_shared.expand(1, N, -1),
-                    self.cls_token_kinematics.expand(1, N, -1),
-                ],
-                dim=1,
-            )  # (1, 2N, C)
+
+            # Shared pathway: tagging, charge, DM — attends to backbone output
+            x_cls_shared = self.cls_token_shared.expand(1, N, -1)  # (1, N, C)
             for block in self.cls_blocks:
-                cls_tokens = block(feat_2x, x_cls=cls_tokens, padding_mask=mask_2x)
-            cls_tokens = self.norm(cls_tokens.squeeze(0))  # (2N, C)
-            x_shared = cls_tokens[:N]  # (N, C) — tagging, charge, DM
-            x_kinematics = cls_tokens[N:]  # (N, C) — kinematics regression
+                x_cls_shared = block(
+                    cand_features_embed, x_cls=x_cls_shared, padding_mask=padding_mask
+                )
+            x_shared = self.norm(x_cls_shared.squeeze(0))  # (N, C)
+
+            # Kinematics pathway: attends to the PRE-backbone raw embedding so it
+            # is never exposed to the classification-biased backbone representation.
+            # The pair_embed attention bias (geometry) is passed through unchanged
+            # so the kinematics blocks still see relative angles/distances.
+            x_cls_kin = self.cls_token_kinematics.expand(1, N, -1)  # (1, N, C)
+            for block in self.cls_blocks_kinematics:
+                x_cls_kin = block(
+                    cand_features_embed_raw, x_cls=x_cls_kin, padding_mask=padding_mask
+                )
+            x_kinematics = self.norm_kinematics(x_cls_kin.squeeze(0))  # (N, C)
 
             # As fc_params is an empty list, then basically we have been using one Linear layer only.
             # Now introduce the different heads also here.
             # Output raw logits - activations will be applied by loss functions or during inference
 
             output = {
-                "is_tau": self.tau_id_head(x_shared).squeeze(-1),  # (N,) - raw logits
+                "is_tau": self.tau_id_head(
+                    x_shared
+                ),  # (N, 2) - raw logits (background=0, signal=1)
                 "charge": self.tau_charge_head(x_shared).squeeze(
                     -1
                 ),  # (N,) - raw logits
