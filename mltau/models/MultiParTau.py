@@ -1,4 +1,5 @@
 import contextlib
+import copy
 import torch
 import torch.nn as nn
 from mltau.models.ParticleTransformer import ParticleTransformer, trunc_normal_
@@ -27,6 +28,10 @@ class ParTau(ParticleTransformer):
         },
         fc_params: list = [],
         activation: str = "gelu",
+        # Dropout applied to shared-token heads (tagging, charge, DM) to counter
+        # overtraining.  Kinematics head is intentionally left unregularized since
+        # it is already the slowest learner.
+        head_dropout: float = 0.1,
         # misc
         trim: bool = True,
         for_inference: bool = False,
@@ -71,39 +76,60 @@ class ParTau(ParticleTransformer):
         # Each token attends to the particle cloud independently through cls_blocks,
         # giving each head the same private representational capacity as a single-head model.
         del self.cls_token
-        self.cls_token_tagging = nn.Parameter(torch.zeros(1, 1, embed_dim))
-        self.cls_token_charge = nn.Parameter(torch.zeros(1, 1, embed_dim))
-        self.cls_token_decay_mode = nn.Parameter(torch.zeros(1, 1, embed_dim))
+        # Two CLS tokens: one shared by tagging/charge/DM, one dedicated to kinematics.
+        # This costs 2x (not 4x) in cls_blocks while still letting the DM head
+        # read kinematic context (e.g. invariant mass) via the kinematics token.
+        self.cls_token_shared = nn.Parameter(torch.zeros(1, 1, embed_dim))
         self.cls_token_kinematics = nn.Parameter(torch.zeros(1, 1, embed_dim))
-        trunc_normal_(self.cls_token_tagging, std=0.02)
-        trunc_normal_(self.cls_token_charge, std=0.02)
-        trunc_normal_(self.cls_token_decay_mode, std=0.02)
+        trunc_normal_(self.cls_token_shared, std=0.02)
         trunc_normal_(self.cls_token_kinematics, std=0.02)
 
+        # Dedicated cls_blocks and norm for the kinematics pathway.  Copied from
+        # the inherited (shared) cls_blocks so the architecture is identical, but
+        # weights are independent so classification gradients cannot corrupt the
+        # kinematics attention layers.
+        self.cls_blocks_kinematics = copy.deepcopy(self.cls_blocks)
+        self.norm_kinematics = copy.deepcopy(self.norm)
+
         # Classification head for decay mode classification.
-        # Takes the DM CLS embedding concatenated with the kinematics CLS embedding
-        # so the DM head can learn its own projection of what is kinematically
-        # relevant (particle multiplicity, track topology, etc.) — richer than
-        # the 5-dim logit bottleneck.
-        self.classification_head = nn.Linear(embed_dim + embed_dim, num_dm_classes)
-        # Logits version (smaller, inductive bias toward visible mass):
-        # self.classification_head = nn.Linear(embed_dim + 5, num_dm_classes)
-        # Regression head kinematic reconstruction [pT_vis, theta, phi, m_vis]
-        self.regression_head = nn.Linear(
-            embed_dim, 5
-        )  # [log_pt, deta, delta_sin(phi), delta_cos(phi), log_m]
-        # Binary heads for tau-tagging and charge reco
-        self.tau_id_head = nn.Linear(embed_dim, 1)
-        self.tau_charge_head = nn.Linear(embed_dim, 1)
+        # Takes the DM CLS embedding concatenated with the (detached) kinematics
+        # CLS embedding so the DM head can exploit kinematic context without
+        # sending classification gradients back into the kinematics CLS token.
+        # 512 → 128 → 6: the compression layer helps separate the 6 DM classes
+        # whose boundaries are non-trivial (e.g. DM 1 vs 2 differ by one π⁰).
+        # Charge and tagging are left as single linear heads — they are simple
+        # binary decisions well-represented in a 256-dim embedding and deeper
+        # heads would only add overfit risk.
+        dm_hidden = embed_dim // 2
+        self.classification_head = nn.Sequential(
+            nn.Dropout(head_dropout),
+            nn.Linear(embed_dim + embed_dim, dm_hidden),
+            nn.GELU(),
+            nn.Linear(dm_hidden, num_dm_classes),
+        )
+        # Regression head: no dropout — kinematics is the hardest task and
+        # the slowest learner, so we do not regularize it.
+        hidden_dim = embed_dim // 2
+        self.regression_head = nn.Sequential(
+            nn.Linear(embed_dim, hidden_dim),
+            nn.GELU(),
+            nn.Linear(hidden_dim, 5),
+        )
+        # Tagging is the second hardest task so use half the dropout rate to
+        # avoid over-regularizing it relative to charge.
+        # Two-class head: background = class 0, signal = class 1.
+        self.tau_id_head = nn.Sequential(
+            nn.Dropout(head_dropout / 2),
+            nn.Linear(embed_dim, 2),
+        )
+        self.tau_charge_head = nn.Sequential(
+            nn.Dropout(head_dropout),
+            nn.Linear(embed_dim, 1),
+        )
 
     @torch.jit.ignore
     def no_weight_decay(self):
-        return {
-            "cls_token_tagging",
-            "cls_token_charge",
-            "cls_token_decay_mode",
-            "cls_token_kinematics",
-        }
+        return {"cls_token_shared", "cls_token_kinematics"}
 
     def forward(
         self,
@@ -126,13 +152,19 @@ class ParTau(ParticleTransformer):
             cand_features_embed = self.embed(cand_features).masked_fill(
                 ~cand_mask.permute(2, 0, 1), 0
             )  # (P, N, C)
+            # Keep a snapshot of the raw embedding before the shared backbone
+            # transforms it.  The kinematics cls_blocks will attend to this instead
+            # of the backbone output, so the regression pathway is never exposed to
+            # the classification-biased representation learned by self.blocks.
+            cand_features_embed_raw = cand_features_embed  # same storage, no copy
+
             attn_mask = None
             if cand_kinematics_pxpypze is not None and self.pair_embed is not None:
                 attn_mask = self.pair_embed(cand_kinematics_pxpypze).view(
                     -1, num_particles, num_particles
                 )  # (N*num_heads, P, P)
 
-            # transform particles
+            # transform particles (shared backbone — classification pathway only)
             for block in self.blocks:
                 cand_features_embed = block(
                     cand_features_embed,
@@ -142,53 +174,45 @@ class ParTau(ParticleTransformer):
                 )
 
             # transform per-jet class tokens
-            # The cls_blocks are designed for a single CLS token per sample.
-            # To give each task its own private CLS token, we tile the particle
-            # features 4x along the batch dimension so each task slot runs as an
-            # independent sample through the cls_blocks in one efficient pass.
             N = cand_features_embed.size(1)
-            # (P, 4N, C) and (4N, P)
-            feat_4x = cand_features_embed.repeat(1, 4, 1)
-            mask_4x = padding_mask.repeat(4, 1)
-            # Stack the 4 task tokens along the batch dim: (1, 4N, C)
-            cls_tokens = torch.cat(
-                [
-                    self.cls_token_tagging.expand(1, N, -1),
-                    self.cls_token_charge.expand(1, N, -1),
-                    self.cls_token_decay_mode.expand(1, N, -1),
-                    self.cls_token_kinematics.expand(1, N, -1),
-                ],
-                dim=1,
-            )  # (1, 4N, C)
+
+            # Shared pathway: tagging, charge, DM — attends to backbone output
+            x_cls_shared = self.cls_token_shared.expand(1, N, -1)  # (1, N, C)
             for block in self.cls_blocks:
-                cls_tokens = block(feat_4x, x_cls=cls_tokens, padding_mask=mask_4x)
-            cls_tokens = self.norm(cls_tokens.squeeze(0))  # (4N, C)
-            x_tagging = cls_tokens[:N]  # (N, C)
-            x_charge = cls_tokens[N : 2 * N]  # (N, C)
-            x_decay_mode = cls_tokens[2 * N : 3 * N]  # (N, C)
-            x_kinematics = cls_tokens[3 * N :]  # (N, C)
+                x_cls_shared = block(
+                    cand_features_embed, x_cls=x_cls_shared, padding_mask=padding_mask
+                )
+            x_shared = self.norm(x_cls_shared.squeeze(0))  # (N, C)
+
+            # Kinematics pathway: attends to the PRE-backbone raw embedding so it
+            # is never exposed to the classification-biased backbone representation.
+            # The pair_embed attention bias (geometry) is passed through unchanged
+            # so the kinematics blocks still see relative angles/distances.
+            x_cls_kin = self.cls_token_kinematics.expand(1, N, -1)  # (1, N, C)
+            for block in self.cls_blocks_kinematics:
+                x_cls_kin = block(
+                    cand_features_embed_raw, x_cls=x_cls_kin, padding_mask=padding_mask
+                )
+            x_kinematics = self.norm_kinematics(x_cls_kin.squeeze(0))  # (N, C)
 
             # As fc_params is an empty list, then basically we have been using one Linear layer only.
             # Now introduce the different heads also here.
             # Output raw logits - activations will be applied by loss functions or during inference
 
-            # Compute kinematics embedding first so it can be reused by the DM head.
-            # Gradients are not detached: DM supervision flows back into the kin
-            # head, which is physically motivated (mass → decay mode).
-            kin_logits = self.regression_head(x_kinematics)  # (N, 5)
-
             output = {
-                "is_tau": self.tau_id_head(x_tagging).squeeze(-1),  # (N,) - raw logits
-                "charge": self.tau_charge_head(x_charge).squeeze(
+                "is_tau": self.tau_id_head(
+                    x_shared
+                ),  # (N, 2) - raw logits (background=0, signal=1)
+                "charge": self.tau_charge_head(x_shared).squeeze(
                     -1
                 ),  # (N,) - raw logits
-                # Embedding version: DM head sees full kin CLS token (256+256 → 6)
+                # Detach x_kinematics so DM gradients do not corrupt the kinematics
+                # regression token. The DM head still sees kinematic context
+                # (e.g. invariant mass) but cannot steer the kinematics token.
                 "decay_mode": self.classification_head(
-                    torch.cat([x_decay_mode, x_kinematics], dim=-1)
+                    torch.cat([x_shared, x_kinematics.detach()], dim=-1)
                 ),  # (N, num_dm_classes) - raw logits
-                "kinematics": self.regression_head(
-                    x_kinematics
-                ),  # (N, 5) - [log_pt, deta, delta_sin(phi), delta_cos(phi), log_m]
+                "kinematics": self.regression_head(x_kinematics),  # (N, 5)
             }
 
             return output

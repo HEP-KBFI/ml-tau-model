@@ -5,11 +5,102 @@ import numpy as np
 
 from omegaconf import DictConfig
 from lightning.pytorch.loggers import TensorBoardLogger  # , CometLogger
-from lightning.pytorch.callbacks import TQDMProgressBar, ModelCheckpoint
+from lightning.pytorch.callbacks import TQDMProgressBar, ModelCheckpoint, Callback
 
 from mltau.tools.io import preprocessed_ParTau_dataloader as dl
 from mltau.models import MultiParTau_module, SingleParTau_module
 from mltau.tools.evaluation import inference
+
+
+class KinematicsFinetuneCallback(Callback):
+    """
+    Two-phase training for MultiParTau:
+
+    Phase 1  — all parameters train normally.
+    Phase 2  — triggered when val_losses/loss has not improved for
+               `patience` epochs: freeze everything except regression_head,
+               reset the patience counter for kinematics-only fine-tuning.
+    Stop     — triggered when val_losses/kinematics_loss has not improved for
+               `patience` epochs while in phase 2.
+
+    Both the overall val loss AND the kinematics val loss are monitored so the
+    callback is robust to the overall loss stagnating for reasons unrelated to
+    kinematics.
+    """
+
+    def __init__(self, patience: int = 10):
+        super().__init__()
+        self.patience = patience
+        self.phase = 1
+        self.best_val_loss = float("inf")
+        self.best_kin_loss = float("inf")
+        self.wait = 0
+
+    def _freeze_all_except_regression_head(self, model):
+        part = model.ParTau
+        for module in [
+            part.embed,
+            part.pair_embed,
+            part.blocks,
+            part.cls_blocks,
+            part.norm,
+        ]:
+            for p in module.parameters():
+                p.requires_grad_(False)
+        for token in [part.cls_token_shared, part.cls_token_kinematics]:
+            token.requires_grad_(False)
+        for head in [part.tau_id_head, part.tau_charge_head, part.classification_head]:
+            for p in head.parameters():
+                p.requires_grad_(False)
+        # regression_head stays requires_grad=True (default)
+
+    def on_validation_epoch_end(self, trainer, pl_module):
+        if trainer.sanity_checking:
+            return
+
+        metrics = trainer.callback_metrics
+
+        if self.phase == 1:
+            val_loss = metrics.get("val_losses/loss", None)
+            if val_loss is None:
+                return
+            val_loss = val_loss.item()
+            if val_loss < self.best_val_loss:
+                self.best_val_loss = val_loss
+                self.wait = 0
+            else:
+                self.wait += 1
+                print(
+                    f"[Phase 1] No improvement for {self.wait}/{self.patience} epochs "
+                    f"(best={self.best_val_loss:.6f}, current={val_loss:.6f})"
+                )
+                if self.wait >= self.patience:
+                    print(
+                        "[Phase 1 → Phase 2] Switching to kinematics-only fine-tuning."
+                    )
+                    self.phase = 2
+                    self.wait = 0
+                    self.best_kin_loss = float("inf")
+                    self._freeze_all_except_regression_head(pl_module)
+                    pl_module.reinitialize_optimizer_for_phase2()
+
+        elif self.phase == 2:
+            kin_loss = metrics.get("val_losses/kinematics_loss", None)
+            if kin_loss is None:
+                return
+            kin_loss = kin_loss.item()
+            if kin_loss < self.best_kin_loss:
+                self.best_kin_loss = kin_loss
+                self.wait = 0
+            else:
+                self.wait += 1
+                print(
+                    f"[Phase 2] Kinematics no improvement for {self.wait}/{self.patience} epochs "
+                    f"(best={self.best_kin_loss:.6f}, current={kin_loss:.6f})"
+                )
+                if self.wait >= self.patience:
+                    print("[Phase 2] Kinematics converged. Stopping training.")
+                    trainer.should_stop = True
 
 
 @hydra.main(config_path="../config", config_name="main", version_base=None)
@@ -45,6 +136,8 @@ def train(cfg: DictConfig):
             filename="ParT-model_best",
         ),
     ]
+    if model_name == "MultiParTau":
+        callbacks.append(KinematicsFinetuneCallback(patience=5))
 
     trainer = L.Trainer(
         max_epochs=cfg.training.trainer.max_epochs,

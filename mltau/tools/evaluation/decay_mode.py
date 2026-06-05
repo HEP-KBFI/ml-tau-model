@@ -16,8 +16,8 @@ plt.rcParams["mathtext.fontset"] = "stix"
 def visualize_confusion_matrix(
     histogram: np.array,
     categories: list,
-    cmap: str = "Greys",
-    bin_text_color: str = "r",
+    cmap: str = "GnBu",
+    bin_text_color: str = "black",
     y_label: str = "Predicted decay modes",
     x_label: str = "True decay modes",
     figsize: tuple = (12, 12),
@@ -44,11 +44,12 @@ def visualize_confusion_matrix(
     fig, ax = plt.subplots(figsize=figsize)
     xbins = ybins = np.arange(len(categories) + 1)
     tick_values = np.arange(len(categories)) + 0.5
-    hep.hist2dplot(histogram, xbins, ybins, cmap=cmap, cbar=True, flow=None)
-    plt.xticks(tick_values, categories, fontsize=14, rotation=0)
-    plt.yticks(tick_values + 0.2, categories, fontsize=14, rotation=90, va="center")
-    plt.xlabel(f"{x_label}", fontdict={"size": 14})
-    plt.ylabel(f"{y_label}", fontdict={"size": 14})
+    hep.hist2dplot(histogram, xbins, ybins, cmap=cmap, cbar=False, flow=None)
+    ax.grid(False)
+    plt.xticks(tick_values, categories, fontsize=30, rotation=45, ha="right")
+    plt.yticks(tick_values + 0.2, categories, fontsize=30, rotation=45, va="top")
+    plt.xlabel(f"{x_label}", fontdict={"size": 36})
+    plt.ylabel(f"{y_label}", fontdict={"size": 36})
     ax.tick_params(axis="both", which="both", length=0)
     for i in range(len(ybins) - 1):
         for j in range(len(xbins) - 1):
@@ -60,16 +61,23 @@ def visualize_confusion_matrix(
                 color=bin_text_color,
                 ha="center",
                 va="center",
+                fontsize=26,
                 fontweight="bold",
             )
+    fig.subplots_adjust(left=0.20, bottom=0.22, right=0.90, top=0.95)
     return fig, ax
 
 
-class DecayModeEvaluator:
-    """Actually we are predicting in the end only 6 (signal) + 1 (bkg) categories, not 16."""
+class BaseDecayModeEvaluator:
+    """Shared functionality for decay mode evaluation.
+
+    Subclasses must call super().__init__() with already-prepared
+    ``predicted`` (class-index array) and ``pred_proba`` ((N, n_classes) array).
+    """
 
     def __init__(
         self,
+        predicted: np.array,
         pred_proba: np.array,
         truth: np.array,
         output_dir: str = "",
@@ -82,13 +90,13 @@ class DecayModeEvaluator:
         self.sample = sample
         self.algorithm = algorithm
         self.pred_proba = np.asarray(pred_proba)
-        self.predicted = np.argmax(self.pred_proba, axis=-1)
+        self.predicted = np.asarray(predicted)
         self._decay_mode_name_mapping = {
             0: r"$h^{\pm}$",
             1: r"$h^{\pm}\pi^0$",
             2: r"$h^\pm+\geq2\pi^0$",
             10: r"$h^{\pm}h^{\mp}h^{\pm}$",
-            11: r"$h^{\pm}h^{\mp}h^{\pm}+\geq\pi^0$",
+            11: r"$h^\pm h^\mp h^\pm$" "\n" r"$+\geq\pi^0$",
             15: "Rare",
         }
         self.inverse_mapping = {
@@ -99,8 +107,14 @@ class DecayModeEvaluator:
         truth = np.asarray(truth)
         if truth.ndim == 1:
             truth = truth.astype(int)
+            # Map -1 → 15 (Rare) before applying forward_mapping, so that
+            # algorithms outputting -1 for unclassified taus are handled correctly.
+            truth = np.where(truth == -1, 15, truth)
             if np.any(truth > 5):
-                self.truth = np.vectorize(self.forward_mapping.get)(truth)
+                # Map known DM labels to class indices; unknown labels → 5 (Rare)
+                self.truth = np.vectorize(lambda x: self.forward_mapping.get(x, 5))(
+                    truth
+                )
             else:
                 self.truth = truth
         else:
@@ -113,15 +127,13 @@ class DecayModeEvaluator:
         self.general_metrics, self.class_metrics = self._calculate_performance_metrics()
         self.class_performances = self.calculate_class_wise_metrics()
 
-    def plot_confusion_matrix(
-        self, output_path: str = ""
-    ):  # TODO: Remove the duplicate
+    def plot_confusion_matrix(self, output_path: str = ""):
         fig, ax = visualize_confusion_matrix(
             histogram=self.normalized_confusion_matrix,
             categories=self.categories,
         )
         if output_path != "":
-            plt.savefig(output_path, format="pdf")
+            plt.savefig(output_path, format="pdf", bbox_inches="tight")
             plt.close("all")
         else:
             return fig, ax
@@ -130,17 +142,11 @@ class DecayModeEvaluator:
         cm = self.confusion_matrix
         total = cm.sum()
 
-        # Per-class counts using standard one-vs-rest definitions
         class_TP = np.diag(cm).astype(float)
-        class_FP = (cm.sum(axis=0) - np.diag(cm)).astype(
-            float
-        )  # predicted i but not true i
-        class_FN = (cm.sum(axis=1) - np.diag(cm)).astype(
-            float
-        )  # true i but not predicted i
+        class_FP = (cm.sum(axis=0) - np.diag(cm)).astype(float)
+        class_FN = (cm.sum(axis=1) - np.diag(cm)).astype(float)
         class_TN = (total - class_TP - class_FP - class_FN).astype(float)
 
-        # Per-class rates
         with np.errstate(divide="ignore", invalid="ignore"):
             class_TPR = np.where(
                 class_TP + class_FN > 0, class_TP / (class_TP + class_FN), 0.0
@@ -164,7 +170,6 @@ class DecayModeEvaluator:
             )
             class_accuracy = (class_TP + class_TN) / total
 
-        # Macro-averaged overall metrics
         TPR = float(np.mean(class_TPR))
         FPR = float(np.mean(class_FPR))
         FNR = float(np.mean(class_FNR))
@@ -201,27 +206,18 @@ class DecayModeEvaluator:
         print("----------------------------------------")
         print("------------ Class metrics -------------")
         print("----------------------------------------")
-
         print(json.dumps(self.class_metrics, indent=4, cls=NpEncoder))
-
         print("----------------------------------------")
         print("------------ General metrics -----------")
         print("----------------------------------------")
         print(json.dumps(self.general_metrics, indent=4, cls=NpEncoder))
 
-    def save_performance(self):  # TODO: Saving to the MultiEvaluator maybe?
+    def save_performance(self):
         class_metrics_output_path = os.path.join(
             self.output_dir, f"{self.sample}_{self.algorithm}_class_metrics.json"
         )
         with open(class_metrics_output_path, "wt") as out_file:
             json.dump(self.class_metrics, out_file, indent=4, cls=NpEncoder)
-
-        class_metrics_output_path = os.path.join(
-            self.output_dir, f"{self.sample}_{self.algorithm}_class_metrics.json"
-        )
-        with open(class_metrics_output_path, "wt") as out_file:
-            json.dump(self.class_metrics, out_file, indent=4, cls=NpEncoder)
-
         confusion_matrix_output_path = os.path.join(
             self.output_dir, f"{self.sample}_{self.algorithm}_confusion_matrix.pdf"
         )
@@ -234,6 +230,51 @@ class DecayModeEvaluator:
                 y_true=self.truth, y_pred=self.predicted, average=None
             ),
         }
+
+
+class DecayModeEvaluator(BaseDecayModeEvaluator):
+    """Decay mode evaluator for soft probability predictions."""
+
+    def __init__(
+        self,
+        pred_proba: np.array,
+        truth: np.array,
+        output_dir: str = "",
+        sample: str = "all",
+        algorithm: str = "all",
+    ):
+        pred_proba = np.asarray(pred_proba)
+        predicted = np.argmax(pred_proba, axis=-1)
+        super().__init__(predicted, pred_proba, truth, output_dir, sample, algorithm)
+
+
+class HardLabelDecayModeEvaluator(BaseDecayModeEvaluator):
+    """Decay mode evaluator for hard-label predictions ({-1, 0, 1, 2, 10, 11, 15}).
+
+    Labels of -1 are mapped to 15 (Rare). A one-hot array is constructed as
+    ``pred_proba`` so that ``DecayModeROCPlot`` produces a single point per
+    class on the ROC plane rather than a curve.
+    """
+
+    # Define the mapping as a class constant so it's available before super().__init__
+    _FORWARD_MAPPING = {0: 0, 1: 1, 2: 2, 10: 3, 11: 4, 15: 5}
+    _N_CLASSES = 6
+
+    def __init__(
+        self,
+        predicted: np.array,
+        truth: np.array,
+        output_dir: str = "",
+        sample: str = "all",
+        algorithm: str = "all",
+    ):
+        predicted = np.asarray(predicted, dtype=int)
+        predicted = np.where(predicted == -1, 15, predicted)
+        predicted_idx = np.vectorize(self._FORWARD_MAPPING.get)(predicted)
+        pred_proba = np.eye(self._N_CLASSES)[predicted_idx]
+        super().__init__(
+            predicted_idx, pred_proba, truth, output_dir, sample, algorithm
+        )
 
 
 class ConfusionMatrix:
@@ -252,6 +293,7 @@ class ConfusionMatrix:
         output_path = os.path.join(
             output_dir, f"decay_mode_cm_{self.evaluator.algorithm}.pdf"
         )
+        self.fig.tight_layout(pad=1.5)
         self.fig.savefig(output_path, format="pdf")
         plt.close("all")
 
@@ -363,6 +405,9 @@ class DecayModeComparisonPlot:
         # Vertical lines between the DMs
         for i in range(len(x)):
             ax.axvline(i - 0.5, color="gray", linestyle="--", linewidth=0.5, zorder=0)
+        # Explicit margins: same bottom/top as confusion matrix so axes boxes
+        # share the same height; smaller left since no tilted tick labels.
+        fig.subplots_adjust(left=0.12, bottom=0.22, right=0.83, top=0.95)
         return fig, ax
 
     def _calculate_overall_performance(self, evaluator):
@@ -381,7 +426,7 @@ class DecayModeComparisonPlot:
                 xytext=offset,
                 ha="center",
                 va="bottom",
-                fontsize=9,
+                fontsize=12,
             )
 
     def add_line(self, evaluator, offset):
@@ -404,11 +449,15 @@ class DecayModeComparisonPlot:
             (-18, -4),
         )
         self.ax.legend(
-            loc="lower left", shadow=True, fancybox=True, framealpha=1, borderpad=1
+            loc="lower left",
+            shadow=True,
+            fancybox=True,
+            framealpha=1,
+            borderpad=1,
+            fontsize=20,
         )
 
     def save(self, output_dir: str):
-        self.fig.tight_layout()
         self.fig.savefig(
             os.path.join(output_dir, f"decay_mode_{self.metric}.pdf"),
             bbox_inches="tight",

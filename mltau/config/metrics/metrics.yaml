@@ -48,6 +48,16 @@ ALGORITHM_PLOT_STYLES:
         label: QKappa
         lw: 3
         marker_size: 15
+    HPS:
+        name: HPS
+        marker: "s"
+        hatch: "."
+        color: "tab:orange"
+        light_color: "k"
+        ls: "solid"
+        label: HPS
+        lw: 3
+        marker_size: 20
     all:
         name: ParTau
         marker: "X"

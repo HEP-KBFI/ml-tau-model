@@ -12,11 +12,15 @@ def log_all_decay_mode_metrics(
     # output_dir: str,
     current_epoch: int,
 ):
-    predictions_proba = np.asarray(predictions["decay_mode"])
+    # DM loss is trained only on signal taus; background jets have DM=-1 mapped
+    # to "Rare" (index 5) in the target, which the model never learns to predict.
+    # Filter to signal only so the confusion matrix matches inference evaluation.
+    signal_mask = np.asarray(targets["is_tau"]) == 1
+    predictions_proba = np.asarray(predictions["decay_mode"])[signal_mask]
 
     evaluator = dm.DecayModeEvaluator(
         pred_proba=predictions_proba,
-        truth=np.asarray(targets["decay_mode"]),
+        truth=np.asarray(targets["decay_mode"])[signal_mask],
         output_dir="",
         sample="all",
         algorithm="all",

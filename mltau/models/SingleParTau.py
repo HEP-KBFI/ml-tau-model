@@ -68,14 +68,26 @@ class ParTau(ParticleTransformer):
 
         embed_dim = embed_dims[-1] if len(embed_dims) > 0 else input_dim
         if self.task == "decay_mode":
-            # Classification head for decay mode classification
-            self.classification_head = nn.Linear(embed_dim, num_dm_classes)
+            # MLP head: 256 → 128 → 6; non-linear compression helps separate the
+            # 6 DM classes whose boundaries are non-trivial (e.g. DM 1 vs DM 2).
+            dm_hidden = embed_dim // 2
+            self.classification_head = nn.Sequential(
+                nn.Linear(embed_dim, dm_hidden),
+                nn.GELU(),
+                nn.Linear(dm_hidden, num_dm_classes),
+            )
         elif self.task == "kinematics":
-            # Regression head: [log(pt_gen/pt_reco), delta_eta, delta_sin(phi), delta_cos(phi), log(m_gen/m_reco)]
-            self.regression_head = nn.Linear(embed_dim, 5)
+            # Regression head: small MLP for richer non-linear mapping from CLS to targets.
+            # [log(pt_gen/pt_reco), delta_eta, delta_sin(phi), delta_cos(phi), log(m_gen/m_reco)]
+            hidden_dim = embed_dim // 2
+            self.regression_head = nn.Sequential(
+                nn.Linear(embed_dim, hidden_dim),
+                nn.GELU(),
+                nn.Linear(hidden_dim, 5),
+            )
         elif self.task == "is_tau":
-            # Binary head for tau-tagging
-            self.binary_head = nn.Linear(embed_dim, 1)
+            # Two-class head for tau-tagging (background = class 0, signal = class 1)
+            self.binary_head = nn.Linear(embed_dim, 2)
         elif self.task == "charge":
             # Two-logit head to match the en-reg charge-classification setup
             self.binary_head = nn.Linear(embed_dim, 2)
@@ -138,8 +150,8 @@ class ParTau(ParticleTransformer):
                 # Regression output: [log(pt_gen/pt_reco), delta_eta, delta_sin(phi), delta_cos(phi), log(m_gen/m_reco)]
                 output = (self.regression_head(x_cls),)  # (N, 5)
             elif self.task == "is_tau":
-                # Return logits; sigmoid is applied outside for logging and evaluation.
-                output = (self.binary_head(x_cls).squeeze(-1),)  # (N,)
+                # Return 2-class logits; signal is class 1.
+                output = (self.binary_head(x_cls),)  # (N, 2)
             elif self.task == "charge":
                 # Two-class logits for charge classification
                 output = (self.binary_head(x_cls),)  # (N, 2)

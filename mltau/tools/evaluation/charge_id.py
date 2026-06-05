@@ -13,7 +13,6 @@ from omegaconf import DictConfig
 from mltau.tools import general as g
 from mltau.tools.evaluation.histogram import Histogram
 
-
 plt.rcParams["mathtext.fontset"] = "stix"
 
 
@@ -35,8 +34,14 @@ def _get_charge_label(cfg, algorithm):
     return cfg.metrics.ALGORITHM_PLOT_STYLES[algorithm].name
 
 
-class ChargeIdEvaluator:
-    """Class for evaluating charge ID performance."""
+class BaseChargeIdEvaluator:
+    """Shared infrastructure for charge ID evaluation.
+
+    Subclasses must implement ``_get_wp_mask(charge)`` to define which events
+    are selected at the working point, and must populate
+    ``eff_denominator_masks`` and ``fake_denominator_masks`` before calling
+    ``_build_wp_metrics()``.
+    """
 
     def __init__(
         self,
@@ -56,45 +61,109 @@ class ChargeIdEvaluator:
         self.algorithm = algorithm
         truth = np.asarray(truth)
         predicted = np.asarray(predicted)
-
-        # Accept either binary truth labels {0,1} or physical signed charge {-1,+1}.
+        # Normalize truth to binary {0, 1}: 1 = positive charge, 0 = negative charge.
+        # Accept either physical signed charge {-1, +1} or already-binary {0, 1}.
         if np.any(truth < 0):
             truth = (truth == 1).astype(int)
         else:
             truth = truth.astype(int)
-
+        self.truth = truth
         self.predicted = predicted
         self.gen_jet_tau_p4s = g.reinitialize_p4(gen_jet_tau_p4s)
         self.reco_jet_p4s = g.reinitialize_p4(reco_jet_p4s)
         self.cfg = cfg
-        self.truth = truth
-        # Use quantile-based thresholds: dense where scores concentrate (near 0/1),
-        # sparse in the middle. Capped at 1000 points for performance.
-        self.tagging_cuts = np.unique(
-            np.concatenate(
-                [[0], np.quantile(self.predicted, np.linspace(0, 1, 1000)), [1]]
-            )
-        )
-
-        # Define charge masks
         self.true_positive_charge_mask = self.truth == 1
         self.true_negative_charge_mask = self.truth == 0
-        self.efficiencies, self.eff_denominator_masks = self._calculate_eff_fake(
-            eff_fake="eff"
+
+    def _base_mask(self):
+        """Kinematic acceptance cuts applied to both gen and reco jets."""
+        ref_var_pt_mask = self.gen_jet_tau_p4s.pt > self.cfg.metrics.charge.cuts.min_pt
+        ref_var_theta_mask1 = (
+            abs(np.rad2deg(self.gen_jet_tau_p4s.theta))
+            < self.cfg.metrics.charge.cuts.max_theta
         )
-        self.fakerates, self.fake_denominator_masks = self._calculate_eff_fake(
-            eff_fake="fake"
+        ref_var_theta_mask2 = (
+            abs(np.rad2deg(self.gen_jet_tau_p4s.theta))
+            > self.cfg.metrics.charge.cuts.min_theta
         )
-        self.pos_charge_predictions = self.predicted[self.true_positive_charge_mask]
-        self.neg_charge_predictions = self.predicted[self.true_negative_charge_mask]
-        # Find the working point where average efficiency is 95%
-        self.wp_idx = self._find_95_percent_average_efficiency_working_point()
-        self.wp_pos = float(self.tagging_cuts[self.wp_idx])
-        self.wp_neg = float(1.0 - self.tagging_cuts[self.wp_idx])
-        # Calculate confusion matrix at working point
-        self.confusion_matrix = self._calculate_confusion_matrix()
+        gen_denominator_mask = (
+            ref_var_pt_mask * ref_var_theta_mask1 * ref_var_theta_mask2
+        )
+        # As we are only assigning charge for tau (candidates) that are tagged, then to have the correct total
+        # number of jets, we need to add the cuts on the reco jet also to the denominator
+        tau_pt_mask = self.reco_jet_p4s.pt > self.cfg.metrics.charge.cuts.min_pt
+        tau_theta_mask1 = (
+            abs(np.rad2deg(self.reco_jet_p4s.theta))
+            < self.cfg.metrics.charge.cuts.max_theta
+        )
+        tau_theta_mask2 = (
+            abs(np.rad2deg(self.reco_jet_p4s.theta))
+            > self.cfg.metrics.charge.cuts.min_theta
+        )
+        reco_denominator_mask = tau_pt_mask * tau_theta_mask1 * tau_theta_mask2
+        return gen_denominator_mask * reco_denominator_mask
+
+    def _compute_denominator_masks(self, eff_fake: str):
+        positive_mask = (
+            self.true_positive_charge_mask
+            if eff_fake == "eff"
+            else self.true_negative_charge_mask
+        )
+        negative_mask = (
+            self.true_negative_charge_mask
+            if eff_fake == "eff"
+            else self.true_positive_charge_mask
+        )
+        base = self._base_mask()
+        return {
+            "positive": base * positive_mask,
+            "negative": base * negative_mask,
+        }
+
+    def _metric_values(self, metric: str):
+        values = getattr(self.gen_jet_tau_p4s, metric).to_numpy()
+        if metric == "theta":
+            values = np.rad2deg(values)
+        return np.asarray(values)
+
+    def _get_wp_mask(self, charge: str) -> np.ndarray:
+        """Return boolean mask for events selected at the working point.
+
+        Must be implemented by subclasses.
+        """
+        raise NotImplementedError
+
+    def _get_working_point_eff_fakes(self, name, metric, eff_fake="eff"):
+        eff_fake_mask = (
+            self.eff_denominator_masks
+            if eff_fake == "eff"
+            else self.fake_denominator_masks
+        )
+        return_values = {}
+        var_values = getattr(self.gen_jet_tau_p4s, name).to_numpy()
+        if name == "theta":
+            var_values = np.rad2deg(var_values)
+        for charge in ["positive", "negative"]:
+            wp_mask = self._get_wp_mask(charge)
+            eff_var_denom = var_values[eff_fake_mask[charge]]
+            eff_var_num = var_values[wp_mask * eff_fake_mask[charge]]
+            bin_edges = np.linspace(
+                min(eff_var_denom), max(eff_var_denom), metric.n_bins + 1
+            )
+            denom_hist = Histogram(eff_var_denom, bin_edges, "denominator")
+            num_hist = Histogram(eff_var_num, bin_edges, "numerator")
+            efficiencies = num_hist / denom_hist
+            return_values[charge] = (
+                efficiencies.bin_centers,
+                efficiencies.data,
+                efficiencies.uncertainties,
+                efficiencies.bin_halfwidths,
+            )
+        return return_values
+
+    def _build_wp_metrics(self):
         self.wp_metrics = {}
-        for name, metric in cfg.metrics.charge.metrics.items():
+        for name, metric in self.cfg.metrics.charge.metrics.items():
             self.wp_metrics[name] = {}
             charge_fr = self._get_working_point_eff_fakes(name, metric, eff_fake="fake")
             charge_eff = self._get_working_point_eff_fakes(name, metric, eff_fake="eff")
@@ -111,6 +180,91 @@ class ChargeIdEvaluator:
                     "eff_yerr": eff_yerr,
                     "eff_xerr": eff_xerr,
                 }
+
+    def compute_binned_efficiencies_for_target_eff(
+        self, metric: str, target_eff: float = 0.8
+    ):
+        """Binned efficiencies at the working point.
+
+        The default implementation uses the single hard-label working point
+        (``target_eff`` is ignored).  Soft-score subclasses should override
+        this to threshold at the requested efficiency.
+        """
+        charge_eff = self._get_working_point_eff_fakes(
+            metric, self.cfg.metrics.charge.metrics[metric], eff_fake="eff"
+        )
+        x, pos, _, _ = charge_eff["positive"]
+        _, neg, _, _ = charge_eff["negative"]
+        return x, np.asarray(pos), np.asarray(neg)
+
+    def compute_binned_fake_rates_for_target_eff(
+        self, metric: str, target_eff: float = 0.8
+    ):
+        """Binned fake rates at the working point.
+
+        See ``compute_binned_efficiencies_for_target_eff`` for notes on the
+        default implementation.
+        """
+        charge_fake = self._get_working_point_eff_fakes(
+            metric, self.cfg.metrics.charge.metrics[metric], eff_fake="fake"
+        )
+        x, pos, _, _ = charge_fake["positive"]
+        _, neg, _, _ = charge_fake["negative"]
+        return x, np.asarray(pos), np.asarray(neg)
+
+
+class ChargeIdEvaluator(BaseChargeIdEvaluator):
+    """Evaluates charge ID performance for continuous probability scores."""
+
+    def __init__(
+        self,
+        predicted: np.array,
+        truth: np.array,
+        gen_jet_tau_p4s: ak.Array,
+        reco_jet_p4s: ak.Array,
+        cfg: DictConfig,
+        output_dir: str = "",
+        sample: str = "",
+        algorithm: str = "",
+    ):
+        super().__init__(
+            predicted,
+            truth,
+            gen_jet_tau_p4s,
+            reco_jet_p4s,
+            cfg,
+            output_dir,
+            sample,
+            algorithm,
+        )
+        # Use quantile-based thresholds: dense where scores concentrate (near 0/1),
+        # sparse in the middle. Capped at 1000 points for performance.
+        self.tagging_cuts = np.unique(
+            np.concatenate(
+                [[0], np.quantile(self.predicted, np.linspace(0, 1, 1000)), [1]]
+            )
+        )
+        self.efficiencies, self.eff_denominator_masks = self._calculate_eff_fake(
+            eff_fake="eff"
+        )
+        self.fakerates, self.fake_denominator_masks = self._calculate_eff_fake(
+            eff_fake="fake"
+        )
+        self.pos_charge_predictions = self.predicted[self.true_positive_charge_mask]
+        self.neg_charge_predictions = self.predicted[self.true_negative_charge_mask]
+        # Find the working point where average efficiency is 95%
+        self.wp_idx = self._find_95_percent_average_efficiency_working_point()
+        self.wp_pos = float(self.tagging_cuts[self.wp_idx])
+        self.wp_neg = float(1.0 - self.tagging_cuts[self.wp_idx])
+        # Calculate confusion matrix at working point
+        self.confusion_matrix = self._calculate_confusion_matrix()
+        self._build_wp_metrics()
+
+    def _get_wp_mask(self, charge: str) -> np.ndarray:
+        if charge == "positive":
+            return self.predicted >= self.wp_pos
+        else:
+            return self.predicted <= self.wp_neg
 
     def choose_threshold_for_target_eff_per_class(
         self, target_eff: float = 0.8, which: str = "positive"
@@ -137,36 +291,51 @@ class ChargeIdEvaluator:
         threshold = float(np.interp(clipped_eff, eff_unique, thr_unique))
         return threshold if which == "positive" else float(1.0 - threshold)
 
-    def _metric_values(self, metric: str):
-        values = getattr(self.gen_jet_tau_p4s, metric).to_numpy()
-        if metric == "theta":
-            values = np.rad2deg(values)
-        return np.asarray(values)
+    def _calculate_eff_fake(self, eff_fake: str = "eff"):
+        _eff_fake = {"positive": [], "negative": []}
+        denominator_masks = self._compute_denominator_masks(eff_fake)
+        pos_denominator_mask = denominator_masks["positive"]
+        neg_denominator_mask = denominator_masks["negative"]
+        pos_all = np.sum(pos_denominator_mask)
+        neg_all = np.sum(neg_denominator_mask)
+        for cut in self.tagging_cuts:
+            pos_passing_cut = np.sum(self.predicted[pos_denominator_mask] >= cut)
+            # Alternative 1: Use same threshold for both (current method)
+            neg_passing_cut = np.sum((1 - self.predicted[neg_denominator_mask]) >= cut)
 
-    def _base_mask(self):
-        ref_var_pt_mask = self.gen_jet_tau_p4s.pt > self.cfg.metrics.charge.cuts.min_pt
-        ref_var_theta_mask1 = (
-            abs(np.rad2deg(self.gen_jet_tau_p4s.theta))
-            < self.cfg.metrics.charge.cuts.max_theta
-        )
-        ref_var_theta_mask2 = (
-            abs(np.rad2deg(self.gen_jet_tau_p4s.theta))
-            > self.cfg.metrics.charge.cuts.min_theta
-        )
-        gen_denominator_mask = (
-            ref_var_pt_mask * ref_var_theta_mask1 * ref_var_theta_mask2
-        )
-        tau_pt_mask = self.reco_jet_p4s.pt > self.cfg.metrics.charge.cuts.min_pt
-        tau_theta_mask1 = (
-            abs(np.rad2deg(self.reco_jet_p4s.theta))
-            < self.cfg.metrics.charge.cuts.max_theta
-        )
-        tau_theta_mask2 = (
-            abs(np.rad2deg(self.reco_jet_p4s.theta))
-            > self.cfg.metrics.charge.cuts.min_theta
-        )
-        reco_denominator_mask = tau_pt_mask * tau_theta_mask1 * tau_theta_mask2
-        return gen_denominator_mask * reco_denominator_mask
+            # Alternative 2: Use direct thresholding (uncomment to test)
+            # Treat negative charge as predictions < threshold (more natural)
+            # neg_passing_cut = np.sum(self.predicted[neg_denominator_mask] <= (1 - cut))
+
+            # Alternative 3: Use calibrated thresholding around model's natural bias
+            # model_bias = np.mean(self.predicted)  # Estimated model bias
+            # neg_threshold = 2 * model_bias - cut  # Symmetric around bias point
+            # neg_passing_cut = np.sum(self.predicted[neg_denominator_mask] <= neg_threshold)
+
+            _eff_fake["positive"].append(
+                pos_passing_cut / pos_all if pos_all > 0 else 0.0
+            )
+            _eff_fake["negative"].append(
+                neg_passing_cut / neg_all if neg_all > 0 else 0.0
+            )
+        return _eff_fake, denominator_masks
+
+    def _find_95_percent_average_efficiency_working_point(
+        self, target_avg_efficiency: float = 0.95
+    ) -> int:
+        """Return the index into tagging_cuts where average efficiency is closest to target."""
+        eff_pos = np.array(self.efficiencies["positive"])
+        eff_neg = np.array(self.efficiencies["negative"])
+        avg_efficiencies = (eff_pos + eff_neg) / 2.0
+        return int(np.argmin(np.abs(avg_efficiencies - target_avg_efficiency)))
+
+    def _calculate_confusion_matrix(self):
+        positive_predictions = self.predicted >= self.wp_pos
+        tp = np.sum(positive_predictions & (self.truth == 1))
+        tn = np.sum(~positive_predictions & (self.truth == 0))
+        fp = np.sum(positive_predictions & (self.truth == 0))
+        fn = np.sum(~positive_predictions & (self.truth == 1))
+        return {"TP": int(tp), "TN": int(tn), "FP": int(fp), "FN": int(fn)}
 
     def compute_binned_fake_rates_for_target_eff(
         self, metric: str, target_eff: float = 0.8
@@ -244,149 +413,96 @@ class ChargeIdEvaluator:
 
         return centers, np.asarray(eff_pos), np.asarray(eff_neg)
 
-    def _calculate_eff_fake(self, eff_fake: str = "eff"):
-        _eff_fake = {"positive": [], "negative": []}
-        positive_mask = (
-            self.true_positive_charge_mask
-            if eff_fake == "eff"
-            else self.true_negative_charge_mask
+
+class HardLabelChargeIdEvaluator(BaseChargeIdEvaluator):
+    """Evaluates charge ID performance for hard-label predictions ({-1, 0, +1}).
+
+    Unlike ChargeIdEvaluator, there is no threshold scanning.  Efficiencies and
+    fakerates are single-element arrays representing the one operating point
+    defined directly by the hard labels, so they can be plotted as a single
+    marker on a ROC curve alongside continuous-score evaluators.
+    """
+
+    def __init__(
+        self,
+        predicted: np.array,
+        truth: np.array,
+        gen_jet_tau_p4s: ak.Array,
+        reco_jet_p4s: ak.Array,
+        cfg: DictConfig,
+        output_dir: str = "",
+        sample: str = "",
+        algorithm: str = "",
+    ):
+        super().__init__(
+            predicted,
+            truth,
+            gen_jet_tau_p4s,
+            reco_jet_p4s,
+            cfg,
+            output_dir,
+            sample,
+            algorithm,
         )
-        negative_mask = (
-            self.true_negative_charge_mask
-            if eff_fake == "eff"
-            else self.true_positive_charge_mask
+        # Hard prediction masks: +1 → predicted positive charge, -1 → predicted negative
+        self._pred_positive_mask = self.predicted == 1
+        self._pred_negative_mask = self.predicted == -1
+        # For interface compatibility with ChargeClassifierPlot
+        self.pos_charge_predictions = self.predicted[self.true_positive_charge_mask]
+        self.neg_charge_predictions = self.predicted[self.true_negative_charge_mask]
+        self.eff_denominator_masks = self._compute_denominator_masks(eff_fake="eff")
+        self.fake_denominator_masks = self._compute_denominator_masks(eff_fake="fake")
+        # Single-point efficiencies and fakerates as 1-element arrays
+        self.efficiencies = self._calculate_single_eff_fake(eff_fake="eff")
+        self.fakerates = self._calculate_single_eff_fake(eff_fake="fake")
+        # Confusion matrix at the single operating point
+        self.confusion_matrix = self._calculate_confusion_matrix()
+        self._build_wp_metrics()
+
+    def _get_wp_mask(self, charge: str) -> np.ndarray:
+        return (
+            self._pred_positive_mask
+            if charge == "positive"
+            else self._pred_negative_mask
         )
-        ref_var_pt_mask = self.gen_jet_tau_p4s.pt > self.cfg.metrics.charge.cuts.min_pt
-        ref_var_theta_mask1 = (
-            abs(np.rad2deg(self.gen_jet_tau_p4s.theta))
-            < self.cfg.metrics.charge.cuts.max_theta
-        )
-        ref_var_theta_mask2 = (
-            abs(np.rad2deg(self.gen_jet_tau_p4s.theta))
-            > self.cfg.metrics.charge.cuts.min_theta
-        )
-        gen_denominator_mask = (
-            ref_var_pt_mask * ref_var_theta_mask1 * ref_var_theta_mask2
-        )
-        # As we are only assigning charge for tau (candidates) that are tagged, then to have the correct total
-        # number of jets, we need to add the cuts on the reco jet also to the denominator
-        tau_pt_mask = self.reco_jet_p4s.pt > self.cfg.metrics.charge.cuts.min_pt
-        tau_theta_mask1 = (
-            abs(np.rad2deg(self.reco_jet_p4s.theta))
-            < self.cfg.metrics.charge.cuts.max_theta
-        )
-        tau_theta_mask2 = (
-            abs(np.rad2deg(self.reco_jet_p4s.theta))
-            > self.cfg.metrics.charge.cuts.min_theta
-        )
-        reco_denominator_mask = tau_pt_mask * tau_theta_mask1 * tau_theta_mask2
-        base_denominator_mask = gen_denominator_mask * reco_denominator_mask
 
-        pos_denominator_mask = base_denominator_mask * positive_mask
-        neg_denominator_mask = base_denominator_mask * negative_mask
-        denominator_masks = {
-            "positive": pos_denominator_mask,
-            "negative": neg_denominator_mask,
-        }
-        neg_all = np.sum(neg_denominator_mask)
-        pos_all = np.sum(pos_denominator_mask)
-        for cut in self.tagging_cuts:
-            pos_passing_cut = np.sum(self.predicted[pos_denominator_mask] >= cut)
-            # Alternative 1: Use same threshold for both (current method)
-            neg_passing_cut = np.sum((1 - self.predicted[neg_denominator_mask]) >= cut)
-
-            # Alternative 2: Use direct thresholding (uncomment to test)
-            # Treat negative charge as predictions < threshold (more natural)
-            # neg_passing_cut = np.sum(self.predicted[neg_denominator_mask] <= (1 - cut))
-
-            # Alternative 3: Use calibrated thresholding around model's natural bias
-            # model_bias = np.mean(self.predicted)  # Estimated model bias
-            # neg_threshold = 2 * model_bias - cut  # Symmetric around bias point
-            # neg_passing_cut = np.sum(self.predicted[neg_denominator_mask] <= neg_threshold)
-
-            if pos_all > 0:
-                _eff_fake["positive"].append(pos_passing_cut / pos_all)
-            else:
-                _eff_fake["positive"].append(0.0)
-
-            if neg_all > 0:
-                _eff_fake["negative"].append(neg_passing_cut / neg_all)
-            else:
-                _eff_fake["negative"].append(0.0)
-        return _eff_fake, denominator_masks
-    
-    ###################################
-    ###################################
-    ###################################
-    ###################################
-
-    def _find_95_percent_average_efficiency_working_point(
-        self, target_avg_efficiency: float = 0.95
-    ) -> int:
-        """Return the index into tagging_cuts where average efficiency is closest to target.
-
-        Finds the working point where (positive_efficiency + negative_efficiency) / 2 = target_avg_efficiency
-        """
-        eff_pos = np.array(self.efficiencies["positive"])
-        eff_neg = np.array(self.efficiencies["negative"])
-
-        # Calculate average efficiency for each threshold
-        avg_efficiencies = (eff_pos + eff_neg) / 2.0
-
-        # Find the threshold closest to target average efficiency
-        return int(np.argmin(np.abs(avg_efficiencies - target_avg_efficiency)))
-
-    def _calculate_confusion_matrix(self):
-        """Calculate confusion matrix at the working point threshold.
-
-        Returns:
-            dict: Confusion matrix with keys 'TP', 'TN', 'FP', 'FN'
-        """
-        # Use positive threshold for predictions (negative threshold is 1 - positive)
-        positive_predictions = self.predicted >= self.wp_pos
-
-        # Calculate confusion matrix elements
-        # True Positive: predicted positive (1), actual positive (1)
-        tp = np.sum(positive_predictions & (self.truth == 1))
-        # True Negative: predicted negative (0), actual negative (0)
-        tn = np.sum(~positive_predictions & (self.truth == 0))
-        # False Positive: predicted positive (1), actual negative (0)
-        fp = np.sum(positive_predictions & (self.truth == 0))
-        # False Negative: predicted negative (0), actual positive (1)
-        fn = np.sum(~positive_predictions & (self.truth == 1))
-
-        return {"TP": int(tp), "TN": int(tn), "FP": int(fp), "FN": int(fn)}
-
-    def _get_working_point_eff_fakes(self, name, metric, eff_fake="eff"):
-        eff_fake_mask = (
+    def _calculate_single_eff_fake(self, eff_fake: str):
+        denom_masks = (
             self.eff_denominator_masks
             if eff_fake == "eff"
             else self.fake_denominator_masks
         )
-        return_values = {}
-        var_values = getattr(self.gen_jet_tau_p4s, name).to_numpy()
-        if name == "theta":
-            var_values = np.rad2deg(var_values)
-        for charge in ["positive", "negative"]:
-            if charge == "positive":
-                wp_mask = self.predicted >= self.wp_pos
-            else:
-                wp_mask = self.predicted <= self.wp_neg
-            eff_var_denom = var_values[eff_fake_mask[charge]]
-            eff_var_num = var_values[wp_mask * eff_fake_mask[charge]]
-            bin_edges = np.linspace(
-                min(eff_var_denom), max(eff_var_denom), metric.n_bins + 1
-            )
-            denom_hist = Histogram(eff_var_denom, bin_edges, "denominator")
-            num_hist = Histogram(eff_var_num, bin_edges, "numerator")
-            efficiencies = num_hist / denom_hist
-            return_values[charge] = (
-                efficiencies.bin_centers,
-                efficiencies.data,
-                efficiencies.uncertainties,
-                efficiencies.bin_halfwidths,
-            )
-        return return_values
+        pos_denom = denom_masks["positive"]
+        neg_denom = denom_masks["negative"]
+        pos_all = np.sum(pos_denom)
+        neg_all = np.sum(neg_denom)
+        pos_passing = np.sum(self._pred_positive_mask[pos_denom])
+        neg_passing = np.sum(self._pred_negative_mask[neg_denom])
+        eff_pos = float(pos_passing) / float(pos_all) if pos_all > 0 else 0.0
+        eff_neg = float(neg_passing) / float(neg_all) if neg_all > 0 else 0.0
+        return {
+            "positive": np.array([eff_pos]),
+            "negative": np.array([eff_neg]),
+        }
+
+    def _calculate_confusion_matrix(self):
+        pred_neutral = self.predicted == 0
+        # truth is binary {0, 1} after base class normalization
+        tp = int(np.sum(self._pred_positive_mask & self.true_positive_charge_mask))
+        tn = int(np.sum(self._pred_negative_mask & self.true_negative_charge_mask))
+        fp = int(np.sum(self._pred_positive_mask & self.true_negative_charge_mask))
+        fn = int(np.sum(self._pred_negative_mask & self.true_positive_charge_mask))
+        # predicted==0 is an efficiency loss for both classes
+        neutral_pos = int(np.sum(pred_neutral & self.true_positive_charge_mask))
+        neutral_neg = int(np.sum(pred_neutral & self.true_negative_charge_mask))
+        return {
+            "TP": tp,
+            "TN": tn,
+            "FP": fp,
+            "FN": fn,
+            "neutral_pos": neutral_pos,
+            "neutral_neg": neutral_neg,
+        }
 
 
 class ChargeClassifierPlot:
@@ -428,7 +544,7 @@ class ChargeClassifierPlot:
             edgecolor=neg_color,
             ax=self.ax,
         )
-        self.ax.legend(prop={"size": 28}, loc ='upper center')
+        self.ax.legend(prop={"size": 28}, loc="upper center")
 
     def plot(self):
         fig, ax = plt.subplots(figsize=(10, 10))
@@ -438,6 +554,7 @@ class ChargeClassifierPlot:
         return fig, ax
 
     def save(self, output_path: str):
+        self.fig.tight_layout(pad=1.5)
         self.fig.savefig(output_path, format="pdf")
         plt.close("all")
 
@@ -446,6 +563,7 @@ class ROCPlot:
     def __init__(self, cfg):
         self.fig, self.ax = self.plot()
         self.cfg = cfg
+        self.comparison_algos = []
 
     def plot(self):
         fig, ax = plt.subplots(figsize=(10, 10))
@@ -460,6 +578,7 @@ class ROCPlot:
         return fig, ax
 
     def add_line(self, evaluator):
+        self.comparison_algos.append(evaluator.algorithm)
         pos_color, neg_color = _get_charge_colors(evaluator.cfg, evaluator.algorithm)
         marker = evaluator.cfg.metrics.ALGORITHM_PLOT_STYLES[evaluator.algorithm].marker
         algorithm_label = _get_charge_label(evaluator.cfg, evaluator.algorithm)
@@ -488,13 +607,13 @@ class ROCPlot:
         handles = []
 
         # --- Models (ONLY positive colors)
-        wanted_algos = ["SingleParTau", "MultiParTau", "QKappa"]
 
-        for algo in wanted_algos:
+        for algo in self.comparison_algos:
             style = self.cfg.metrics.ALGORITHM_PLOT_STYLES[algo]
             handles.append(
                 Line2D(
-                    [0], [0],
+                    [0],
+                    [0],
                     color=style.color,
                     marker=style.marker,
                     linestyle="",
@@ -506,6 +625,7 @@ class ROCPlot:
         self.ax.legend(handles=handles, loc="upper left", prop={"size": 20})
 
     def save(self, output_path):
+        self.fig.tight_layout(pad=1.5)
         self.fig.savefig(output_path, format="pdf")
         plt.close("all")
 
@@ -570,6 +690,7 @@ class EfficiencyPlot:
         return fig, ax
 
     def save(self, output_path):
+        self.fig.tight_layout(pad=1.5)
         self.fig.savefig(output_path, format="pdf")
         plt.close("all")
 
@@ -633,6 +754,7 @@ class FakeRatePlot:
         return fig, ax
 
     def save(self, output_path):
+        self.fig.tight_layout(pad=1.5)
         self.fig.savefig(output_path, format="pdf")
         plt.close("all")
 
@@ -766,7 +888,8 @@ class AsymmetryPlot:
         return fig, (ax, ax_ratio)
 
     def save(self, output_path):
-        self.fig.savefig(output_path, format="pdf", bbox_inches="tight")
+        self.fig.tight_layout(pad=1.5)
+        self.fig.savefig(output_path, format="pdf")
         plt.close("all")
 
 
@@ -837,7 +960,8 @@ class ConfusionMatrixPlot:
         return fig, ax
 
     def save(self, output_path):
-        self.fig.savefig(output_path, format="pdf", bbox_inches="tight")
+        self.fig.tight_layout(pad=1.5)
+        self.fig.savefig(output_path, format="pdf")
         plt.close(self.fig)
 
 
