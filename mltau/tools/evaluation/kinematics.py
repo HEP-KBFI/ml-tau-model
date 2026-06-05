@@ -456,7 +456,7 @@ class LinePlot:
         ax.set_ylim((self.ymin, self.ymax))
         if self.axhline_loc is not None:
             ax.axhline(self.axhline_loc, ls="--", color="k")
-        ax.grid()
+        # ax.grid()
         start, end = ax.get_ylim()
         ax.yaxis.set_ticks(np.linspace(start, end, self.nticks))
         self._set_y_formatter(start, end, axis=ax)

@@ -16,6 +16,30 @@ hep.style.use(hep.styles.CMS)
 matplotlib.rcParams["axes.unicode_minus"] = False
 plt.rcParams["mathtext.fontset"] = "stix"
 
+RESULT_FIGSIZE = (10, 10)
+ROC_LEGEND_FONT_SIZE = 30
+ROC_MARKER_SIZE = 12
+ROC_MAX_MARKERS = 30
+
+
+def _roc_marker_indices(values, max_markers=ROC_MAX_MARKERS):
+    values = np.asarray(values)
+    if len(values) <= max_markers:
+        return 1
+    valid_indices = np.flatnonzero(np.isfinite(values))
+    if len(valid_indices) <= max_markers:
+        return valid_indices
+    target_values = np.linspace(
+        np.nanmin(values[valid_indices]),
+        np.nanmax(values[valid_indices]),
+        max_markers,
+    )
+    marker_indices = [
+        valid_indices[np.argmin(np.abs(values[valid_indices] - target_value))]
+        for target_value in target_values
+    ]
+    return np.unique(marker_indices)
+
 
 class TaggerEvaluator:
     def __init__(
@@ -166,7 +190,7 @@ class TaggerEvaluator:
         eff_var_denom = var_values[self.eff_denominator_mask]
         eff_var_num = var_values[medium_wp_mask * self.eff_numerator_mask]
         bin_edges = np.linspace(
-            min(eff_var_denom), max(eff_var_denom), metric.n_bins + 1
+            metric.x_range[0], metric.x_range[1], metric.n_bins + 1
         )
         denom_hist = Histogram(eff_var_denom, bin_edges, "denominator")
         num_hist = Histogram(eff_var_num, bin_edges, "numerator")
@@ -186,7 +210,7 @@ class TaggerEvaluator:
         fake_var_denom = var_values[self.fake_denominator_mask]
         fake_var_num = var_values[medium_wp_mask * self.fake_numerator_mask]
         bin_edges = np.linspace(
-            min(fake_var_denom), max(fake_var_denom), metric.n_bins + 1
+            metric.x_range[0], metric.x_range[1], metric.n_bins + 1
         )
         denom_hist = Histogram(fake_var_denom, bin_edges, "denominator")
         num_hist = Histogram(fake_var_num, bin_edges, "numerator")
@@ -205,7 +229,7 @@ class ROCPlot:
         self.cfg = cfg
 
     def plot(self):
-        fig, ax = plt.subplots(figsize=(10, 10))
+        fig, ax = plt.subplots(figsize=RESULT_FIGSIZE)
         ax.set_ylabel(r"$P_{misid}$", fontsize=30)
         ax.set_xlabel(r"$\varepsilon_{\tau}$", fontsize=30)
         ax.tick_params(axis="x", labelsize=30)
@@ -214,7 +238,7 @@ class ROCPlot:
         ax.set_xlim((0, 1))
         ax.xaxis.set_major_locator(ticker.MultipleLocator(0.2))
         ax.set_yscale("log")
-        plt.grid()
+        # plt.grid()
         return fig, ax
 
     def add_line(self, evaluator):
@@ -224,10 +248,11 @@ class ROCPlot:
             color=self.cfg.metrics.ALGORITHM_PLOT_STYLES[evaluator.algorithm].color,
             marker=self.cfg.metrics.ALGORITHM_PLOT_STYLES[evaluator.algorithm].marker,
             label=self.cfg.metrics.ALGORITHM_PLOT_STYLES[evaluator.algorithm].name,
-            ms=15,
+            ms=ROC_MARKER_SIZE,
+            markevery=_roc_marker_indices(evaluator.efficiencies),
             ls="",
         )
-        self.ax.legend(prop={"size": 30})
+        self.ax.legend(loc="upper left", prop={"size": ROC_LEGEND_FONT_SIZE})
 
     def save(self, output_path):
         self.fig.tight_layout(pad=1.5)
@@ -257,6 +282,7 @@ class FakeRatePlot:
 
     def plot(self):
         fig, ax = plt.subplots(figsize=(10, 10))
+        ax.set_xlim(tuple(self.cfg.metrics.tagging.metrics[self.metric].x_range))
         ax.xaxis.set_major_locator(
             ticker.MultipleLocator(
                 self.cfg.metrics.tagging.metrics[self.metric].x_maj_tick_spacing
@@ -277,7 +303,7 @@ class FakeRatePlot:
         ax.set_ylim(ylim)
         ax.tick_params(axis="x", labelsize=30)
         ax.tick_params(axis="y", labelsize=30)
-        plt.grid()
+        # plt.grid()
         return fig, ax
 
     def save(self, output_path):
@@ -308,6 +334,7 @@ class EfficiencyPlot:
 
     def plot(self):
         fig, ax = plt.subplots(figsize=(10, 10))
+        ax.set_xlim(tuple(self.cfg.metrics.tagging.metrics[self.metric].x_range))
         ax.xaxis.set_major_locator(
             ticker.MultipleLocator(
                 self.cfg.metrics.tagging.metrics[self.metric].x_maj_tick_spacing
@@ -329,7 +356,7 @@ class EfficiencyPlot:
         ax.set_ylim(tuple(ylim))
         ax.tick_params(axis="x", labelsize=30)
         ax.tick_params(axis="y", labelsize=30)
-        plt.grid()
+        # plt.grid()
         return fig, ax
 
     def save(self, output_path):

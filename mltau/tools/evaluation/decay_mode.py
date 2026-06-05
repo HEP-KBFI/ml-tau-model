@@ -429,7 +429,7 @@ class DecayModeComparisonPlot:
                 fontsize=12,
             )
 
-    def add_line(self, evaluator, offset):
+    def add_line(self, evaluator, offset, annotation_offset=(-18, -4)):
         location = np.arange(len(self.decay_modes.keys()) + 1) + offset
         overall_score = self._calculate_overall_performance(evaluator)
         metric_values = list(evaluator.class_performances[self.metric]) + [
@@ -443,11 +443,7 @@ class DecayModeComparisonPlot:
             marker=self.cfg.metrics.ALGORITHM_PLOT_STYLES[evaluator.algorithm].marker,
             s=100,
         )
-        self._annotate_points(
-            location,
-            metric_values,
-            (-18, -4),
-        )
+        self._annotate_points(location, metric_values, annotation_offset)
         self.ax.legend(
             loc="lower left",
             shadow=True,
@@ -478,6 +474,7 @@ def get_offsets(n: int):
     offsets = [left_most_bin + (i * delta_offset) for i in range(n)]
     return offsets
 
+annotation_offsets = [(0, 9), (0, -18)]
 
 class DecayModeMultiEvaluator:
     def __init__(self, output_dir: str, cfg: DictConfig, sample: str):
@@ -496,7 +493,8 @@ class DecayModeMultiEvaluator:
         for i, evaluator in enumerate(evaluators):
             self.cms.append(ConfusionMatrix(evaluator=evaluator))
             self.dmrps.append(DecayModeROCPlot(evaluator=evaluator))
-            self.dmcp.add_line(evaluator=evaluator, offset=offsets[i])
+            # self.dmcp.add_line(evaluator=evaluator, offset=offsets[i])
+            self.dmcp.add_line(evaluator=evaluator, offset=offsets[i], annotation_offset=annotation_offsets[i % len(annotation_offsets)])
 
     def save(self):
         for drmp in self.dmrps:

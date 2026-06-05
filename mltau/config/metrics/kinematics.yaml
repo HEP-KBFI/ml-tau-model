@@ -5,20 +5,20 @@ kinematics:
             data_dir: ${kinematics.base_dir}
     pt:
         bin_edges:
-            zh: [5, 10, 15, 20, 25, 30, 35, 40, 45, 50]
-            z: [5, 10, 15, 20, 25, 30, 35, 40, 45, 50]
-            all: [5, 10, 15, 20, 25, 30, 35, 40, 45, 50]
+            zh: [5, 10, 15, 20, 25, 30, 35, 40, 45]
+            z: [5, 10, 15, 20, 25, 30, 35, 40, 45]
+            all: [5, 10, 15, 20, 25, 30, 35, 40, 45]
         resolution_plot:
             ylabel: "$p_T^{vis}\\ resol.\\ (q_{75} - q_{25})/q_{50}$"
             ylim: [0, 0.06]
-            xlabel: "$p_T^{gen-vis}$"
+            xlabel: "$p_T^{gen-vis}$ [GeV]"
             xscale: "linear"
             yscale: "linear"
             nticks: 7
         response_plot:
             ylabel: "$p_T^{vis}\\ scale\\ (q_{50})$"
             ylim:  [0.90, 1.1]
-            xlabel: "$p_T^{gen-vis}$"
+            xlabel: "$p_T^{gen-vis}$ [GeV]"
             xscale: "linear"
             yscale: "linear"
             nticks: 3

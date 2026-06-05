@@ -15,6 +15,25 @@ from mltau.tools.evaluation.histogram import Histogram
 
 plt.rcParams["mathtext.fontset"] = "stix"
 
+RESULT_FIGSIZE = (10, 10)
+RESULT_SUBPLOT_ADJUST = {"left": 0.16, "bottom": 0.14, "right": 0.96, "top": 0.96}
+STACK_SUBPLOT_HSPACE = 0
+STACK_YLIM_LOG_PADDING = 0.30
+STACK_AXIS_LABEL_SIZE = 30
+STACK_TICK_LABEL_SIZE = 30
+STACK_Y_TICK_LABEL_X = -0.11
+ROC_LEGEND_FONT_SIZE = 30
+ROC_MARKER_SIZE = 12
+ROC_MAX_MARKERS = 45
+STACK_LEGEND_FONT_SIZE = ROC_LEGEND_FONT_SIZE
+
+
+def _sparse_marker_step(values, max_markers=ROC_MAX_MARKERS):
+    values = np.asarray(values)
+    if len(values) <= max_markers:
+        return 1
+    return int(np.ceil(len(values) / max_markers))
+
 
 def _lighten_color(color, amount=0.55):
     rgb = np.array(mcolors.to_rgb(color))
@@ -32,6 +51,12 @@ def _get_charge_colors(cfg, algorithm):
 
 def _get_charge_label(cfg, algorithm):
     return cfg.metrics.ALGORITHM_PLOT_STYLES[algorithm].name
+
+
+def _get_metric_plot_range(metric_cfg):
+    if "x_plot_range" in metric_cfg:
+        return tuple(metric_cfg.x_plot_range)
+    return tuple(metric_cfg.x_range)
 
 
 class BaseChargeIdEvaluator:
@@ -212,6 +237,66 @@ class BaseChargeIdEvaluator:
         _, neg, _, _ = charge_fake["negative"]
         return x, np.asarray(pos), np.asarray(neg)
 
+    def compute_combined_roc(self):
+        """Charge-combined ROC points using denominator-weighted averages."""
+        eff_pos = np.asarray(self.efficiencies["positive"], dtype=float)
+        eff_neg = np.asarray(self.efficiencies["negative"], dtype=float)
+        fake_pos = np.asarray(self.fakerates["positive"], dtype=float)
+        fake_neg = np.asarray(self.fakerates["negative"], dtype=float)
+
+        eff_pos_den = np.sum(self.eff_denominator_masks["positive"])
+        eff_neg_den = np.sum(self.eff_denominator_masks["negative"])
+        fake_pos_den = np.sum(self.fake_denominator_masks["positive"])
+        fake_neg_den = np.sum(self.fake_denominator_masks["negative"])
+
+        efficiencies = np.divide(
+            eff_pos * eff_pos_den + eff_neg * eff_neg_den,
+            eff_pos_den + eff_neg_den,
+            out=np.full_like(eff_pos, np.nan, dtype=float),
+            where=(eff_pos_den + eff_neg_den) > 0,
+        )
+        fakerates = np.divide(
+            fake_pos * fake_pos_den + fake_neg * fake_neg_den,
+            fake_pos_den + fake_neg_den,
+            out=np.full_like(fake_pos, np.nan, dtype=float),
+            where=(fake_pos_den + fake_neg_den) > 0,
+        )
+        return efficiencies, fakerates
+
+    def compute_combined_binned_fake_rates_for_target_eff(
+        self, metric: str, target_eff: float = 0.8
+    ):
+        """Charge-combined binned fake rate at the evaluator's working point.
+
+        For hard-label evaluators there is only one operating point, so
+        ``target_eff`` is intentionally ignored.
+        """
+        values = self._metric_values(metric)
+        metric_cfg = self.cfg.metrics.charge.metrics[metric]
+        bin_edges = np.linspace(
+            metric_cfg.x_range[0], metric_cfg.x_range[1], metric_cfg.n_bins + 1
+        )
+        centers = 0.5 * (bin_edges[:-1] + bin_edges[1:])
+
+        pred_charge_pos = self._get_wp_mask("positive")
+        pred_charge_neg = self._get_wp_mask("negative")
+        base_mask = self._base_mask()
+        pos_truth = self.true_positive_charge_mask & base_mask
+        neg_truth = self.true_negative_charge_mask & base_mask
+
+        fake_rates = []
+        for left, right in zip(bin_edges[:-1], bin_edges[1:]):
+            metric_mask = (values >= left) & (values < right)
+            pos_sel = metric_mask & pos_truth
+            neg_sel = metric_mask & neg_truth
+            numerator = np.sum(pred_charge_neg[pos_sel]) + np.sum(
+                pred_charge_pos[neg_sel]
+            )
+            denominator = np.sum(pos_sel) + np.sum(neg_sel)
+            fake_rates.append(numerator / denominator if denominator > 0 else np.nan)
+
+        return centers, np.asarray(fake_rates)
+
 
 class ChargeIdEvaluator(BaseChargeIdEvaluator):
     """Evaluates charge ID performance for continuous probability scores."""
@@ -290,6 +375,17 @@ class ChargeIdEvaluator(BaseChargeIdEvaluator):
         clipped_eff = np.clip(target_eff, eff_unique[0], eff_unique[-1])
         threshold = float(np.interp(clipped_eff, eff_unique, thr_unique))
         return threshold if which == "positive" else float(1.0 - threshold)
+
+    def choose_threshold_for_target_eff(self, target_eff: float = 0.8) -> float:
+        """Symmetric score threshold closest to a charge-combined efficiency."""
+        efficiencies, _ = self.compute_combined_roc()
+        efficiencies = np.asarray(efficiencies, dtype=float)
+        mask = np.isfinite(efficiencies)
+        if not np.any(mask):
+            raise RuntimeError("No finite ROC points found for threshold selection")
+        valid_indices = np.flatnonzero(mask)
+        idx = valid_indices[np.argmin(np.abs(efficiencies[mask] - target_eff))]
+        return float(self.tagging_cuts[idx])
 
     def _calculate_eff_fake(self, eff_fake: str = "eff"):
         _eff_fake = {"positive": [], "negative": []}
@@ -412,6 +508,36 @@ class ChargeIdEvaluator(BaseChargeIdEvaluator):
             )
 
         return centers, np.asarray(eff_pos), np.asarray(eff_neg)
+
+    def compute_combined_binned_fake_rates_for_target_eff(
+        self, metric: str, target_eff: float = 0.8
+    ):
+        values = self._metric_values(metric)
+        metric_cfg = self.cfg.metrics.charge.metrics[metric]
+        bin_edges = np.linspace(
+            metric_cfg.x_range[0], metric_cfg.x_range[1], metric_cfg.n_bins + 1
+        )
+        centers = 0.5 * (bin_edges[:-1] + bin_edges[1:])
+        threshold = self.choose_threshold_for_target_eff(target_eff)
+
+        pred_charge_pos = self.predicted >= threshold
+        pred_charge_neg = self.predicted <= (1.0 - threshold)
+        base_mask = self._base_mask()
+        pos_truth = self.true_positive_charge_mask & base_mask
+        neg_truth = self.true_negative_charge_mask & base_mask
+
+        fake_rates = []
+        for left, right in zip(bin_edges[:-1], bin_edges[1:]):
+            metric_mask = (values >= left) & (values < right)
+            pos_sel = metric_mask & pos_truth
+            neg_sel = metric_mask & neg_truth
+            numerator = np.sum(pred_charge_neg[pos_sel]) + np.sum(
+                pred_charge_pos[neg_sel]
+            )
+            denominator = np.sum(pos_sel) + np.sum(neg_sel)
+            fake_rates.append(numerator / denominator if denominator > 0 else np.nan)
+
+        return centers, np.asarray(fake_rates)
 
 
 class HardLabelChargeIdEvaluator(BaseChargeIdEvaluator):
@@ -560,13 +686,14 @@ class ChargeClassifierPlot:
 
 
 class ROCPlot:
-    def __init__(self, cfg):
+    def __init__(self, cfg, split_by_charge: bool = False):
         self.fig, self.ax = self.plot()
         self.cfg = cfg
         self.comparison_algos = []
+        self.split_by_charge = split_by_charge
 
     def plot(self):
-        fig, ax = plt.subplots(figsize=(10, 10))
+        fig, ax = plt.subplots(figsize=RESULT_FIGSIZE)
         ax.set_ylabel(r"$P_{misid}$", fontsize=30)
         ax.set_xlabel(r"$\varepsilon_{\tau}$", fontsize=30)
         ax.tick_params(axis="x", labelsize=30)
@@ -580,27 +707,43 @@ class ROCPlot:
     def add_line(self, evaluator):
         self.comparison_algos.append(evaluator.algorithm)
         pos_color, neg_color = _get_charge_colors(evaluator.cfg, evaluator.algorithm)
-        marker = evaluator.cfg.metrics.ALGORITHM_PLOT_STYLES[evaluator.algorithm].marker
+        style = evaluator.cfg.metrics.ALGORITHM_PLOT_STYLES[evaluator.algorithm]
+        marker = style.marker
         algorithm_label = _get_charge_label(evaluator.cfg, evaluator.algorithm)
-        # ML prediction curves
-        self.ax.plot(
-            evaluator.efficiencies["positive"],
-            evaluator.fakerates["positive"],
-            color=pos_color,
-            marker=marker,
-            label=None,
-            ms=8,
-            ls="",
-        )
-        self.ax.plot(
-            evaluator.efficiencies["negative"],
-            evaluator.fakerates["negative"],
-            color=neg_color,
-            marker=marker,
-            label=None,
-            ms=8,
-            ls="",
-        )
+        if self.split_by_charge:
+            # ML prediction curves
+            self.ax.plot(
+                evaluator.efficiencies["positive"],
+                evaluator.fakerates["positive"],
+                color=pos_color,
+                marker=marker,
+                label=None,
+                ms=ROC_MARKER_SIZE,
+                markevery=_sparse_marker_step(evaluator.efficiencies["positive"]),
+                ls="",
+            )
+            self.ax.plot(
+                evaluator.efficiencies["negative"],
+                evaluator.fakerates["negative"],
+                color=neg_color,
+                marker=marker,
+                label=None,
+                ms=ROC_MARKER_SIZE,
+                markevery=_sparse_marker_step(evaluator.efficiencies["negative"]),
+                ls="",
+            )
+        else:
+            efficiencies, fakerates = evaluator.compute_combined_roc()
+            self.ax.plot(
+                efficiencies,
+                fakerates,
+                color=pos_color,
+                marker=marker,
+                label=algorithm_label,
+                ms=ROC_MARKER_SIZE,
+                markevery=_sparse_marker_step(efficiencies),
+                ls="",
+            )
 
     # Create a custom legend for the ROC
     def finalize_legend(self):
@@ -618,14 +761,136 @@ class ROCPlot:
                     marker=style.marker,
                     linestyle="",
                     label=style.name,
-                    markersize=8,
+                    markersize=ROC_MARKER_SIZE,
                 )
             )
 
-        self.ax.legend(handles=handles, loc="upper left", prop={"size": 20})
+        self.ax.legend(
+            handles=handles, loc="upper left", prop={"size": ROC_LEGEND_FONT_SIZE}
+        )
 
     def save(self, output_path):
-        self.fig.tight_layout(pad=1.5)
+        self.fig.subplots_adjust(**RESULT_SUBPLOT_ADJUST)
+        self.fig.savefig(output_path, format="pdf")
+        plt.close("all")
+
+
+class TargetEfficiencyFakeRateStackPlot:
+    def __init__(self, cfg: DictConfig, metric: str, target_efficiencies):
+        self.cfg = cfg
+        self.metric = metric
+        self.target_efficiencies = list(target_efficiencies)
+        self._panel_y_values = [[] for _ in self.target_efficiencies]
+        self.fig, self.axes = self.plot()
+
+    def add_line(self, evaluator):
+        style = evaluator.cfg.metrics.ALGORITHM_PLOT_STYLES[evaluator.algorithm]
+        algorithm_label = _get_charge_label(evaluator.cfg, evaluator.algorithm)
+        color = style.color
+        marker = style.marker
+        linestyle = getattr(style, "ls", "solid")
+        linewidth = getattr(style, "lw", 2)
+        marker_size = getattr(style, "marker_size", 8)
+
+        for panel_idx, (ax, target_eff) in enumerate(
+            zip(self.axes, self.target_efficiencies)
+        ):
+            x, fakerates = evaluator.compute_combined_binned_fake_rates_for_target_eff(
+                self.metric, target_eff=target_eff
+            )
+            valid = np.isfinite(x) & np.isfinite(fakerates)
+            plotted_fakerates = np.asarray(fakerates)[valid]
+            self._panel_y_values[panel_idx].extend(plotted_fakerates)
+            ax.plot(
+                np.asarray(x)[valid],
+                plotted_fakerates,
+                color=color,
+                marker=marker,
+                linestyle=linestyle,
+                linewidth=linewidth,
+                markersize=marker_size,
+                label=algorithm_label,
+            )
+
+    def plot(self):
+        fig, axes = plt.subplots(
+            len(self.target_efficiencies),
+            1,
+            figsize=RESULT_FIGSIZE,
+            sharex=True,
+            gridspec_kw={"hspace": STACK_SUBPLOT_HSPACE},
+        )
+        if len(self.target_efficiencies) == 1:
+            axes = [axes]
+
+        locator = ticker.MultipleLocator(
+            self.cfg.metrics.charge.metrics[self.metric].x_maj_tick_spacing
+        )
+        xmin, xmax = _get_metric_plot_range(
+            self.cfg.metrics.charge.metrics[self.metric]
+        )
+
+        for ax, target_eff in zip(axes, self.target_efficiencies):
+            ax.xaxis.set_major_locator(locator)
+            ax.set_xlim(xmin, xmax)
+            ax.set_ylabel("")
+            ax.set_yscale(self.cfg.metrics.charge.performances.fakerate.yscale)
+            ax.tick_params(axis="x", labelsize=STACK_TICK_LABEL_SIZE)
+            ax.tick_params(axis="y", labelsize=STACK_TICK_LABEL_SIZE)
+            ax.text(
+                0.02,
+                0.92,
+                rf"$\varepsilon_\tau = {100 * target_eff:.0f}\%$",
+                transform=ax.transAxes,
+                ha="left",
+                va="top",
+                fontsize=20,
+            )
+
+        axes[-1].set_xlabel(
+            rf"{self.cfg.metrics.charge.performances.fakerate.xlabel[self.metric]}",
+            fontsize=STACK_AXIS_LABEL_SIZE,
+        )
+        axes[0].set_ylabel(
+            rf"{self.cfg.metrics.charge.performances.fakerate.ylabel}",
+            fontsize=STACK_AXIS_LABEL_SIZE,
+        )
+        fig.subplots_adjust(**RESULT_SUBPLOT_ADJUST, hspace=STACK_SUBPLOT_HSPACE)
+        return fig, axes
+
+    def finalize_legend(self):
+        # Legend intentionally disabled for the stacked target-efficiency fake-rate plot.
+        # self.axes[0].legend(
+        #     loc="upper left", frameon=False, prop={"size": STACK_LEGEND_FONT_SIZE}
+        # )
+        pass
+
+    def _set_auto_ylims(self):
+        for ax, y_values in zip(self.axes, self._panel_y_values):
+            y_values = np.asarray(y_values, dtype=float)
+            valid = y_values[np.isfinite(y_values) & (y_values > 0)]
+            if len(valid) == 0:
+                continue
+            ymin = 10 ** (
+                np.floor(np.log10(np.min(valid))) - STACK_YLIM_LOG_PADDING
+            )
+            ymax = 10 ** (
+                np.ceil(np.log10(np.max(valid))) + STACK_YLIM_LOG_PADDING
+            )
+            if ymin == ymax:
+                ymax *= 10
+            ax.set_ylim(ymin, ymax)
+
+    def _align_y_tick_labels(self):
+        for ax in self.axes:
+            for label in ax.get_yticklabels(which="major"):
+                label.set_horizontalalignment("left")
+                label.set_x(STACK_Y_TICK_LABEL_X)
+
+    def save(self, output_path):
+        self._set_auto_ylims()
+        self._align_y_tick_labels()
+        self.fig.subplots_adjust(**RESULT_SUBPLOT_ADJUST, hspace=STACK_SUBPLOT_HSPACE)
         self.fig.savefig(output_path, format="pdf")
         plt.close("all")
 
@@ -666,6 +931,9 @@ class EfficiencyPlot:
 
     def plot(self):
         fig, ax = plt.subplots(figsize=(10, 10))
+        ax.set_xlim(
+            _get_metric_plot_range(self.cfg.metrics.charge.metrics[self.metric])
+        )
         ax.xaxis.set_major_locator(
             ticker.MultipleLocator(
                 self.cfg.metrics.charge.metrics[self.metric].x_maj_tick_spacing
@@ -731,6 +999,9 @@ class FakeRatePlot:
 
     def plot(self):
         fig, ax = plt.subplots(figsize=(10, 10))
+        ax.set_xlim(
+            _get_metric_plot_range(self.cfg.metrics.charge.metrics[self.metric])
+        )
         ax.xaxis.set_major_locator(
             ticker.MultipleLocator(
                 self.cfg.metrics.charge.metrics[self.metric].x_maj_tick_spacing
@@ -842,7 +1113,9 @@ class AsymmetryPlot:
         ax.xaxis.set_major_locator(locator)
         ax_ratio.xaxis.set_major_locator(locator)
 
-        xmin, xmax = self.cfg.metrics.charge.metrics[self.metric].x_range
+        xmin, xmax = _get_metric_plot_range(
+            self.cfg.metrics.charge.metrics[self.metric]
+        )
         ax.set_xlim(xmin, xmax)
         ax_ratio.set_xlim(xmin, xmax)
 
@@ -966,9 +1239,15 @@ class ConfusionMatrixPlot:
 
 
 class ChargeMultiEvaluator:
-    def __init__(self, output_dir: str, cfg: DictConfig):
+    def __init__(
+        self,
+        output_dir: str,
+        cfg: DictConfig,
+        target_efficiencies=(0.99, 0.80, 0.70),
+    ):
         self.output_dir = output_dir
         self.cfg = cfg
+        self.target_efficiencies = list(target_efficiencies)
         os.makedirs(self.output_dir, exist_ok=True)
         self.metrics = list(self.cfg.metrics.charge.metrics.keys())
 
@@ -988,6 +1267,9 @@ class ChargeMultiEvaluator:
             for metric in self.metrics
         }
         self.roc_plot = ROCPlot(self.cfg)
+        self.pt_fakerate_target_efficiencies_plot = TargetEfficiencyFakeRateStackPlot(
+            self.cfg, "pt", self.target_efficiencies
+        )
         self.wp_values = {}
 
     def combine_results(self, evaluators: list):
@@ -995,12 +1277,14 @@ class ChargeMultiEvaluator:
             self.tagging_plots[evaluator.algorithm] = ChargeClassifierPlot()
             self.tagging_plots[evaluator.algorithm].add_line(evaluator, "test")
             self.roc_plot.add_line(evaluator)
+            self.pt_fakerate_target_efficiencies_plot.add_line(evaluator)
             for metric in self.metrics:
                 self.efficiency_plots[metric].add_line(evaluator)
                 self.fakerate_plots[metric].add_line(evaluator)
                 self.efficiency_asymmetry_plots[metric].add_line(evaluator)
                 self.fakerate_asymmetry_plots[metric].add_line(evaluator)
         self.roc_plot.finalize_legend()
+        self.pt_fakerate_target_efficiencies_plot.finalize_legend()
 
     def save(self):
         for metric in self.metrics:
@@ -1020,6 +1304,10 @@ class ChargeMultiEvaluator:
             self.efficiency_asymmetry_plots[metric].save(eff_asym_output_path)
         roc_output_path = os.path.join(self.output_dir, f"ROC.pdf")
         self.roc_plot.save(roc_output_path)
+        target_eff_fr_output_path = os.path.join(
+            self.output_dir, "pt_fakerates_target_efficiencies.pdf"
+        )
+        self.pt_fakerate_target_efficiencies_plot.save(target_eff_fr_output_path)
         for algorithm in self.tagging_plots.keys():
             cls_output_path = os.path.join(
                 self.output_dir, f"classifier_scores_{algorithm}.pdf"
