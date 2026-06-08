@@ -33,7 +33,7 @@ class ParTauModule(L.LightningModule):
         )
 
         # Initialize loss functions once to avoid memory allocation overhead
-        self.charge_loss = nn.BCEWithLogitsLoss(reduction="none")
+        self.charge_loss = nn.CrossEntropyLoss(reduction="none")
         self.tagging_loss = nn.CrossEntropyLoss(
             reduction="none", label_smoothing=0.1
         )  # background=0, signal=1; label_smoothing reduces overconfidence oscillations
@@ -309,7 +309,7 @@ class ParTauModule(L.LightningModule):
             if key == "is_tau":  # Two-class head; return signal probability (class 1)
                 pred_tensor = torch.softmax(logits_tensor, dim=-1)[:, 1]
             elif key == "charge":  # Binary classification head
-                pred_tensor = torch.sigmoid(logits_tensor)
+                pred_tensor = torch.softmax(logits_tensor, dim=-1)[:, 1]
             elif key == "decay_mode":  # Multiclass classification
                 pred_tensor = torch.softmax(logits_tensor, dim=-1)
             else:  # Regression (kinematics)

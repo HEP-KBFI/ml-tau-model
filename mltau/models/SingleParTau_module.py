@@ -151,21 +151,17 @@ class ParTauModule(L.LightningModule):
         target = targets[self.task]
 
         if self.task == "kinematics":
-            component_raw_loss = self.loss_fn(pred, target)
-            is_tau_mask = targets["is_tau"].bool()
-            masked = component_raw_loss[is_tau_mask]  # (N_tau, 5)
-            pred_tau = pred[is_tau_mask]
-            tgt_tau = target[is_tau_mask]
+            component_loss = self.loss_fn(pred, target)
             l_m = 0.2
-            log_pt_loss = masked[:, 0].mean()
-            deta_loss = masked[:, 1].mean()
+            log_pt_loss = component_loss[:, 0].mean()
+            deta_loss = component_loss[:, 1].mean()
             # Phi chord loss: 2D coupled gradient for (sin, cos) components
             phi_chord_loss = torch.sqrt(
-                (pred_tau[:, 2] - tgt_tau[:, 2]) ** 2
-                + (pred_tau[:, 3] - tgt_tau[:, 3]) ** 2
+                (pred[:, 2] - target[:, 2]) ** 2
+                + (pred[:, 3] - target[:, 3]) ** 2
                 + 1e-8
             ).mean()
-            log_m_loss = masked[:, 4].mean()
+            log_m_loss = component_loss[:, 4].mean()
             loss = (log_pt_loss + deta_loss + phi_chord_loss + l_m * log_m_loss) / (
                 3.0 + l_m
             )
@@ -187,9 +183,7 @@ class ParTauModule(L.LightningModule):
                 predictions["charge_logits"], targets["charge"].long()
             ).mean()
         else:  # "decay_mode" — only meaningful for signal taus
-            raw_loss = self.loss_fn(predictions["decay_mode_logits"], target)
-            is_tau_mask = targets["is_tau"].bool()
-            loss = raw_loss[is_tau_mask].mean()
+            loss = self.loss_fn(predictions["decay_mode_logits"], target).mean()
 
         return {"loss": loss, self._loss_key(): loss}
 
