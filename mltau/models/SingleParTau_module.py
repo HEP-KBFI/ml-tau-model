@@ -103,11 +103,6 @@ class ParTauModule(L.LightningModule):
             T_max = estimated_steps
             print(f"Using calculated T_max={T_max} from estimated_stepping_batches")
 
-        # lr_scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
-        #     optimizer,
-        #     T_max=T_max,
-        #     eta_min=self.cfg.training.lr * 0.01,
-        # )
         lr_scheduler = torch.optim.lr_scheduler.OneCycleLR(
             optimizer,
             max_lr=self.cfg.training.lr,

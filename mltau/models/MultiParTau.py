@@ -89,6 +89,7 @@ class ParTau(ParticleTransformer):
         # weights are independent so classification gradients cannot corrupt the
         # kinematics attention layers.
         self.cls_blocks_kinematics = copy.deepcopy(self.cls_blocks)
+        self.blocks_kinematics = copy.deepcopy(self.blocks)
         self.norm_kinematics = copy.deepcopy(self.norm)
 
         # Classification head for decay mode classification.
@@ -124,7 +125,7 @@ class ParTau(ParticleTransformer):
         )
         self.tau_charge_head = nn.Sequential(
             nn.Dropout(head_dropout),
-            nn.Linear(embed_dim, 1),
+            nn.Linear(embed_dim, 2),
         )
 
     @torch.jit.ignore
@@ -152,11 +153,12 @@ class ParTau(ParticleTransformer):
             cand_features_embed = self.embed(cand_features).masked_fill(
                 ~cand_mask.permute(2, 0, 1), 0
             )  # (P, N, C)
+
             # Keep a snapshot of the raw embedding before the shared backbone
             # transforms it.  The kinematics cls_blocks will attend to this instead
             # of the backbone output, so the regression pathway is never exposed to
             # the classification-biased representation learned by self.blocks.
-            cand_features_embed_raw = cand_features_embed  # same storage, no copy
+            cand_features_embed_kin = cand_features_embed  # same storage, no copy
 
             attn_mask = None
             if cand_kinematics_pxpypze is not None and self.pair_embed is not None:
@@ -184,14 +186,23 @@ class ParTau(ParticleTransformer):
                 )
             x_shared = self.norm(x_cls_shared.squeeze(0))  # (N, C)
 
-            # Kinematics pathway: attends to the PRE-backbone raw embedding so it
-            # is never exposed to the classification-biased backbone representation.
+            # Kinematics pathway:
             # The pair_embed attention bias (geometry) is passed through unchanged
             # so the kinematics blocks still see relative angles/distances.
-            x_cls_kin = self.cls_token_kinematics.expand(1, N, -1)  # (1, N, C)
+            for block in self.blocks_kinematics:
+                cand_features_embed_kin = block(
+                    cand_features_embed,
+                    x_cls=None,
+                    padding_mask=padding_mask,
+                    attn_mask=attn_mask,
+                )
+
+            # transform per-jet class tokens
+            N_kin = cand_features_embed.size(1)
+            x_cls_kin = self.cls_token_kinematics.expand(1, N_kin, -1)  # (1, N, C)
             for block in self.cls_blocks_kinematics:
                 x_cls_kin = block(
-                    cand_features_embed_raw, x_cls=x_cls_kin, padding_mask=padding_mask
+                    cand_features_embed_kin, x_cls=x_cls_kin, padding_mask=padding_mask
                 )
             x_kinematics = self.norm_kinematics(x_cls_kin.squeeze(0))  # (N, C)
 
@@ -203,9 +214,7 @@ class ParTau(ParticleTransformer):
                 "is_tau": self.tau_id_head(
                     x_shared
                 ),  # (N, 2) - raw logits (background=0, signal=1)
-                "charge": self.tau_charge_head(x_shared).squeeze(
-                    -1
-                ),  # (N,) - raw logits
+                "charge": self.tau_charge_head(x_shared),  # (N, 2) - raw logits
                 # Detach x_kinematics so DM gradients do not corrupt the kinematics
                 # regression token. The DM head still sees kinematic context
                 # (e.g. invariant mass) but cannot steer the kinematics token.

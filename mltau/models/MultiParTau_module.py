@@ -336,7 +336,7 @@ class ParTauModule(L.LightningModule):
         return predictions, inputs.target, inputs.weight
 
     def charge_loss_fn(self, predictions, targets):
-        return self.charge_loss(predictions, targets)
+        return self.charge_loss(predictions, targets.long())
 
     def tagging_loss_fn(self, predictions, targets):
         return self.tagging_loss(predictions, targets.long())
