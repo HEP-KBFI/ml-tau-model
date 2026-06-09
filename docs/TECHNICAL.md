@@ -17,24 +17,24 @@ Four task-specific CLS tokens independently attend to the shared backbone output
 
 | Head | Output | Activation | Architecture |
 |------|--------|------------|--------------|
-| `tau_id_head` | $P(\text{is tau})$ | Sigmoid | 1-layer FFN |
-| `tau_charge_head` | $P(\text{charge} = +1)$ | Sigmoid | 1-layer FFN |
+| `tau_id_head` | Background vs Signal logits (2 classes) | Softmax | 1-layer FFN |
+| `tau_charge_head` | Charge logit (positive score) | Sigmoid | 1-layer FFN |
 | `classification_head` | Decay mode probabilities (6 classes) | Softmax | 1-layer FFN |
-| `regression_head` | $[\log(p_T^\text{vis}/p_T^\text{jet}),\ \Delta\theta,\ \Delta\phi,\ \log(m_\text{vis}/m_\text{jet})]$ | None | 1-layer FFN |
+| `regression_head` | $[\log(p_T^\text{vis}/p_T^\text{jet}),\ \Delta\eta,\ \sin\Delta\phi,\ \cos\Delta\phi,\ \log(m_\text{vis}/m_\text{jet})]$ | None | 1-layer FFN |
 
 ### Training (PyTorch Lightning)
-- **Optimizer**: RAdam (`lr=1e-4`, `betas=(0.95, 0.999)`)
-- **LR Schedule**: CosineAnnealingLR (`T_max = 20000 × max_epochs`, `eta_min = lr × 0.01`)
+- **Optimizer**: AdamW (`lr=1e-3`, `weight_decay=1e-2`)
+- **LR Schedule**: OneCycleLR (max learning rate `1e-3`)
 - **Loss functions**:
-  - Tau ID: `SigmoidFocalLoss(α=0.25, γ=2.0)` — handles signal/background imbalance
-  - Charge: `SigmoidFocalLoss(γ=2.0)`
+  - Tau ID: `CrossEntropyLoss` (2-class) with label smoothing
+  - Charge: `BCEWithLogitsLoss`
   - Decay mode: `CrossEntropyLoss`
-  - Kinematics: `HuberLoss(δ=1.0)` over 4 regression targets
+  - Kinematics: `HuberLoss(δ=1.0)` over 5 regression targets
 - **Conditional gating**: Auxiliary losses (charge, decay mode, kinematics) are multiplied by the truth tau label, so only signal jets contribute to those tasks.
 
 ## Input Features
 
-13 features per candidate particle (following Table 2 of the ParT paper):
+17 features per candidate particle:
 
 | # | Feature | Description |
 |---|---------|-------------|
@@ -51,6 +51,10 @@ Four task-specific CLS tokens independently attend to the shared backbone output
 | 11 | `isPhoton` | \|PDG\| = 22 |
 | 12 | `isChargedHadron` | \|PDG\| = 211 (π±) |
 | 13 | `isNeutralHadron` | \|PDG\| = 130 (K⁰L) |
+| 14 | `cand_dz` | Longitudinal impact parameter $d_z$ |
+| 15 | `cand_dz_err` | Error on $d_z$ |
+| 16 | `cand_dxy` | Transverse impact parameter $d_{xy}$ |
+| 17 | `cand_dxy_err` | Error on $d_{xy}$ |
 
 A maximum of 20 candidates per jet are used (padded/clipped).
 
@@ -63,7 +67,7 @@ A maximum of 20 candidates per jet are used (padded/clipped).
 | 2 | 2, 3, 4 | 1-prong, ≥2 π⁰ |
 | 3 | 5, 10 | 3-prong, 0 π⁰ |
 | 4 | 6–9, 11–14 | 3-prong, ≥1 π⁰ |
-| 5 | 16 | Rare |
+| 5 | 15, 16, -1 | Rare / Other |
 
 Leptonic decay modes (15) and background (-1) are not considered for this classification. Background is tagged in a separate head.
 
@@ -72,7 +76,7 @@ Leptonic decay modes (15) and background (-1) are not considered for this classi
 - **Format**: Apache Parquet files, streamed with `awkward-array` using row-group chunking
 - **Dataset**: CLD detector simulation (key4hep framework), $e^+e^-$ collision events
 - **Split**: 70% train / 10% validation / 20% test
-- **Batch size**: 2048
+- **Batch size**: 12288
 
 ### Expected Parquet Fields
 
@@ -184,15 +188,20 @@ mltau/
   models/
     ParticleTransformer.py   # Base ParT implementation
     MultiParTau.py           # Multi-task extension with 4 output heads
-    ParTau_module.py         # PyTorch Lightning training module
+    MultiParTau_module.py    # Lightning module for multi-task ParTau
+    SingleParTau.py          # Single-task ParTau model
+    SingleParTau_module.py   # Lightning module for single-task ParTau
   scripts/
     train.py                 # Main training entry point
-    inference_postprocessor.py
+    run_inference.py         # Main inference entry point
+    HPS/                     # Baseline HPS processing scripts
   tools/
-    features.py              # Feature computation utilities
-    losses.py                # SigmoidFocalLoss and other loss functions
+    features.py              # Math and kinematic utilities
+    losses.py                # Unified TauLoss and FocalLoss implementations
     evaluation/              # Per-task evaluation logic
-    io/                      # Parquet dataloaders (ParT and OmniJet/ALEPH)
+    io/                      # Data loading and preprocessing logic
     logging/                 # TensorBoard metric loggers per task
-    optimizers/              # Lookahead optimizer wrapper
+    optimizers/              # Optimizer wrappers (e.g., Lookahead)
+```
+``
 ```

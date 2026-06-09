@@ -6,7 +6,7 @@ This repository contains the **ParTau** model — a multi-task [Particle Transfo
 
 - **Tau tagging** — whether the jet originates from a hadronic tau decay
 - **Decay mode classification** — 6-class HPS-aligned decay mode  
-- **Visible tau kinematics** — $p_T$ ratio, direction correction ($\Delta\theta$, $\Delta\phi$), and visible mass via regression
+- **Visible tau kinematics** — $p_T$ ratio, direction correction ($\Delta\eta$, $\Delta\phi$), and visible mass via regression
 - **Tau charge** — binary (+1 or −1) classification
 
 Tau leptons can decay both leptonically and hadronically, however only hadronic decays are targeted with this project.
@@ -72,7 +72,7 @@ For training in HPC environments with the frozen singularity image containing al
 sbatch train-gpu.sh
 
 # Custom configuration
-./run.sh python3 mltau/scripts/train.py training.lr=5e-4 training.max_epochs=200
+./run.sh python3 mltau/scripts/train.py training.lr=5e-4 training.trainer.max_epochs=200
 ```
 
 ### Running Inference
