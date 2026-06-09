@@ -11,16 +11,7 @@ training:
     tau_id: 1.0
     charge: 1.0
     decay_mode: 1.0
-    kinematics: 2.0  # higher weight → larger gradient magnitude → harder to cancel by PCGrad
-
-  kinematics_lr_multiplier: 3.0  # LR multiplier for regression_head + cls_token_kinematics only
-                                  # (was 10.0 — too aggressive, causes early plateau)
-
-  # Phase-2 kinematics fine-tuning: at this epoch the shared backbone and
-  # classification task pathways are frozen and only kinematics pathway 
-  # (token + blocks + head) continue training.
-  # Rule of thumb: set to ~60-70 % of max_epochs, after classification tasks plateau.
-  phase2_start_epoch: 30  # kinematics tends to plateau ~epoch 24; restart its LR here
+    kinematics: 2.0  # higher weight → larger gradient magnitude
 
   dataloader:
     batch_size: 12288

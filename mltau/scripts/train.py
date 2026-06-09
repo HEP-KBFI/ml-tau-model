@@ -12,111 +12,6 @@ from mltau.models import MultiParTau_module, SingleParTau_module
 from mltau.tools.evaluation import inference
 
 
-class KinematicsFinetuneCallback(Callback):
-    """
-    Two-phase training for MultiParTau:
-
-    Phase 1  — all parameters train normally.
-    Phase 2  — triggered when val_losses/loss has not improved for
-               `patience` epochs: freeze everything except regression_head,
-               reset the patience counter for kinematics-only fine-tuning.
-    Stop     — triggered when val_losses/kinematics_loss has not improved for
-               `patience` epochs while in phase 2.
-
-    Both the overall val loss AND the kinematics val loss are monitored so the
-    callback is robust to the overall loss stagnating for reasons unrelated to
-    kinematics.
-    """
-
-    def __init__(self, patience: int = 10):
-        super().__init__()
-        self.patience = patience
-        self.phase = 1
-        self.has_switched = False
-        self.best_val_loss = float("inf")
-        self.best_kin_loss = float("inf")
-        self.wait = 0
-
-    def _freeze_all_except_regression_head(self, model):
-        part = model.ParTau
-        # Freeze shared backbone
-        for module in [part.embed, part.pair_embed, part.blocks]:
-            if module is not None:
-                for p in module.parameters():
-                    p.requires_grad_(False)
-
-        # Freeze all task pathways except kinematics
-        task_pathways = [
-            (part.cls_token_tau_id, part.cls_blocks_tau_id, part.norm_tau_id, part.tau_id_head),
-            (part.cls_token_charge, part.cls_blocks_charge, part.norm_charge, part.tau_charge_head),
-            (part.cls_token_dm, part.cls_blocks_dm, part.norm_dm, part.classification_head),
-        ]
-        
-        for token, blocks, norm, head in task_pathways:
-            token.requires_grad_(False)
-            for module in [blocks, norm, head]:
-                for p in module.parameters():
-                    p.requires_grad_(False)
-
-        # Kinematics pathway (cls_token_kinematics, cls_blocks_kinematics, 
-        # norm_kinematics, and regression_head) stays requires_grad=True
-
-    def on_validation_epoch_end(self, trainer, pl_module):
-        if trainer.sanity_checking:
-            return
-
-        metrics = trainer.callback_metrics
-
-        if self.phase == 1:
-            val_loss = metrics.get("val_losses/loss", None)
-            if val_loss is None:
-                return
-            val_loss = val_loss.item()
-            if val_loss < self.best_val_loss:
-                self.best_val_loss = val_loss
-                self.wait = 0
-            else:
-                self.wait += 1
-                print(
-                    f"[Phase 1] No improvement for {self.wait}/{self.patience} epochs "
-                    f"(best={self.best_val_loss:.6f}, current={val_loss:.6f})"
-                )
-                if self.wait >= self.patience:
-                    if not self.has_switched:
-                        print(
-                            "[Phase 1 → Phase 2] Switching to kinematics-only fine-tuning."
-                        )
-                        self.phase = 2
-                        self.wait = 0
-                        self.best_kin_loss = float("inf")
-                        self._freeze_all_except_regression_head(pl_module)
-                        pl_module.reinitialize_optimizer_for_phase2()
-                        self.has_switched = True
-                    else:
-                        # This shouldn't normally be reached given the state change,
-                        # but ensures robustness.
-                        self.phase = 2
-                        self.wait = 0
-
-        elif self.phase == 2:
-            kin_loss = metrics.get("val_losses/kinematics_loss", None)
-            if kin_loss is None:
-                return
-            kin_loss = kin_loss.item()
-            if kin_loss < self.best_kin_loss:
-                self.best_kin_loss = kin_loss
-                self.wait = 0
-            else:
-                self.wait += 1
-                print(
-                    f"[Phase 2] Kinematics no improvement for {self.wait}/{self.patience} epochs "
-                    f"(best={self.best_kin_loss:.6f}, current={kin_loss:.6f})"
-                )
-                if self.wait >= self.patience:
-                    print("[Phase 2] Kinematics converged. Stopping training.")
-                    trainer.should_stop = True
-
-
 @hydra.main(config_path="../config", config_name="main", version_base=None)
 def train(cfg: DictConfig):
     datamodule = dl.ParTDataModule(cfg=cfg, debug_run=cfg.training.debug_run)
@@ -140,7 +35,7 @@ def train(cfg: DictConfig):
 
     # Configure callbacks
     callbacks = [
-        TQDMProgressBar(refresh_rate=100),  # Reduced refresh rate for CPU
+        TQDMProgressBar(refresh_rate=100),
         ModelCheckpoint(
             dirpath=models_dir,
             monitor="val_losses/loss",
@@ -150,8 +45,6 @@ def train(cfg: DictConfig):
             filename="ParT-model_best",
         ),
     ]
-    if model_name == "MultiParTau":
-        callbacks.append(KinematicsFinetuneCallback(patience=5))
 
     trainer = L.Trainer(
         max_epochs=cfg.training.trainer.max_epochs,
