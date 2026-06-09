@@ -38,6 +38,7 @@ class ParTau(ParticleTransformer):
         use_amp: bool = False,
         metric: str = "eta-phi",
         verbosity: int = 0,
+        share_cls_blocks: bool = True,
         **kwargs,
     ):
         # Don't pass num_classes to parent since we implement our own heads
@@ -67,6 +68,7 @@ class ParTau(ParticleTransformer):
         )
         self.for_inference = for_inference
         self.use_amp = use_amp
+        self.share_cls_blocks = share_cls_blocks
 
         # We will have a total of 4 heads: decay mode, kinematic, charge and tauID.
 
@@ -82,21 +84,22 @@ class ParTau(ParticleTransformer):
         trunc_normal_(self.cls_token_dm, std=0.02)
         trunc_normal_(self.cls_token_kinematics, std=0.02)
 
-        # Four separate CLS blocks (one per task) and their corresponding norms.
-        # We reuse the inherited self.cls_blocks and self.norm as templates.
-        self.cls_blocks_tau_id = copy.deepcopy(self.cls_blocks)
-        self.cls_blocks_charge = copy.deepcopy(self.cls_blocks)
-        self.cls_blocks_dm = copy.deepcopy(self.cls_blocks)
-        self.cls_blocks_kinematics = copy.deepcopy(self.cls_blocks)
+        if not self.share_cls_blocks:
+            # Four separate CLS blocks (one per task) and their corresponding norms.
+            # We reuse the inherited self.cls_blocks and self.norm as templates.
+            self.cls_blocks_tau_id = copy.deepcopy(self.cls_blocks)
+            self.cls_blocks_charge = copy.deepcopy(self.cls_blocks)
+            self.cls_blocks_dm = copy.deepcopy(self.cls_blocks)
+            self.cls_blocks_kinematics = copy.deepcopy(self.cls_blocks)
 
-        self.norm_tau_id = copy.deepcopy(self.norm)
-        self.norm_charge = copy.deepcopy(self.norm)
-        self.norm_dm = copy.deepcopy(self.norm)
-        self.norm_kinematics = copy.deepcopy(self.norm)
+            self.norm_tau_id = copy.deepcopy(self.norm)
+            self.norm_charge = copy.deepcopy(self.norm)
+            self.norm_dm = copy.deepcopy(self.norm)
+            self.norm_kinematics = copy.deepcopy(self.norm)
 
-        # Clean up inherited shared blocks as we now use task-specific ones.
-        del self.cls_blocks
-        del self.norm
+            # Clean up inherited shared blocks as we now use task-specific ones.
+            del self.cls_blocks
+            del self.norm
 
         # Simplified task-specific readout heads with a consistent 1-layer FFN architecture.
         # (Linear -> GELU -> Dropout -> Linear)
@@ -175,37 +178,53 @@ class ParTau(ParticleTransformer):
             # transform per-jet task tokens
             N = cand_features_embed.size(1)
 
+            # Use task-specific or shared blocks/norms
+            if self.share_cls_blocks:
+                cls_blocks_tau_id = (
+                    cls_blocks_charge
+                ) = cls_blocks_dm = cls_blocks_kinematics = self.cls_blocks
+                norm_tau_id = norm_charge = norm_dm = norm_kinematics = self.norm
+            else:
+                cls_blocks_tau_id = self.cls_blocks_tau_id
+                cls_blocks_charge = self.cls_blocks_charge
+                cls_blocks_dm = self.cls_blocks_dm
+                cls_blocks_kinematics = self.cls_blocks_kinematics
+                norm_tau_id = self.norm_tau_id
+                norm_charge = self.norm_charge
+                norm_dm = self.norm_dm
+                norm_kinematics = self.norm_kinematics
+
             # Tau ID pathway
             x_cls_tau_id = self.cls_token_tau_id.expand(1, N, -1)
-            for block in self.cls_blocks_tau_id:
+            for block in cls_blocks_tau_id:
                 x_cls_tau_id = block(
                     cand_features_embed, x_cls=x_cls_tau_id, padding_mask=padding_mask
                 )
-            x_tau_id = self.norm_tau_id(x_cls_tau_id.squeeze(0))
+            x_tau_id = norm_tau_id(x_cls_tau_id.squeeze(0))
 
             # Charge pathway
             x_cls_charge = self.cls_token_charge.expand(1, N, -1)
-            for block in self.cls_blocks_charge:
+            for block in cls_blocks_charge:
                 x_cls_charge = block(
                     cand_features_embed, x_cls=x_cls_charge, padding_mask=padding_mask
                 )
-            x_charge = self.norm_charge(x_cls_charge.squeeze(0))
+            x_charge = norm_charge(x_cls_charge.squeeze(0))
 
             # Decay Mode pathway
             x_cls_dm = self.cls_token_dm.expand(1, N, -1)
-            for block in self.cls_blocks_dm:
+            for block in cls_blocks_dm:
                 x_cls_dm = block(
                     cand_features_embed, x_cls=x_cls_dm, padding_mask=padding_mask
                 )
-            x_dm = self.norm_dm(x_cls_dm.squeeze(0))
+            x_dm = norm_dm(x_cls_dm.squeeze(0))
 
             # Kinematics pathway
             x_cls_kin = self.cls_token_kinematics.expand(1, N, -1)
-            for block in self.cls_blocks_kinematics:
+            for block in cls_blocks_kinematics:
                 x_cls_kin = block(
                     cand_features_embed, x_cls=x_cls_kin, padding_mask=padding_mask
                 )
-            x_kinematics = self.norm_kinematics(x_cls_kin.squeeze(0))
+            x_kinematics = norm_kinematics(x_cls_kin.squeeze(0))
 
             # Output raw logits - activations will be applied by loss functions or during inference
             output = {
