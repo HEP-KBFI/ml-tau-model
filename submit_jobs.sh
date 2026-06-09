@@ -17,28 +17,28 @@ echo "Current Git Revision: $GIT_REV"
 echo "Submitting SingleParTau jobs..."
 
 # 1. SingleParTau: Tau ID (Tagging)
-sbatch --job-name=tauid train-gpu.sh \
-    training.model.name=SingleParTau \
-    training.model.task=is_tau \
-    output_dir=outputs/${TAG}_single_tauid_${GIT_REV}
-
-# 2. SingleParTau: Charge ID
-sbatch --job-name=charge train-gpu.sh \
-    training.model.name=SingleParTau \
-    training.model.task=charge \
-    output_dir=outputs/${TAG}_single_charge_${GIT_REV}
-
-# 3. SingleParTau: Decay Mode Classification
-sbatch --job-name=decaymode train-gpu.sh \
-    training.model.name=SingleParTau \
-    training.model.task=decay_mode \
-    output_dir=outputs/${TAG}_single_decaymode_${GIT_REV}
-
-# 4. SingleParTau: Kinematics Regression
-sbatch --job-name=kinematics train-gpu.sh \
-    training.model.name=SingleParTau \
-    training.model.task=kinematics \
-    output_dir=outputs/${TAG}_single_kinematics_${GIT_REV}
+# sbatch --job-name=tauid train-gpu.sh \
+#     training.model.name=SingleParTau \
+#     training.model.task=is_tau \
+#     output_dir=outputs/${TAG}_single_tauid_${GIT_REV}
+# 
+# # 2. SingleParTau: Charge ID
+# sbatch --job-name=charge train-gpu.sh \
+#     training.model.name=SingleParTau \
+#     training.model.task=charge \
+#     output_dir=outputs/${TAG}_single_charge_${GIT_REV}
+# 
+# # 3. SingleParTau: Decay Mode Classification
+# sbatch --job-name=decaymode train-gpu.sh \
+#     training.model.name=SingleParTau \
+#     training.model.task=decay_mode \
+#     output_dir=outputs/${TAG}_single_decaymode_${GIT_REV}
+# 
+# # 4. SingleParTau: Kinematics Regression
+# sbatch --job-name=kinematics train-gpu.sh \
+#     training.model.name=SingleParTau \
+#     training.model.task=kinematics \
+#     output_dir=outputs/${TAG}_single_kinematics_${GIT_REV}
 
 echo "Submitting MultiParTau job..."
 
