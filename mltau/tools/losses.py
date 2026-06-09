@@ -97,7 +97,11 @@ class TauLoss(nn.Module):
 
     def compute_decay_mode_loss(self, predictions, targets, weights):
         """CrossEntropy loss for decay mode classification."""
-        loss = self.dm_loss_fn(predictions, targets.long())
+        # CrossEntropyLoss expects (N, C) float targets for probabilities or (N,) long targets for indices
+        if targets.ndim > 1:
+            loss = self.dm_loss_fn(predictions, targets.float())
+        else:
+            loss = self.dm_loss_fn(predictions, targets.long())
         return (loss * weights).mean()
 
     def _compute_kinematics_loss_per_sample(self, predictions, targets):
@@ -197,10 +201,17 @@ class TauLoss(nn.Module):
 
         if is_tau_mask.any():
             # 2. Decay Mode loss — signal only
-            dm_per_jet = self.dm_loss_fn(
-                predictions["decay_mode"][is_tau_mask],
-                targets["decay_mode"][is_tau_mask].long(),
-            )
+            dm_target = targets["decay_mode"][is_tau_mask]
+            if dm_target.ndim > 1:
+                dm_per_jet = self.dm_loss_fn(
+                    predictions["decay_mode"][is_tau_mask],
+                    dm_target.float(),
+                )
+            else:
+                dm_per_jet = self.dm_loss_fn(
+                    predictions["decay_mode"][is_tau_mask],
+                    dm_target.long(),
+                )
 
             # 3. Charge loss — signal only
             charge_targets = (targets["charge"][is_tau_mask] == 1).float()
