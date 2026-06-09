@@ -168,9 +168,9 @@ class ParTauModule(L.LightningModule):
                 "loss": loss,
                 self._loss_key(): loss,
                 "kinematics_log_pt_loss": components["log_pt"],
-                "kinematics_delta_eta_loss": components["deta"],
+                "kinematics_delta_eta_loss": components["delta_eta"],
                 "kinematics_phi_chord_loss": components["phi_chord"],
-                "kinematics_log_mass_loss": components["log_m"],
+                "kinematics_log_mass_loss": components["log_mass"],
             }
             return metrics
         elif self.task == "is_tau":

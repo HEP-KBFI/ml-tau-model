@@ -97,12 +97,12 @@ class ParTau(ParticleTransformer):
                 nn.Linear(head_hidden, 2),
             )
         elif self.task == "charge":
-            # Two-logit head to match the en-reg charge-classification setup
+            # Single-logit head for charge classification (+1 vs -1) using BCE loss.
             self.binary_head = nn.Sequential(
                 nn.Linear(embed_dim, head_hidden),
                 nn.GELU(),
                 nn.Dropout(head_dropout),
-                nn.Linear(head_hidden, 2),
+                nn.Linear(head_hidden, 1),
             )
         else:
             raise NotImplementedError(
