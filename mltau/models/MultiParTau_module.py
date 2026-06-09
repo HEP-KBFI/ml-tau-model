@@ -10,6 +10,7 @@ from mltau.tools import general as g
 from mltau.tools.io.general import BatchInputs
 
 from mltau.tools.logging import logger
+from mltau.tools.losses import TauLoss
 from mltau.models.MultiParTau import ParTau
 
 
@@ -32,13 +33,8 @@ class ParTauModule(L.LightningModule):
             metric="theta-phi",
         )
 
-        # Initialize loss functions once to avoid memory allocation overhead
-        self.charge_loss = nn.BCEWithLogitsLoss(reduction="none")
-        self.tagging_loss = nn.CrossEntropyLoss(
-            reduction="none", label_smoothing=0.1
-        )  # background=0, signal=1; label_smoothing reduces overconfidence oscillations
-        self.decay_mode_loss = nn.CrossEntropyLoss(reduction="none")
-        self.kinematics_loss = nn.HuberLoss(reduction="none", delta=1.0)
+        # Unified loss module handles all task-specific functions and weighting logic.
+        self.tau_loss = TauLoss(l_m=0.2, label_smoothing=0.1)
 
         self.num_tasks = 4
         # Disable automatic optimization so PCGrad can do per-task backward passes
@@ -281,142 +277,102 @@ class ParTauModule(L.LightningModule):
         )
         return predictions, inputs.target, inputs.weight
 
-    def charge_loss_fn(self, predictions, targets):
-        return self.charge_loss(predictions, targets)
-
-    def tagging_loss_fn(self, predictions, targets):
-        return self.tagging_loss(predictions, targets.long())
-
-    def decay_mode_loss_fn(self, predictions, targets):
-        return self.decay_mode_loss(predictions, targets)
-
-    def kinematics_loss_fn(self, predictions, targets, l_m: float = 0.2):
-        # Log-ratio terms: independent Huber in log space
-        log_pt_loss = self.kinematics_loss(predictions[:, 0], targets[:, 0])  # log pT
-        log_m_loss = self.kinematics_loss(predictions[:, 4], targets[:, 4])  # log mass
-
-        # Delta eta term
-        deta_loss = self.kinematics_loss(predictions[:, 1], targets[:, 1])  # delta eta
-
-        # Phi chord loss: treat (sin, cos) as a 2D unit-vector difference so that
-        # the gradient corrects the angular direction jointly rather than pushing
-        # sin and cos independently.  The chord distance equals 2|sin(Δφ/2)|.
-        phi_chord_loss = torch.sqrt(
-            (predictions[:, 2] - targets[:, 2]) ** 2
-            + (predictions[:, 3] - targets[:, 3]) ** 2
-            + 1e-8
-        )  # shape [N], differentiable everywhere
-
-        # 3 independent components + mass, normalise by sum of weights
-        return (log_pt_loss + deta_loss + phi_chord_loss + l_m * log_m_loss) / (
-            3.0 + l_m
-        )
-
     def _compute_per_task_losses(self, predictions, targets, sample_weights):
         """
         Return a [4] tensor [tag_loss, dm_loss, charge_loss, kin_loss] — each a
         sample-weighted scalar with a gradient graph attached (for GradNorm).
 
-        The three signal-only tasks (dm, charge, kin) require at least one tau jet
-        in the batch; if there are none they are returned as zero tensors so that
-        GradNorm can still run without crashing (their gradient norm will be 0 and
-        their target G_target will be pulled toward 0 as well).
+        Delegates to the unified TauLoss module.
         """
-        is_tau_mask = targets["is_tau"].bool()
-
-        # Tagging loss — all jets
-        tag_per_jet = self.tagging_loss_fn(predictions["is_tau"], targets["is_tau"])
-        tag_loss = (tag_per_jet * sample_weights).mean()
-
-        if not is_tau_mask.any():
-            zero = tag_loss.new_zeros(())
-            return torch.stack([tag_loss, zero, zero, zero])
-
-        tau_weights = sample_weights[is_tau_mask]
-
-        dm_loss = (
-            self.decay_mode_loss_fn(
-                predictions["decay_mode"][is_tau_mask],
-                targets["decay_mode"][is_tau_mask],
-            )
-            * tau_weights
-        ).mean()
-
-        charge_loss = (
-            self.charge_loss_fn(
-                predictions["charge"][is_tau_mask],
-                targets["charge"][is_tau_mask],
-            )
-            * tau_weights
-        ).mean()
-
-        kin_loss = (
-            self.kinematics_loss_fn(
-                predictions["kinematics"][is_tau_mask],
-                targets["kinematics"][is_tau_mask],
-            )
-            * tau_weights
-        ).mean()
-
-        return torch.stack([tag_loss, dm_loss, charge_loss, kin_loss])
+        return self.tau_loss.compute_multi_task_losses(
+            predictions, targets, sample_weights
+        )
 
     def calculate_metrics(
         self, targets, predictions, weights, w_kin=1, w_dm=1, w_tag=1, w_charge=1
     ):
         is_tau_mask = targets["is_tau"].bool()
 
-        # Per-jet losses — shape [N]
-        tau_id_loss_per_jet = self.tagging_loss_fn(
-            predictions["is_tau"], targets["is_tau"]
+        # 1. Tagging loss — all jets
+        tagging_loss = self.tau_loss.compute_tagging_loss(
+            predictions["is_tau"], targets["is_tau"], weights
         )
 
-        # Start combined per-jet loss with tagging term
-        combined_per_jet = w_tag * tau_id_loss_per_jet
+        # Start combined per-jet loss with tagging term (unweighted here as it's
+        # already averaged over samples in compute_tagging_loss).
+        # To get the combined loss correctly, we need the per-sample losses.
+        # However, for validation metrics we typically want the averaged values.
+        
+        # We re-calculate per-sample to get the exact 'loss' value as before.
+        tag_per_jet = self.tau_loss.tag_loss_fn(predictions["is_tau"], targets["is_tau"].long())
+        combined_per_jet = w_tag * tag_per_jet
 
         if not is_tau_mask.any():
             return {
-                "tau_id_loss": tau_id_loss_per_jet.mean(),
+                "tau_id_loss": tagging_loss,
                 "charge_loss": combined_per_jet.new_zeros(()),
                 "decay_mode_loss": combined_per_jet.new_zeros(()),
                 "kinematics_loss": combined_per_jet.new_zeros(()),
                 "loss": (combined_per_jet * weights).mean(),
             }
 
-        # Per-jet losses for signal-only heads — shape [N_signal]
-        dm_loss_per_jet = self.decay_mode_loss_fn(
-            predictions["decay_mode"][is_tau_mask], targets["decay_mode"][is_tau_mask]
+        tau_weights = weights[is_tau_mask]
+
+        # 2. Decay Mode loss — signal only
+        dm_loss = self.tau_loss.compute_decay_mode_loss(
+            predictions["decay_mode"][is_tau_mask],
+            targets["decay_mode"][is_tau_mask],
+            tau_weights,
         )
-        charge_loss_per_jet = self.charge_loss_fn(
-            predictions["charge"][is_tau_mask], targets["charge"][is_tau_mask]
-        )
-        kin_loss_per_jet = self.kinematics_loss_fn(
-            predictions["kinematics"][is_tau_mask], targets["kinematics"][is_tau_mask]
+        dm_per_jet = self.tau_loss.dm_loss_fn(
+            predictions["decay_mode"][is_tau_mask],
+            targets["decay_mode"][is_tau_mask].long(),
         )
 
-        # loss = torch.stack(
-        #     [
-        #         tau_id_loss_per_jet,
-        #         dm_loss_per_jet,
-        #         charge_loss_per_jet,
-        #         kin_loss_per_jet,
-        #     ]
-        # )
+        # 3. Charge loss — signal only
+        charge_loss = self.tau_loss.compute_charge_loss(
+            predictions["charge"][is_tau_mask],
+            targets["charge"][is_tau_mask],
+            tau_weights,
+        )
+        charge_per_jet = self.tau_loss.charge_loss_fn(
+            predictions["charge"][is_tau_mask],
+            targets["charge"][is_tau_mask].float(),
+        )
+
+        # 4. Kinematics loss — signal only
+        kin_loss, _ = self.tau_loss.compute_kinematics_loss(
+            predictions["kinematics"][is_tau_mask],
+            targets["kinematics"][is_tau_mask],
+            tau_weights,
+        )
+        # Re-calculate per-sample for combined loss
+        pred_tau = predictions["kinematics"][is_tau_mask]
+        tgt_tau = targets["kinematics"][is_tau_mask]
+        kin_per_jet = (
+            self.tau_loss.kin_loss_fn(pred_tau[:, 0], tgt_tau[:, 0])
+            + self.tau_loss.kin_loss_fn(pred_tau[:, 1], tgt_tau[:, 1])
+            + torch.sqrt(
+                (pred_tau[:, 2] - tgt_tau[:, 2]) ** 2
+                + (pred_tau[:, 3] - tgt_tau[:, 3]) ** 2
+                + 1e-8
+            )
+            + self.tau_loss.l_m * self.tau_loss.kin_loss_fn(pred_tau[:, 4], tgt_tau[:, 4])
+        ) / (3.0 + self.tau_loss.l_m)
 
         # Add signal-only terms into combined per-jet loss
         combined_per_jet[is_tau_mask] += (
-            w_dm * dm_loss_per_jet
-            + w_charge * charge_loss_per_jet
-            + w_kin * kin_loss_per_jet
+            w_dm * dm_per_jet + w_charge * charge_per_jet + w_kin * kin_per_jet
         )
 
-        # Multiply each jet's combined loss by its cls_weight, then average
+        # Multiply each jet's combined loss by its weight, then average
         loss = (combined_per_jet * weights).mean()
 
         return {
-            "tau_id_loss": tau_id_loss_per_jet.mean(),
-            "charge_loss": charge_loss_per_jet.mean(),
-            "decay_mode_loss": dm_loss_per_jet.mean(),
-            "kinematics_loss": kin_loss_per_jet.mean(),
+            "tau_id_loss": tagging_loss,
+            "charge_loss": charge_loss,
+            "decay_mode_loss": dm_loss,
+            "kinematics_loss": kin_loss,
             "loss": loss,
         }
 

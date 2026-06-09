@@ -166,8 +166,8 @@ class ParTau(ParticleTransformer):
                 # Return 2-class logits; signal is class 1.
                 output = (self.binary_head(x_cls),)  # (N, 2)
             elif self.task == "charge":
-                # Two-class logits for charge classification
-                output = (self.binary_head(x_cls),)  # (N, 2)
+                # Single-logit output for charge classification
+                output = (self.binary_head(x_cls).squeeze(-1),)  # (N,)
             else:
                 raise NotImplementedError(
                     f"This model is not suitable for the chosen task of {self.task}"
