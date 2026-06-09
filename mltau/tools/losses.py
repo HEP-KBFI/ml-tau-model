@@ -147,7 +147,7 @@ class TauLoss(nn.Module):
 
         if not is_tau_mask.any():
             zero = tag_loss.new_zeros(())
-            return torch.stack([tag_loss, zero, zero, zero])
+            return torch.stack([tag_loss, zero, zero, zero]), {}
 
         tau_weights = sample_weights[is_tau_mask]
 
@@ -166,13 +166,13 @@ class TauLoss(nn.Module):
         )
 
         # 4. Kinematics loss — signal only
-        kin_loss, _ = self.compute_kinematics_loss(
+        kin_loss, kin_components = self.compute_kinematics_loss(
             predictions_dict["kinematics"][is_tau_mask],
             targets_dict["kinematics"][is_tau_mask],
             tau_weights,
         )
 
-        return torch.stack([tag_loss, dm_loss, charge_loss, kin_loss])
+        return torch.stack([tag_loss, dm_loss, charge_loss, kin_loss]), kin_components
 
     def compute_combined_loss(
         self,

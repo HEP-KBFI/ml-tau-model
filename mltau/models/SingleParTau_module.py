@@ -35,7 +35,8 @@ class ParTauModule(L.LightningModule):
         self.tau_loss = TauLoss(l_m=0.2, label_smoothing=0.1)
 
     def _loss_key(self):
-        return f"{self.task}_loss"
+        task_name = "tau_id" if self.task == "is_tau" else self.task
+        return f"{task_name}_loss"
 
     def _make_accumulator(self):
         # Original aggregate-only accumulator kept for reference.

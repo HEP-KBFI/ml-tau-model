@@ -46,7 +46,7 @@ class ParTauModule(L.LightningModule):
         predictions, targets, sample_weights = self.forward(batch)
 
         # Per-task scalar losses: [tag, dm, charge, kin]
-        task_losses = self._compute_per_task_losses(
+        task_losses, kin_components = self._compute_per_task_losses(
             predictions, targets, sample_weights
         )
 
@@ -118,6 +118,9 @@ class ParTauModule(L.LightningModule):
                 "charge_loss": task_losses[2],
                 "kinematics_loss": task_losses[3],
             }
+            for k, v in kin_components.items():
+                loss_dict[f"kinematics_{k}_loss"] = v
+
         for key, value in loss_dict.items():
             self.training_loss_accumulator[key].append(value.detach())
 
@@ -279,10 +282,8 @@ class ParTauModule(L.LightningModule):
 
     def _compute_per_task_losses(self, predictions, targets, sample_weights):
         """
-        Return a [4] tensor [tag_loss, dm_loss, charge_loss, kin_loss] — each a
-        sample-weighted scalar with a gradient graph attached (for GradNorm).
-
-        Delegates to the unified TauLoss module.
+        Return (task_losses, kin_components).
+        task_losses: [4] tensor [tag_loss, dm_loss, charge_loss, kin_loss]
         """
         return self.tau_loss.compute_multi_task_losses(
             predictions, targets, sample_weights
@@ -291,65 +292,24 @@ class ParTauModule(L.LightningModule):
     def calculate_metrics(
         self, targets, predictions, weights, w_kin=1, w_dm=1, w_tag=1, w_charge=1
     ):
-        is_tau_mask = targets["is_tau"].bool()
-
-        # 1. Tagging loss — all jets
-        tagging_loss = self.tau_loss.compute_tagging_loss(
-            predictions["is_tau"], targets["is_tau"], weights
+        task_losses, kin_components = self._compute_per_task_losses(
+            predictions, targets, weights
         )
 
-        # 2. Task-specific losses (signal only)
-        if not is_tau_mask.any():
-            zero = tagging_loss.new_zeros(())
-            return {
-                "tau_id_loss": tagging_loss,
-                "charge_loss": zero,
-                "decay_mode_loss": zero,
-                "kinematics_loss": zero,
-                "loss": w_tag * tagging_loss,
-            }
+        # Aggregation: Sum of Averages (consistent with training and SingleParTau)
+        combined_loss = task_losses.sum()
 
-        tau_weights = weights[is_tau_mask]
-
-        # 2. Decay Mode loss
-        dm_loss = self.tau_loss.compute_decay_mode_loss(
-            predictions["decay_mode"][is_tau_mask],
-            targets["decay_mode"][is_tau_mask],
-            tau_weights,
-        )
-
-        # 3. Charge loss
-        charge_loss = self.tau_loss.compute_charge_loss(
-            predictions["charge"][is_tau_mask],
-            targets["charge"][is_tau_mask],
-            tau_weights,
-        )
-
-        # 4. Kinematics loss
-        kin_loss, _ = self.tau_loss.compute_kinematics_loss(
-            predictions["kinematics"][is_tau_mask],
-            targets["kinematics"][is_tau_mask],
-            tau_weights,
-        )
-
-        # Multiply each jet's combined loss by its weight, then average
-        loss = self.tau_loss.compute_combined_loss(
-            predictions,
-            targets,
-            weights,
-            w_tag=w_tag,
-            w_dm=w_dm,
-            w_charge=w_charge,
-            w_kin=w_kin,
-        )
-
-        return {
-            "tau_id_loss": tagging_loss,
-            "charge_loss": charge_loss,
-            "decay_mode_loss": dm_loss,
-            "kinematics_loss": kin_loss,
-            "loss": loss,
+        metrics = {
+            "loss": combined_loss,
+            "tau_id_loss": task_losses[0],
+            "decay_mode_loss": task_losses[1],
+            "charge_loss": task_losses[2],
+            "kinematics_loss": task_losses[3],
         }
+        for k, v in kin_components.items():
+            metrics[f"kinematics_{k}_loss"] = v
+
+        return metrics
 
     def validation_step(self, batch, _batch_idx):
         predictions, targets, weights = self.forward(batch)
@@ -375,20 +335,16 @@ class ParTauModule(L.LightningModule):
     def on_validation_epoch_start(self):
         """Initialize storage for validation outputs."""
         self.validation_outputs = []
-        self.validation_loss_accumulator = {
-            key: []
-            for key in [
-                "loss",
-                "tau_id_loss",
-                "charge_loss",
-                "decay_mode_loss",
-                "kinematics_loss",
-                "tau_id_loss_weighted",
-                "charge_loss_weighted",
-                "decay_mode_loss_weighted",
-                "kinematics_loss_weighted",
+        keys = ["loss", "tau_id_loss", "charge_loss", "decay_mode_loss", "kinematics_loss"]
+        keys.extend(
+            [
+                "kinematics_log_pt_loss",
+                "kinematics_delta_eta_loss",
+                "kinematics_phi_chord_loss",
+                "kinematics_log_mass_loss",
             ]
-        }
+        )
+        self.validation_loss_accumulator = {key: [] for key in keys}
 
     def _log_at_epoch_end(self, dataset: str):
         if dataset == "val" and self.trainer.sanity_checking:
@@ -497,20 +453,16 @@ class ParTauModule(L.LightningModule):
         self._log_at_epoch_end(dataset="val")
 
     def on_train_epoch_start(self):
-        self.training_loss_accumulator = {
-            key: []
-            for key in [
-                "loss",
-                "tau_id_loss",
-                "charge_loss",
-                "decay_mode_loss",
-                "kinematics_loss",
-                "tau_id_loss_weighted",
-                "charge_loss_weighted",
-                "decay_mode_loss_weighted",
-                "kinematics_loss_weighted",
+        keys = ["loss", "tau_id_loss", "charge_loss", "decay_mode_loss", "kinematics_loss"]
+        keys.extend(
+            [
+                "kinematics_log_pt_loss",
+                "kinematics_delta_eta_loss",
+                "kinematics_phi_chord_loss",
+                "kinematics_log_mass_loss",
             ]
-        }
+        )
+        self.training_loss_accumulator = {key: [] for key in keys}
 
     def on_train_epoch_end(self):
         epoch_metrics = {
