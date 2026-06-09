@@ -43,6 +43,7 @@ class ParTauModule(L.LightningModule):
         self.num_tasks = 4
         # Disable automatic optimization so PCGrad can do per-task backward passes
         self.automatic_optimization = False
+        self.phase2_initialized = False
 
     def training_step(self, batch, batch_idx):
         net_opt = self.optimizers()
@@ -182,12 +183,9 @@ class ParTauModule(L.LightningModule):
     def reinitialize_optimizer_for_phase2(self):
         """Freeze the shared backbone; fine-tune kinematics params + DM head.
 
-        The DM head must remain trainable because it uses x_kinematics as input
-        (via torch.cat([x_shared, x_kinematics.detach()])).  As kinematics
-        continues to train, x_kinematics drifts from its phase-1 representation;
-        if DM is frozen it silently degrades.  The .detach() ensures DM gradients
-        still cannot flow back into the kinematics pathway, so kinematics training
-        is unaffected by keeping DM unfrozen.
+        The DM head remains trainable in Phase 2 to allow it to continue 
+        adapting as the shared backbone weights might be updated by kinematics,
+        though they now use separate CLS tokens and blocks.
 
         Both steps are required:
           1. requires_grad_(False) on frozen params so PCGrad's `params` list
@@ -195,6 +193,9 @@ class ParTauModule(L.LightningModule):
           2. Rebuild the AdamW optimizer with only the unfrozen params so that
              momentum buffers are not accumulated for frozen weights.
         """
+        if self.phase2_initialized:
+            return
+
         # 1. Freeze everything, then selectively unfreeze.
         self.ParTau.requires_grad_(False)
         kin_params = (
@@ -217,15 +218,15 @@ class ParTauModule(L.LightningModule):
             ],
             weight_decay=1e-2,
         )
-        # Estimate remaining steps for a short cosine tail.
+        # Use a simple CosineAnnealingLR for the fine-tuning phase.
+        # OneCycleLR is problematic when restarted mid-run as it expects to start from 0.
         remaining = max(
             1, self.trainer.estimated_stepping_batches - self.trainer.global_step
         )
-        new_scheduler = torch.optim.lr_scheduler.OneCycleLR(
+        new_scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
             new_optimizer,
-            max_lr=[kin_lr, base_lr],
-            total_steps=remaining,
-            anneal_strategy="cos",
+            T_max=remaining,
+            eta_min=1e-7,
         )
         self.trainer.optimizers = [new_optimizer]
         self.trainer.lr_scheduler_configs[0].scheduler = new_scheduler
@@ -235,6 +236,7 @@ class ParTauModule(L.LightningModule):
             f"[Phase 2 @ epoch {self.current_epoch}] Backbone frozen. "
             f"Trainable: {n_kin:,} kin params + {n_dm:,} DM head params"
         )
+        self.phase2_initialized = True
 
     def configure_optimizers(self):
         # AdamW is generally preferred for transformer architectures.
@@ -623,7 +625,8 @@ class ParTauModule(L.LightningModule):
         # Automatically trigger phase-2 kinematics fine-tuning when configured.
         phase2_epoch = getattr(self.cfg.training, "phase2_start_epoch", None)
         if phase2_epoch is not None and self.current_epoch == phase2_epoch:
-            self.reinitialize_optimizer_for_phase2()
+            if not self.phase2_initialized:
+                self.reinitialize_optimizer_for_phase2()
 
         self.training_loss_accumulator = {
             key: []

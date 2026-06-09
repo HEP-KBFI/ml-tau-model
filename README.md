@@ -75,6 +75,20 @@ sbatch train-gpu.sh
 ./run.sh python3 mltau/scripts/train.py training.lr=5e-4 training.max_epochs=200
 ```
 
+### Running Inference
+To generate prediction parquet files from a pretrained model checkpoint:
+
+```bash
+./run_inference.sh <path_to_checkpoint> <output_directory>
+```
+This will run inference on the test dataset and save `.parquet` files to `<output_directory>/predictions/`.
+
+### Evaluation & Plotting
+Final physics performance plots (ROC, efficiency, resolution) are typically generated via Jupyter notebooks:
+1. Open `mltau/notebooks/MultiParTau_vs_SingleParTau.ipynb`.
+2. Update the `OUTPUT_DIR` and `SIGNAL_SAMPLE`/`BKG_SAMPLE` paths to point to your inference outputs.
+3. Run the cells to generate the PDF plots.
+
 ## Documentation
 
 - **[Technical Details](docs/TECHNICAL.md)**: Complete model architecture, training setup, and implementation details

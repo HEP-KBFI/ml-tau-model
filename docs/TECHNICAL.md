@@ -13,14 +13,14 @@ The core backbone is a faithful implementation of the [ParT architecture](https:
 Default configuration: `embed_dims=[256, 512, 256]`, `num_layers=2`, `num_heads=8`.
 
 ### Task Heads (ParTau)
-Four output heads operate on the shared CLS token embedding:
+Four task-specific CLS tokens independently attend to the shared backbone output. Each token then passes through a dedicated CLS block and normalization layer before reaching its respective readout head:
 
-| Head | Output | Activation |
-|------|--------|------------|
-| `tau_id_head` | $P(\text{is tau})$ | Sigmoid |
-| `tau_charge_head` | $P(\text{charge} = +1)$ | Sigmoid |
-| `classification_head` | Decay mode probabilities (6 classes) | Softmax |
-| `regression_head` | $[\log(p_T^\text{vis}/p_T^\text{jet}),\ \Delta\theta,\ \Delta\phi,\ \log(m_\text{vis}/m_\text{jet})]$ | None |
+| Head | Output | Activation | Architecture |
+|------|--------|------------|--------------|
+| `tau_id_head` | $P(\text{is tau})$ | Sigmoid | 1-layer FFN |
+| `tau_charge_head` | $P(\text{charge} = +1)$ | Sigmoid | 1-layer FFN |
+| `classification_head` | Decay mode probabilities (6 classes) | Softmax | 1-layer FFN |
+| `regression_head` | $[\log(p_T^\text{vis}/p_T^\text{jet}),\ \Delta\theta,\ \Delta\phi,\ \log(m_\text{vis}/m_\text{jet})]$ | None | 1-layer FFN |
 
 ### Training (PyTorch Lightning)
 - **Optimizer**: RAdam (`lr=1e-4`, `betas=(0.95, 0.999)`)
@@ -183,7 +183,7 @@ mltau/
   config/           # Hydra configuration files
   models/
     ParticleTransformer.py   # Base ParT implementation
-    ParTau.py                # Multi-task extension with 4 output heads
+    MultiParTau.py           # Multi-task extension with 4 output heads
     ParTau_module.py         # PyTorch Lightning training module
   scripts/
     train.py                 # Main training entry point

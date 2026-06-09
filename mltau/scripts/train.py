@@ -32,27 +32,34 @@ class KinematicsFinetuneCallback(Callback):
         super().__init__()
         self.patience = patience
         self.phase = 1
+        self.has_switched = False
         self.best_val_loss = float("inf")
         self.best_kin_loss = float("inf")
         self.wait = 0
 
     def _freeze_all_except_regression_head(self, model):
         part = model.ParTau
-        for module in [
-            part.embed,
-            part.pair_embed,
-            part.blocks,
-            part.cls_blocks,
-            part.norm,
-        ]:
-            for p in module.parameters():
-                p.requires_grad_(False)
-        for token in [part.cls_token_shared, part.cls_token_kinematics]:
+        # Freeze shared backbone
+        for module in [part.embed, part.pair_embed, part.blocks]:
+            if module is not None:
+                for p in module.parameters():
+                    p.requires_grad_(False)
+
+        # Freeze all task pathways except kinematics
+        task_pathways = [
+            (part.cls_token_tau_id, part.cls_blocks_tau_id, part.norm_tau_id, part.tau_id_head),
+            (part.cls_token_charge, part.cls_blocks_charge, part.norm_charge, part.tau_charge_head),
+            (part.cls_token_dm, part.cls_blocks_dm, part.norm_dm, part.classification_head),
+        ]
+        
+        for token, blocks, norm, head in task_pathways:
             token.requires_grad_(False)
-        for head in [part.tau_id_head, part.tau_charge_head, part.classification_head]:
-            for p in head.parameters():
-                p.requires_grad_(False)
-        # regression_head stays requires_grad=True (default)
+            for module in [blocks, norm, head]:
+                for p in module.parameters():
+                    p.requires_grad_(False)
+
+        # Kinematics pathway (cls_token_kinematics, cls_blocks_kinematics, 
+        # norm_kinematics, and regression_head) stays requires_grad=True
 
     def on_validation_epoch_end(self, trainer, pl_module):
         if trainer.sanity_checking:
@@ -75,14 +82,21 @@ class KinematicsFinetuneCallback(Callback):
                     f"(best={self.best_val_loss:.6f}, current={val_loss:.6f})"
                 )
                 if self.wait >= self.patience:
-                    print(
-                        "[Phase 1 → Phase 2] Switching to kinematics-only fine-tuning."
-                    )
-                    self.phase = 2
-                    self.wait = 0
-                    self.best_kin_loss = float("inf")
-                    self._freeze_all_except_regression_head(pl_module)
-                    pl_module.reinitialize_optimizer_for_phase2()
+                    if not self.has_switched:
+                        print(
+                            "[Phase 1 → Phase 2] Switching to kinematics-only fine-tuning."
+                        )
+                        self.phase = 2
+                        self.wait = 0
+                        self.best_kin_loss = float("inf")
+                        self._freeze_all_except_regression_head(pl_module)
+                        pl_module.reinitialize_optimizer_for_phase2()
+                        self.has_switched = True
+                    else:
+                        # This shouldn't normally be reached given the state change,
+                        # but ensures robustness.
+                        self.phase = 2
+                        self.wait = 0
 
         elif self.phase == 2:
             kin_loss = metrics.get("val_losses/kinematics_loss", None)

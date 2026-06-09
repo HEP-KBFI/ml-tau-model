@@ -17,8 +17,8 @@ training:
                                   # (was 10.0 — too aggressive, causes early plateau)
 
   # Phase-2 kinematics fine-tuning: at this epoch the shared backbone and
-  # cls_token_shared are frozen and only cls_token_kinematics + regression_head
-  # continue training.  Set to null to disable (single-phase training).
+  # classification task pathways are frozen and only kinematics pathway 
+  # (token + blocks + head) continue training.
   # Rule of thumb: set to ~60-70 % of max_epochs, after classification tasks plateau.
   phase2_start_epoch: 30  # kinematics tends to plateau ~epoch 24; restart its LR here
 
