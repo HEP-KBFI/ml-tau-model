@@ -40,6 +40,23 @@ class ParTauModule(L.LightningModule):
         # Disable automatic optimization so PCGrad can do per-task backward passes
         self.automatic_optimization = False
 
+        # Task weight scheduler state
+        tw = self.cfg.training.task_weights
+        self.current_task_weights = {
+            "tau_id": tw.tau_id,
+            "decay_mode": tw.decay_mode,
+            "charge": tw.charge,
+            "kinematics": tw.kinematics,
+        }
+
+        self.scheduler_state = {}
+        if self.cfg.training.task_weight_scheduler.enabled:
+            for task in self.cfg.training.task_weight_scheduler.monitor_tasks:
+                self.scheduler_state[task] = {
+                    "best_loss": float("inf"),
+                    "patience_counter": 0,
+                }
+
     def training_step(self, batch, batch_idx):
         net_opt = self.optimizers()
 
@@ -56,11 +73,15 @@ class ParTauModule(L.LightningModule):
         # ------------------------------------------------------------------ #
         params = [p for p in self.ParTau.parameters() if p.requires_grad]
 
-        tw = self.cfg.training.task_weights
+        tw = self.current_task_weights
         task_weight_tensor = task_losses.new_tensor(
-            [tw.tau_id, tw.decay_mode, tw.charge, tw.kinematics]
+            [tw["tau_id"], tw["decay_mode"], tw["charge"], tw["kinematics"]]
         )
         weighted_task_losses = task_losses * task_weight_tensor
+
+        # Log current task weights
+        for task_name, weight in tw.items():
+            self.log(f"task_weights/{task_name}", weight, on_step=True, on_epoch=False)
 
         # 1. Collect per-task gradient vectors.
         task_grads = []
@@ -450,6 +471,36 @@ class ParTauModule(L.LightningModule):
             }
             for k, v in epoch_metrics.items():
                 self.log(f"val_losses/{k}", v)
+
+            # --- Task Weight Scheduler Logic ---
+            sch_cfg = self.cfg.training.task_weight_scheduler
+            if sch_cfg.enabled:
+                for task in sch_cfg.monitor_tasks:
+                    loss_key = f"{task}_loss"
+                    if loss_key in epoch_metrics:
+                        current_loss = epoch_metrics[loss_key].item()
+                        state = self.scheduler_state[task]
+
+                        if current_loss < state["best_loss"]:
+                            state["best_loss"] = current_loss
+                            state["patience_counter"] = 0
+                        else:
+                            state["patience_counter"] += 1
+
+                        if state["patience_counter"] >= sch_cfg.patience:
+                            old_weight = self.current_task_weights[task]
+                            new_weight = max(
+                                sch_cfg.min_weight, old_weight * sch_cfg.factor
+                            )
+                            if new_weight < old_weight:
+                                self.current_task_weights[task] = new_weight
+                                print(
+                                    f"[Scheduler] Reducing {task} weight: "
+                                    f"{old_weight:.4f} -> {new_weight:.4f}"
+                                )
+                            # Reset counter after reduction (standard ReduceLROnPlateau behavior)
+                            state["patience_counter"] = 0
+
         self._log_at_epoch_end(dataset="val")
 
     def on_train_epoch_start(self):

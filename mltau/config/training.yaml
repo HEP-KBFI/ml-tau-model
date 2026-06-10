@@ -13,6 +13,13 @@ training:
     decay_mode: 1.0
     kinematics: 2.0  # higher weight → larger gradient magnitude
 
+  task_weight_scheduler:
+    enabled: true
+    monitor_tasks: ["charge", "decay_mode"]
+    patience: 3
+    factor: 0.5
+    min_weight: 0.05
+
   dataloader:
     batch_size: 12288
     num_dataloader_workers: 1
