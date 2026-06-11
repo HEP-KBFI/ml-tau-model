@@ -191,15 +191,25 @@ mltau/
     MultiParTau_module.py    # Lightning module for multi-task ParTau
     SingleParTau.py          # Single-task ParTau model
     SingleParTau_module.py   # Lightning module for single-task ParTau
+    HPS.py                   # Baseline HPS model definition
   scripts/
     train.py                 # Main training entry point
     run_inference.py         # Main inference entry point
+    upload_model_hf.py       # Upload to HuggingFace Hub
+    move_models_hf.py        # Local model organization for HF
     HPS/                     # Baseline HPS processing scripts
   tools/
     features.py              # Math and kinematic utilities
+    general.py               # 4-vector normalization and DM mapping
     losses.py                # Unified TauLoss and FocalLoss implementations
     evaluation/              # Per-task evaluation logic
     io/                      # Data loading and preprocessing logic
+    logging/                 # TensorBoard metric loggers per task
+    optimizers/              # Optimizer wrappers (e.g., Lookahead)
+```
+``
+```
+       # Data loading and preprocessing logic
     logging/                 # TensorBoard metric loggers per task
     optimizers/              # Optimizer wrappers (e.g., Lookahead)
 ```
