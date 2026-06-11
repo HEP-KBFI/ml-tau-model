@@ -173,64 +173,6 @@ class ParTauModule(L.LightningModule):
     def test_step(self, batch, _batch_idx):
         return self.forward(batch)[0]
 
-    def reinitialize_optimizer_for_phase2(self):
-        """Freeze the shared backbone; fine-tune kinematics params + DM head.
-
-        The DM head remains trainable in Phase 2 to allow it to continue 
-        adapting as the shared backbone weights might be updated by kinematics,
-        though they now use separate CLS tokens and blocks.
-
-        Both steps are required:
-          1. requires_grad_(False) on frozen params so PCGrad's `params` list
-             excludes them (no spurious zero gradients written into them).
-          2. Rebuild the AdamW optimizer with only the unfrozen params so that
-             momentum buffers are not accumulated for frozen weights.
-        """
-        if self.phase2_initialized:
-            return
-
-        # 1. Freeze everything, then selectively unfreeze.
-        self.ParTau.requires_grad_(False)
-        kin_params = (
-            list(self.ParTau.regression_head.parameters())
-            + list(self.ParTau.cls_blocks_kinematics.parameters())
-            + list(self.ParTau.norm_kinematics.parameters())
-            + [self.ParTau.cls_token_kinematics]
-        )
-        # DM head must adapt as kinematics representation changes.
-        dm_params = list(self.ParTau.classification_head.parameters())
-        for p in kin_params + dm_params:
-            p.requires_grad_(True)
-
-        base_lr = self.cfg.training.lr
-        kin_lr = base_lr * self.cfg.training.kinematics_lr_multiplier
-        new_optimizer = torch.optim.AdamW(
-            [
-                {"params": kin_params, "lr": kin_lr},
-                {"params": dm_params, "lr": base_lr},
-            ],
-            weight_decay=1e-2,
-        )
-        # Use a simple CosineAnnealingLR for the fine-tuning phase.
-        # OneCycleLR is problematic when restarted mid-run as it expects to start from 0.
-        remaining = max(
-            1, self.trainer.estimated_stepping_batches - self.trainer.global_step
-        )
-        new_scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
-            new_optimizer,
-            T_max=remaining,
-            eta_min=1e-7,
-        )
-        self.trainer.optimizers = [new_optimizer]
-        self.trainer.lr_scheduler_configs[0].scheduler = new_scheduler
-        n_kin = sum(p.numel() for p in kin_params)
-        n_dm = sum(p.numel() for p in dm_params)
-        print(
-            f"[Phase 2 @ epoch {self.current_epoch}] Backbone frozen. "
-            f"Trainable: {n_kin:,} kin params + {n_dm:,} DM head params"
-        )
-        self.phase2_initialized = True
-
     def configure_optimizers(self):
         # AdamW is generally preferred for transformer architectures.
         base_lr = self.cfg.training.lr
