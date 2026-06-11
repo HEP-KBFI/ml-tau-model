@@ -27,6 +27,9 @@ class ParTau(ParticleTransformer):
         },
         fc_params: list = [],
         activation: str = "gelu",
+        # Dropout applied to readout heads to counter overtraining.
+        # Kinematics head is intentionally left unregularized.
+        head_dropout: float = 0.1,
         # misc
         trim: bool = True,
         for_inference: bool = False,
@@ -67,30 +70,40 @@ class ParTau(ParticleTransformer):
         # We will have a total of 4 heads: decay mode, kinematic, charge and tauID.
 
         embed_dim = embed_dims[-1] if len(embed_dims) > 0 else input_dim
+        head_hidden = embed_dim // 2
         if self.task == "decay_mode":
             # MLP head: 256 → 128 → 6; non-linear compression helps separate the
             # 6 DM classes whose boundaries are non-trivial (e.g. DM 1 vs DM 2).
-            dm_hidden = embed_dim // 2
             self.classification_head = nn.Sequential(
-                nn.Linear(embed_dim, dm_hidden),
+                nn.Linear(embed_dim, head_hidden),
                 nn.GELU(),
-                nn.Linear(dm_hidden, num_dm_classes),
+                nn.Dropout(head_dropout),
+                nn.Linear(head_hidden, num_dm_classes),
             )
         elif self.task == "kinematics":
             # Regression head: small MLP for richer non-linear mapping from CLS to targets.
             # [log(pt_gen/pt_reco), delta_eta, delta_sin(phi), delta_cos(phi), log(m_gen/m_reco)]
-            hidden_dim = embed_dim // 2
             self.regression_head = nn.Sequential(
-                nn.Linear(embed_dim, hidden_dim),
+                nn.Linear(embed_dim, head_hidden),
                 nn.GELU(),
-                nn.Linear(hidden_dim, 5),
+                nn.Linear(head_hidden, 5),
             )
         elif self.task == "is_tau":
             # Two-class head for tau-tagging (background = class 0, signal = class 1)
-            self.binary_head = nn.Linear(embed_dim, 2)
+            self.binary_head = nn.Sequential(
+                nn.Linear(embed_dim, head_hidden),
+                nn.GELU(),
+                nn.Dropout(head_dropout / 2),
+                nn.Linear(head_hidden, 2),
+            )
         elif self.task == "charge":
-            # Two-logit head to match the en-reg charge-classification setup
-            self.binary_head = nn.Linear(embed_dim, 2)
+            # Single-logit head for charge classification (+1 vs -1) using BCE loss.
+            self.binary_head = nn.Sequential(
+                nn.Linear(embed_dim, head_hidden),
+                nn.GELU(),
+                nn.Dropout(head_dropout),
+                nn.Linear(head_hidden, 1),
+            )
         else:
             raise NotImplementedError(
                 f"This model is not suitable for the chosen task of {self.task}"
@@ -153,8 +166,8 @@ class ParTau(ParticleTransformer):
                 # Return 2-class logits; signal is class 1.
                 output = (self.binary_head(x_cls),)  # (N, 2)
             elif self.task == "charge":
-                # Two-class logits for charge classification
-                output = (self.binary_head(x_cls),)  # (N, 2)
+                # Single-logit output for charge classification
+                output = (self.binary_head(x_cls).squeeze(-1),)  # (N,)
             else:
                 raise NotImplementedError(
                     f"This model is not suitable for the chosen task of {self.task}"

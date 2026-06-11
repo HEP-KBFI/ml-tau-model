@@ -7,7 +7,7 @@ from omegaconf import DictConfig
 
 from mltau.tools.io.general import BatchInputs
 from mltau.tools import general as g
-from mltau.tools.losses import FocalLoss
+from mltau.tools.losses import FocalLoss, TauLoss
 from mltau.tools.logging import tagging, kinematics, decay_mode, charge_id
 from mltau.models.SingleParTau import ParTau
 
@@ -32,17 +32,11 @@ class ParTauModule(L.LightningModule):
             use_amp=False,
             metric="theta-phi",
         )
-        if task == "is_tau":
-            self.loss_fn = nn.CrossEntropyLoss(reduction="none", label_smoothing=0.1)
-        elif task == "charge":
-            self.loss_fn = nn.CrossEntropyLoss(reduction="none")
-        elif task == "decay_mode":
-            self.loss_fn = nn.CrossEntropyLoss(reduction="none")
-        elif task == "kinematics":
-            self.loss_fn = nn.HuberLoss(reduction="none", delta=1.0)
+        self.tau_loss = TauLoss(l_m=0.2, label_smoothing=0.1)
 
     def _loss_key(self):
-        return f"{self.task}_loss"
+        task_name = "tau_id" if self.task == "is_tau" else self.task
+        return f"{task_name}_loss"
 
     def _make_accumulator(self):
         # Original aggregate-only accumulator kept for reference.
@@ -127,7 +121,7 @@ class ParTauModule(L.LightningModule):
         if self.task == "charge":
             charge_logits = model_output[0]
             predictions = {
-                self.task: torch.softmax(charge_logits, dim=-1)[:, 1],
+                self.task: torch.sigmoid(charge_logits),
                 "charge_logits": charge_logits,
             }
         elif self.task == "decay_mode":
@@ -149,47 +143,60 @@ class ParTauModule(L.LightningModule):
     def calculate_metrics(self, targets, predictions, weights):
         pred = predictions[self.task]
         target = targets[self.task]
+        is_tau_mask = targets["is_tau"].bool()
 
         if self.task == "kinematics":
-            component_raw_loss = self.loss_fn(pred, target)
-            is_tau_mask = targets["is_tau"].bool()
-            masked = component_raw_loss[is_tau_mask]  # (N_tau, 5)
+            # Signal-only task: mask inputs
+            if not is_tau_mask.any():
+                return {
+                    "loss": pred.new_zeros(()),
+                    self._loss_key(): pred.new_zeros(()),
+                    "kinematics_log_pt_loss": pred.new_zeros(()),
+                    "kinematics_delta_eta_loss": pred.new_zeros(()),
+                    "kinematics_phi_chord_loss": pred.new_zeros(()),
+                    "kinematics_log_mass_loss": pred.new_zeros(()),
+                }
+
             pred_tau = pred[is_tau_mask]
             tgt_tau = target[is_tau_mask]
-            l_m = 0.2
-            log_pt_loss = masked[:, 0].mean()
-            deta_loss = masked[:, 1].mean()
-            # Phi chord loss: 2D coupled gradient for (sin, cos) components
-            phi_chord_loss = torch.sqrt(
-                (pred_tau[:, 2] - tgt_tau[:, 2]) ** 2
-                + (pred_tau[:, 3] - tgt_tau[:, 3]) ** 2
-                + 1e-8
-            ).mean()
-            log_m_loss = masked[:, 4].mean()
-            loss = (log_pt_loss + deta_loss + phi_chord_loss + l_m * log_m_loss) / (
-                3.0 + l_m
+            weights_tau = weights[is_tau_mask]
+
+            loss, components = self.tau_loss.compute_kinematics_loss(
+                pred_tau, tgt_tau, weights_tau
             )
+
             metrics = {
                 "loss": loss,
                 self._loss_key(): loss,
-                "kinematics_log_pt_loss": log_pt_loss,
-                "kinematics_delta_eta_loss": deta_loss,
-                "kinematics_phi_chord_loss": phi_chord_loss,
-                "kinematics_log_mass_loss": log_m_loss,
+                "kinematics_log_pt_loss": components["log_pt"],
+                "kinematics_delta_eta_loss": components["delta_eta"],
+                "kinematics_phi_chord_loss": components["phi_chord"],
+                "kinematics_log_mass_loss": components["log_mass"],
             }
             return metrics
         elif self.task == "is_tau":
-            loss = (
-                self.loss_fn(predictions["is_tau_logits"], target.long()) * weights
-            ).mean()
+            # Tagging is for all jets
+            loss = self.tau_loss.compute_tagging_loss(
+                predictions["is_tau_logits"], target, weights
+            )
         elif self.task == "charge":
-            loss = self.loss_fn(
-                predictions["charge_logits"], targets["charge"].long()
-            ).mean()
+            # Signal-only task: mask inputs
+            if not is_tau_mask.any():
+                return {"loss": pred.new_zeros(()), self._loss_key(): pred.new_zeros(())}
+            loss = self.tau_loss.compute_charge_loss(
+                predictions["charge_logits"][is_tau_mask],
+                target[is_tau_mask],
+                weights[is_tau_mask],
+            )
         else:  # "decay_mode" — only meaningful for signal taus
-            raw_loss = self.loss_fn(predictions["decay_mode_logits"], target)
-            is_tau_mask = targets["is_tau"].bool()
-            loss = raw_loss[is_tau_mask].mean()
+            if not is_tau_mask.any():
+                return {"loss": pred.new_zeros(()), self._loss_key(): pred.new_zeros(())}
+            # Apply weights to the signal-only loss
+            loss = self.tau_loss.compute_decay_mode_loss(
+                predictions["decay_mode_logits"][is_tau_mask],
+                target[is_tau_mask],
+                weights[is_tau_mask],
+            )
 
         return {"loss": loss, self._loss_key(): loss}
 

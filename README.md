@@ -1,12 +1,14 @@
 # End-to-End ML Reconstruction and Identification of Hadronically Decaying Tau Leptons
 
+[![Hugging Face](https://img.shields.io/badge/%F0%9F%A4%97%20Hugging%20Face-Models-orange)](https://huggingface.co/HEP-KBFI/fcc-tau)
+
 The aim of this project is to develop and test end-to-end machine learning methods for reconstruction and identification of hadronically decaying tau leptons, while also providing a thoroughly validated and tested dataset for evaluating the performance of said algorithms.
 
 This repository contains the **ParTau** model — a multi-task [Particle Transformer (ParT)](https://arxiv.org/abs/2202.03772) adapted for future lepton collider experiments (CLD/CLIC/FCC-ee). Given a reconstructed jet and its constituent particles, ParTau simultaneously predicts:
 
 - **Tau tagging** — whether the jet originates from a hadronic tau decay
 - **Decay mode classification** — 6-class HPS-aligned decay mode  
-- **Visible tau kinematics** — $p_T$ ratio, direction correction ($\Delta\theta$, $\Delta\phi$), and visible mass via regression
+- **Visible tau kinematics** — $p_T$ ratio, direction correction ($\Delta\eta$, $\Delta\phi$), and visible mass via regression
 - **Tau charge** — binary (+1 or −1) classification
 
 Tau leptons can decay both leptonically and hadronically, however only hadronic decays are targeted with this project.
@@ -72,8 +74,22 @@ For training in HPC environments with the frozen singularity image containing al
 sbatch train-gpu.sh
 
 # Custom configuration
-./run.sh python3 mltau/scripts/train.py training.lr=5e-4 training.max_epochs=200
+./run.sh python3 mltau/scripts/train.py training.lr=5e-4 training.trainer.max_epochs=200
 ```
+
+### Running Inference
+To generate prediction parquet files from a pretrained model checkpoint:
+
+```bash
+./run_inference.sh <path_to_checkpoint> <output_directory>
+```
+This will run inference on the test dataset and save `.parquet` files to `<output_directory>/predictions/`.
+
+### Evaluation & Plotting
+Final physics performance plots (ROC, efficiency, resolution) are typically generated via Jupyter notebooks:
+1. Open `mltau/notebooks/MultiParTau_vs_SingleParTau.ipynb`.
+2. Update the `OUTPUT_DIR` and `SIGNAL_SAMPLE`/`BKG_SAMPLE` paths to point to your inference outputs.
+3. Run the cells to generate the PDF plots.
 
 ## Documentation
 
