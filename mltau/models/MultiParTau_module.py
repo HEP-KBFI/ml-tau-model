@@ -18,15 +18,15 @@ class ParTauModule(L.LightningModule):
     def __init__(self, cfg: DictConfig, input_dim: int, num_dm_classes: int):
         super().__init__()
         self.cfg = cfg
+        m_cfg = cfg.training.model
         self.ParTau = ParTau(
             input_dim=input_dim,
-            num_dm_classes=num_dm_classes,  # Number of decay modes we wish to classify
-            num_layers=2,  # cfg.models.ParticleTransformer.hyperparameters.num_layers,
-            embed_dims=[
-                256,
-                512,
-                256,
-            ],  # cfg.models.ParticleTransformer.hyperparameters.embed_dims,
+            num_dm_classes=num_dm_classes,
+            num_layers=m_cfg.get("num_layers", 8),
+            num_heads=m_cfg.get("num_heads", 8),
+            num_cls_layers=m_cfg.get("num_cls_layers", 2),
+            embed_dims=m_cfg.get("embed_dims", [256, 512, 256]),
+            pair_embed_dims=m_cfg.get("pair_embed_dims", [64, 64, 64]),
             use_pre_activation_pair=False,
             for_inference=False,
             use_amp=False,
