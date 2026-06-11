@@ -38,10 +38,8 @@ from tqdm.auto import tqdm
 
 from mltau.tools.general import reinitialize_p4, one_hot_decoding
 from mltau.tools.io.general import BatchInputs
-from mltau.tools.io.preprocessed_ParTau_dataloader import (
-    ParticleTransformerDataset,
-    apply_saved_input_scaling_from_cfg,
-)
+from mltau.tools.io.preprocessed_ParTau_dataloader import ParticleTransformerDataset
+from mltau.tools.io import scaling
 
 # def softmax(x):
 #     # x shape: (N, 6)
@@ -229,7 +227,7 @@ def create_predictions_file(
     tensors = load_tensors(input_path)
     # Add scaling calls
     print("[DEBUG] Active scaler:", cfg.training.input_scaling.scaler_path)
-    tensors = apply_saved_input_scaling_from_cfg(tensors, cfg)
+    tensors = scaling.apply_saved_input_scaling_from_cfg(tensors, cfg)
     dataset = ParticleTransformerDataset(
         tensors,
         batch_size=cfg.training.dataloader.batch_size,
