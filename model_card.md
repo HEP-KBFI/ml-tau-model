@@ -71,7 +71,7 @@ The models located in the `outputs/0609_*` directories correspond to the followi
 
 | Model Name | Task | Git Hash |
 |------------|------|----------|
-| `multipartau_full` | Multi-task | `af76c4c` |
+| `multipartau_full` | Multi-task | `fef7149` |
 | `single_charge` | Charge | `a5d7ed8` |
 | `single_decaymode` | Decay Mode | `a5d7ed8` |
 | `single_kinematics` | Kinematics | `a5d7ed8` |
@@ -79,4 +79,3 @@ The models located in the `outputs/0609_*` directories correspond to the followi
 
 ---
 *Generated based on training configurations and experiment outputs.*
-
