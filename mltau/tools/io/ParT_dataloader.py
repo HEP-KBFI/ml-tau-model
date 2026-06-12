@@ -27,16 +27,47 @@ from ntupelizer.scripts.preprocess_torch import build_tensors_from_data
 np.random.seed(42)
 
 
+def build_tensors(data: ak.Array, cfg: DictConfig):
+    tensors = build_tensors_from_data(data, cfg.dataset.max_cands)
+    # Transpose to [N, C, P] to match model expectations and preprocessed dataloader
+    return (
+        tensors[0].transpose(1, 2),
+        tensors[1].transpose(1, 2),
+        tensors[2],
+        tensors[3],
+        tensors[4],
+        tensors[5],
+        tensors[6],
+        tensors[7],
+    )
+
+
 class ParticleTransformerDataset(IterableDataset):
     def __init__(
-        self, row_groups: Sequence[ig.RowGroup], cfg: DictConfig, batch_size: int = 1
+        self,
+        row_groups: Sequence[ig.RowGroup],
+        cfg: DictConfig,
+        batch_size: int = 1,
+        shuffle: bool = True,
     ):
         super().__init__()
         self.cfg = cfg
         self.batch_size = batch_size
         self.row_groups = row_groups
         self.num_rows = sum([rg.num_rows for rg in self.row_groups])
+        self.shuffle = shuffle
         self._file_cache = {}
+
+        # Pre-load scaler once if enabled
+        self.scaler = None
+        if scaling.input_scaling_enabled(self.cfg):
+            try:
+                self.scaler = scaling.load_saved_scaler(self.cfg)
+            except RuntimeError as e:
+                # If fitting is expected to happen elsewhere or we're in setup,
+                # we might not have it yet.
+                print(f"[Warning] {e}")
+
         print(f"There are {'{:,}'.format(self.num_rows)} jets in the dataset.")
 
     def __len__(self):
@@ -48,20 +79,6 @@ class ParticleTransformerDataset(IterableDataset):
 
             self._file_cache[filename] = pq.ParquetFile(filename)
         return self._file_cache[filename]
-
-    def build_tensors(self, data: ak.Array):
-        tensors = build_tensors_from_data(data, self.cfg.dataset.max_cands)
-        # Transpose to [N, C, P] to match model expectations and preprocessed dataloader
-        return (
-            tensors[0].transpose(1, 2),
-            tensors[1].transpose(1, 2),
-            tensors[2],
-            tensors[3],
-            tensors[4],
-            tensors[5],
-            tensors[6],
-            tensors[7],
-        )
 
     def __iter__(self):
         worker_info = torch.utils.data.get_worker_info()
@@ -118,13 +135,26 @@ class ParticleTransformerDataset(IterableDataset):
             else:
                 data = all_data[0]
 
-            tensors = self.build_tensors(data)
+            tensors = build_tensors(data, self.cfg)
 
-            if scaling.input_scaling_enabled(self.cfg):
-                # Apply saved scaler (usually derived from training set)
-                tensors = scaling.apply_saved_input_scaling_from_cfg(tensors, self.cfg)
+            if self.scaler is not None:
+                tensors = scaling.apply_scaler(tensors, self.scaler)
 
             N = tensors[0].shape[0]
+
+            if self.shuffle:
+                # Intra-chunk shuffle: ensures that even if a read chunk contains both signal
+                # and background (from different row groups), they are mixed within batches.
+                perm = torch.randperm(N)
+
+                def _apply_perm(t):
+                    if isinstance(t, torch.Tensor):
+                        return t[perm]
+                    if isinstance(t, dict):
+                        return {k: v[perm] for k, v in t.items()}
+                    return t
+
+                tensors = tuple(_apply_perm(t) for t in tensors)
 
             # Yield pre-batched slices — bypasses PyTorch per-sample collation entirely
             for start in range(0, N, self.batch_size):
@@ -174,9 +204,8 @@ class ParTDataModule(LightningDataModule):
             test_paths_wcp = os.path.join(
                 self.cfg.dataset.data_dir, f"{self.sample}_test.parquet"
             )
-            test_paths = list(glob.glob(test_paths_wcp))
+            test_paths = sorted(list(glob.glob(test_paths_wcp)))
             test_rowgroups = ig.get_row_groups(input_paths=test_paths)
-            np.random.shuffle(test_rowgroups)
             return test_rowgroups
         elif dataset_type == "train":
             total = sum(
@@ -192,7 +221,7 @@ class ParTDataModule(LightningDataModule):
             train_paths_wcp = os.path.join(
                 self.cfg.dataset.data_dir, f"{self.sample}_train.parquet"
             )
-            train_paths = list(glob.glob(train_paths_wcp))
+            train_paths = sorted(list(glob.glob(train_paths_wcp)))
             all_train_rowgroups = ig.get_row_groups(input_paths=train_paths)
             np.random.shuffle(all_train_rowgroups)
             n_train_rowgroups = int(len(all_train_rowgroups) * fractions["train"])
@@ -201,6 +230,60 @@ class ParTDataModule(LightningDataModule):
             return train_rowgroups, val_rowgroups
         else:
             return []
+
+    def fit_scaler(self, row_groups: Sequence[ig.RowGroup], n_row_groups: int = 200):
+        print(
+            f"[input scaling] Fitting scaler on a sample of {n_row_groups} row groups..."
+        )
+        sample_rgs = row_groups[:n_row_groups]
+
+        # Group by filename
+        from collections import defaultdict
+
+        file_batches = defaultdict(list)
+        for rg in sample_rgs:
+            file_batches[rg.filename].append(rg.row_group)
+
+        all_cf = []
+        all_msk = []
+
+        _NEEDED_COLUMNS = [
+            "reco_cand_p4s",
+            "reco_cand_charges",
+            "reco_cand_pdgs",
+            "reco_cand_dz",
+            "reco_cand_dz_error",
+            "reco_cand_dxy",
+            "reco_cand_dxy_error",
+            "reco_jet_p4",
+        ]
+
+        for filename, indices in file_batches.items():
+            import pyarrow.parquet as pq
+
+            pf = pq.ParquetFile(filename)
+            table = pf.read_row_groups(indices, columns=_NEEDED_COLUMNS)
+            data = ak.from_arrow(table)
+            tensors = build_tensors(data, self.cfg)
+            all_cf.append(tensors[0])
+            all_msk.append(tensors[3])
+
+        cf = torch.cat(all_cf, dim=0)
+        msk = torch.cat(all_msk, dim=0)
+
+        feature_indices = scaling.get_feature_indices(self.cfg)
+        mean, std = scaling.fit_feature_scaler(cf, msk, feature_indices)
+
+        path = scaling.get_scaler_path(self.cfg)
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        np.savez(
+            path,
+            mean=mean,
+            std=std,
+            feature_indices=np.asarray(feature_indices, dtype=np.int64),
+            feature_names=scaling._CAND_FEATURE_NAMES,
+        )
+        print(f"[input scaling] Saved scaler to {path}")
 
     def setup(self, stage: str) -> None:
         # For debug runs, use smaller but reasonable batch size for speed
@@ -211,11 +294,24 @@ class ParTDataModule(LightningDataModule):
             train_row_groups, val_row_groups = self.get_dataset_rowgroups(
                 dataset_type="train"
             )
+
+            if scaling.input_scaling_enabled(self.cfg):
+                try:
+                    scaling.load_saved_scaler(self.cfg)
+                except RuntimeError:
+                    self.fit_scaler(train_row_groups)
+
             self.train_dataset = ParticleTransformerDataset(
-                row_groups=train_row_groups, cfg=self.cfg, batch_size=batch_size
+                row_groups=train_row_groups,
+                cfg=self.cfg,
+                batch_size=batch_size,
+                shuffle=True,
             )
             self.val_dataset = ParticleTransformerDataset(
-                row_groups=val_row_groups, cfg=self.cfg, batch_size=batch_size
+                row_groups=val_row_groups,
+                cfg=self.cfg,
+                batch_size=batch_size,
+                shuffle=False,
             )
             # batch_size=None: dataset yields pre-batched slices, skip collation entirely
             self.train_loader = DataLoader(
@@ -263,7 +359,7 @@ class ParTDataModule(LightningDataModule):
         elif stage == "test" or stage == "predict":
             test_row_groups = self.get_dataset_rowgroups(dataset_type="test")
             self.test_dataset = ParticleTransformerDataset(
-                row_groups=test_row_groups, cfg=self.cfg, batch_size=batch_size
+                row_groups=test_row_groups, cfg=self.cfg, batch_size=batch_size, shuffle=False
             )
             self.test_loader = DataLoader(
                 self.test_dataset,

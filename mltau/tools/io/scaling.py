@@ -117,10 +117,7 @@ def fit_and_apply_input_scaling(train_tensors, val_tensors, cfg: DictConfig):
     )
 
 
-def apply_saved_input_scaling_from_cfg(tensors, cfg: DictConfig):
-    if not input_scaling_enabled(cfg):
-        return tensors
-
+def load_saved_scaler(cfg: DictConfig):
     path = get_scaler_path(cfg)
     if not os.path.exists(path):
         raise RuntimeError(
@@ -128,9 +125,22 @@ def apply_saved_input_scaling_from_cfg(tensors, cfg: DictConfig):
         )
 
     scaler = np.load(path)
-    mean = scaler["mean"]
-    std = scaler["std"]
-    feature_indices = scaler["feature_indices"].astype(np.int64).tolist()
-    print(f"[input scaling] Loaded scaler from {path}", flush=True)
+    return {
+        "mean": scaler["mean"],
+        "std": scaler["std"],
+        "feature_indices": scaler["feature_indices"].astype(np.int64).tolist(),
+    }
 
-    return apply_feature_scaler(tensors, mean, std, feature_indices)
+
+def apply_scaler(tensors, scaler):
+    return apply_feature_scaler(
+        tensors, scaler["mean"], scaler["std"], scaler["feature_indices"]
+    )
+
+
+def apply_saved_input_scaling_from_cfg(tensors, cfg: DictConfig):
+    if not input_scaling_enabled(cfg):
+        return tensors
+    scaler = load_saved_scaler(cfg)
+    print(f"[input scaling] Loaded scaler from {get_scaler_path(cfg)}", flush=True)
+    return apply_scaler(tensors, scaler)
