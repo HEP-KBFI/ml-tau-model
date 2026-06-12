@@ -67,9 +67,9 @@ A maximum of 20 candidates per jet are used (padded/clipped).
 | 2 | 2, 3, 4 | 1-prong, ≥2 π⁰ |
 | 3 | 5, 10 | 3-prong, 0 π⁰ |
 | 4 | 6–9, 11–14 | 3-prong, ≥1 π⁰ |
-| 5 | 15, -1 | Rare / Other |
+| 5 | 15, 16, -1 | Rare / Leptonic / Other |
 
-Leptonic decay modes (15) and background (-1) are mapped to class 5. HPS DM 16 is currently unmapped. Background is tagged in a separate head.
+Rare decay modes (15), leptonic decays (16), and background (-1) are all mapped to class 5. Background samples are masked during training so only signal taus contribute to this head. Background is also tagged in a separate `tau_id_head`.
 
 ## Data
 
