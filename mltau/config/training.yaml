@@ -21,6 +21,7 @@ training:
     min_weight: 0.05
 
   dataloader:
+    type: preprocessed # preprocessed | parquet
     batch_size: 12288
     num_dataloader_workers: 1
     prefetch_factor: 100
