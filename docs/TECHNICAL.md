@@ -29,7 +29,7 @@ Four task-specific CLS tokens independently attend to the shared backbone output
   - Tau ID: `CrossEntropyLoss` (2-class) with label smoothing
   - Charge: `BCEWithLogitsLoss`
   - Decay mode: `CrossEntropyLoss`
-  - Kinematics: `HuberLoss(δ=1.0)` over 5 regression targets
+  - Kinematics: Combined loss using `HuberLoss(δ=1.0)` for $p_T$, $\eta$, and $m$, plus a chord loss (L2 distance) for the $(\sin\phi, \cos\phi)$ vector. The mass component is weighted by $\lambda_m = 0.2$.
 - **Conditional gating**: Auxiliary losses (charge, decay mode, kinematics) are multiplied by the truth tau label, so only signal jets contribute to those tasks.
 
 ## Input Features
@@ -52,9 +52,9 @@ Four task-specific CLS tokens independently attend to the shared backbone output
 | 12 | `isChargedHadron` | \|PDG\| = 211 (π±) |
 | 13 | `isNeutralHadron` | \|PDG\| = 130 (K⁰L) |
 | 14 | `cand_dz` | Longitudinal impact parameter $d_z$ |
-| 15 | `cand_dz_err` | Error on $d_z$ |
+| 15 | `cand_dz_error` | Error on $d_z$ |
 | 16 | `cand_dxy` | Transverse impact parameter $d_{xy}$ |
-| 17 | `cand_dxy_err` | Error on $d_{xy}$ |
+| 17 | `cand_dxy_error` | Error on $d_{xy}$ |
 
 A maximum of 20 candidates per jet are used (padded/clipped).
 
@@ -67,9 +67,9 @@ A maximum of 20 candidates per jet are used (padded/clipped).
 | 2 | 2, 3, 4 | 1-prong, ≥2 π⁰ |
 | 3 | 5, 10 | 3-prong, 0 π⁰ |
 | 4 | 6–9, 11–14 | 3-prong, ≥1 π⁰ |
-| 5 | 15, 16, -1 | Rare / Other |
+| 5 | 15, 16, -1 | Rare / Leptonic / Other |
 
-Leptonic decay modes (15) and background (-1) are not considered for this classification. Background is tagged in a separate head.
+Rare decay modes (15), leptonic decays (16), and background (-1) are all mapped to class 5. Background samples are masked during training so only signal taus contribute to this head. Background is also tagged in a separate `tau_id_head`.
 
 ## Data
 
@@ -206,12 +206,6 @@ mltau/
     io/                      # Data loading and preprocessing logic
     logging/                 # TensorBoard metric loggers per task
     optimizers/              # Optimizer wrappers (e.g., Lookahead)
-```
-``
-```
-       # Data loading and preprocessing logic
     logging/                 # TensorBoard metric loggers per task
     optimizers/              # Optimizer wrappers (e.g., Lookahead)
-```
-``
 ```

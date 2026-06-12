@@ -49,7 +49,7 @@ The models utilize the **Particle Transformer (ParT)** architecture, which uses 
 - **Embedding Dimensions:** `[256, 512, 256]`
 - **Pair Embedding Dimensions:** `[64, 64, 64]`
 - **Attention Heads:** 8
-- **Transformer Layers:** 8 (default) / 2 (specific runs)
+- **Transformer Layers:** 2 (default)
 - **CLS Layers:** 2
 - **Activation:** GELU
 

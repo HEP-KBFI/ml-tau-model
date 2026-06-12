@@ -53,6 +53,12 @@ The dataset contains 2 signal samples (ZH→Ztautau and Z→tautau) and one back
 
 ## Quick Start
 
+```
+git clone http://github.com/HEP-KBFI/ml-tau-model
+git submodule update
+git submodule sync
+```
+
 ### Local Development (Custom Environment)
 For local training on your machine without requiring the exact same environment as the authors:
 
