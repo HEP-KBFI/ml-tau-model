@@ -130,20 +130,17 @@ class ParTauModule(L.LightningModule):
 
         combined_loss = task_losses.sum().detach()
 
-        # Accumulate individual task losses for epoch-level logging
-        with torch.no_grad():
-            loss_dict = {
-                "loss": combined_loss,
-                "tau_id_loss": task_losses[0],
-                "decay_mode_loss": task_losses[1],
-                "charge_loss": task_losses[2],
-                "kinematics_loss": task_losses[3],
-            }
-            for k, v in kin_components.items():
-                loss_dict[f"kinematics_{k}_loss"] = v
-
-        for key, value in loss_dict.items():
-            self.training_loss_accumulator[key].append(value.detach())
+        # Log training losses with correct weighting
+        num_jets = targets["is_tau"].shape[0]
+        num_signal = targets["is_tau"].sum().item()
+        
+        self.log("train_losses/loss", combined_loss, on_step=True, on_epoch=True, batch_size=num_jets)
+        self.log("train_losses/tau_id_loss", task_losses[0], on_step=True, on_epoch=True, batch_size=num_jets)
+        
+        if num_signal > 0:
+            self.log("train_losses/decay_mode_loss", task_losses[1], on_step=True, on_epoch=True, batch_size=num_signal)
+            self.log("train_losses/charge_loss", task_losses[2], on_step=True, on_epoch=True, batch_size=num_signal)
+            self.log("train_losses/kinematics_loss", task_losses[3], on_step=True, on_epoch=True, batch_size=num_signal)
 
         self.log(
             "LR",
@@ -276,38 +273,37 @@ class ParTauModule(L.LightningModule):
 
     def validation_step(self, batch, _batch_idx):
         predictions, targets, weights = self.forward(batch)
-
-        inputs = BatchInputs(*batch)
-
         metrics = self.calculate_metrics(
             targets=targets, predictions=predictions, weights=weights
         )
 
+        num_jets = targets["is_tau"].shape[0]
+        num_signal = targets["is_tau"].sum().item()
+
+        # Log per-batch metrics weighted by the number of contributing samples
+        self.log("val_losses/loss", metrics["loss"], on_step=False, on_epoch=True, batch_size=num_jets)
+        self.log("val_losses/tau_id_loss", metrics["tau_id_loss"], on_step=False, on_epoch=True, batch_size=num_jets)
+        
+        if num_signal > 0:
+            self.log("val_losses/decay_mode_loss", metrics["decay_mode_loss"], on_step=False, on_epoch=True, batch_size=num_signal)
+            self.log("val_losses/charge_loss", metrics["charge_loss"], on_step=False, on_epoch=True, batch_size=num_signal)
+            self.log("val_losses/kinematics_loss", metrics["kinematics_loss"], on_step=False, on_epoch=True, batch_size=num_signal)
+            for k in ["log_pt", "delta_eta", "phi_chord", "log_mass"]:
+                key = f"kinematics_{k}_loss"
+                if key in metrics:
+                    self.log(f"val_losses/{key}", metrics[key], on_step=False, on_epoch=True, batch_size=num_signal)
+
         output = {
             "predictions": predictions,
             "targets": targets,
-            # "weights": weights,
-            "inputs": inputs,  # Store inputs for p4s extraction at epoch end
+            "inputs": BatchInputs(*batch),
         }
         self.validation_outputs.append(output)
-        for key, value in metrics.items():
-            self.validation_loss_accumulator[key].append(value.detach())
-
         return metrics["loss"]
 
     def on_validation_epoch_start(self):
         """Initialize storage for validation outputs."""
         self.validation_outputs = []
-        keys = ["loss", "tau_id_loss", "charge_loss", "decay_mode_loss", "kinematics_loss"]
-        keys.extend(
-            [
-                "kinematics_log_pt_loss",
-                "kinematics_delta_eta_loss",
-                "kinematics_phi_chord_loss",
-                "kinematics_log_mass_loss",
-            ]
-        )
-        self.validation_loss_accumulator = {key: [] for key in keys}
 
     def _log_at_epoch_end(self, dataset: str):
         if dataset == "val" and self.trainer.sanity_checking:
@@ -406,21 +402,15 @@ class ParTauModule(L.LightningModule):
 
     def on_validation_epoch_end(self):
         if not self.trainer.sanity_checking:
-            epoch_metrics = {
-                k: torch.stack(v).mean()
-                for k, v in self.validation_loss_accumulator.items()
-                if v
-            }
-            for k, v in epoch_metrics.items():
-                self.log(f"val_losses/{k}", v)
-
             # --- Task Weight Scheduler Logic ---
             sch_cfg = self.cfg.training.task_weight_scheduler
             if sch_cfg.enabled:
+                # Use callback_metrics which contains correctly aggregated epoch-level losses
+                cb_metrics = self.trainer.callback_metrics
                 for task in sch_cfg.monitor_tasks:
-                    loss_key = f"{task}_loss"
-                    if loss_key in epoch_metrics:
-                        current_loss = epoch_metrics[loss_key].item()
+                    loss_key = f"val_losses/{task}_loss"
+                    if loss_key in cb_metrics:
+                        current_loss = cb_metrics[loss_key].item()
                         state = self.scheduler_state[task]
 
                         if current_loss < state["best_loss"]:
@@ -446,23 +436,8 @@ class ParTauModule(L.LightningModule):
         self._log_at_epoch_end(dataset="val")
 
     def on_train_epoch_start(self):
-        keys = ["loss", "tau_id_loss", "charge_loss", "decay_mode_loss", "kinematics_loss"]
-        keys.extend(
-            [
-                "kinematics_log_pt_loss",
-                "kinematics_delta_eta_loss",
-                "kinematics_phi_chord_loss",
-                "kinematics_log_mass_loss",
-            ]
-        )
-        self.training_loss_accumulator = {key: [] for key in keys}
+        pass
 
     def on_train_epoch_end(self):
-        epoch_metrics = {
-            k: torch.stack(v).mean()
-            for k, v in self.training_loss_accumulator.items()
-            if v
-        }
-        for k, v in epoch_metrics.items():
-            self.log(f"train_losses/{k}", v)
+        pass
 

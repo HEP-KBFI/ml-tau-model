@@ -218,16 +218,45 @@ class ParTDataModule(LightningDataModule):
                 dataset: self.cfg.dataset.relative_sizes[dataset] / total
                 for dataset in ["train", "val"]
             }
+            
+            # Separate paths by signal (z) and background (qq) to allow interleaving
             train_paths_wcp = os.path.join(
                 self.cfg.dataset.data_dir, f"{self.sample}_train.parquet"
             )
-            train_paths = sorted(list(glob.glob(train_paths_wcp)))
-            all_train_rowgroups = ig.get_row_groups(input_paths=train_paths)
-            np.random.shuffle(all_train_rowgroups)
-            n_train_rowgroups = int(len(all_train_rowgroups) * fractions["train"])
-            train_rowgroups = all_train_rowgroups[:n_train_rowgroups]
-            val_rowgroups = all_train_rowgroups[n_train_rowgroups:]
-            return train_rowgroups, val_rowgroups
+            all_train_paths = sorted(list(glob.glob(train_paths_wcp)))
+            
+            sig_paths = [p for p in all_train_paths if "z_train" in os.path.basename(p)]
+            bkg_paths = [p for p in all_train_paths if "qq_train" in os.path.basename(p)]
+            other_paths = [p for p in all_train_paths if p not in sig_paths and p not in bkg_paths]
+
+            def _get_and_split(paths):
+                rgs = ig.get_row_groups(input_paths=paths)
+                np.random.shuffle(rgs)
+                n_train = int(len(rgs) * fractions["train"])
+                return rgs[:n_train], rgs[n_train:]
+
+            sig_train, sig_val = _get_and_split(sig_paths) if sig_paths else ([], [])
+            bkg_train, bkg_val = _get_and_split(bkg_paths) if bkg_paths else ([], [])
+            other_train, other_val = _get_and_split(other_paths) if other_paths else ([], [])
+
+            def _interleave(sig, bkg, other):
+                combined = []
+                # Calculate ratio to maintain balance throughout the dataset
+                ratio = len(bkg) // len(sig) if sig else 0
+                isig, ibkg = 0, 0
+                while isig < len(sig) or ibkg < len(bkg):
+                    if isig < len(sig):
+                        combined.append(sig[isig])
+                        isig += 1
+                    for _ in range(ratio):
+                        if ibkg < len(bkg):
+                            combined.append(bkg[ibkg])
+                            ibkg += 1
+                combined.extend(bkg[ibkg:])
+                combined.extend(other)
+                return combined
+
+            return _interleave(sig_train, bkg_train, other_train), _interleave(sig_val, bkg_val, other_val)
         else:
             return []
 
@@ -311,7 +340,7 @@ class ParTDataModule(LightningDataModule):
                 row_groups=val_row_groups,
                 cfg=self.cfg,
                 batch_size=batch_size,
-                shuffle=False,
+                shuffle=True,
             )
             # batch_size=None: dataset yields pre-batched slices, skip collation entirely
             self.train_loader = DataLoader(
@@ -359,7 +388,7 @@ class ParTDataModule(LightningDataModule):
         elif stage == "test" or stage == "predict":
             test_row_groups = self.get_dataset_rowgroups(dataset_type="test")
             self.test_dataset = ParticleTransformerDataset(
-                row_groups=test_row_groups, cfg=self.cfg, batch_size=batch_size, shuffle=False
+                row_groups=test_row_groups, cfg=self.cfg, batch_size=batch_size, shuffle=True
             )
             self.test_loader = DataLoader(
                 self.test_dataset,
