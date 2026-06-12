@@ -25,6 +25,7 @@ training:
     batch_size: 12288
     num_dataloader_workers: 1
     prefetch_factor: 100
+    row_groups_per_read: 16
 
   input_scaling:
     enabled: false
