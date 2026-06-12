@@ -36,10 +36,18 @@ class ParticleTransformerDataset(IterableDataset):
         self.batch_size = batch_size
         self.row_groups = row_groups
         self.num_rows = sum([rg.num_rows for rg in self.row_groups])
+        self._file_cache = {}
         print(f"There are {'{:,}'.format(self.num_rows)} jets in the dataset.")
 
     def __len__(self):
         return math.ceil(self.num_rows / self.batch_size)
+
+    def _get_parquet_file(self, filename):
+        if filename not in self._file_cache:
+            import pyarrow.parquet as pq
+
+            self._file_cache[filename] = pq.ParquetFile(filename)
+        return self._file_cache[filename]
 
     def build_tensors(self, data: ak.Array):
         tensors = build_tensors_from_data(data, self.cfg.dataset.max_cands)
@@ -85,12 +93,31 @@ class ParticleTransformerDataset(IterableDataset):
             "cls_weight",
         ]
 
-        for row_group in row_groups_to_process:
-            data = ak.from_parquet(
-                row_group.filename,
-                row_groups=[row_group.row_group],
-                columns=_NEEDED_COLUMNS,
-            )
+        # Batch row group reading to amortize metadata parsing overhead
+        row_groups_per_read = self.cfg.training.dataloader.get("row_groups_per_read", 16)
+
+        for i in range(0, len(row_groups_to_process), row_groups_per_read):
+            chunk = row_groups_to_process[i : i + row_groups_per_read]
+
+            # Group by filename to utilize Parquet batch reading
+            from collections import defaultdict
+
+            file_batches = defaultdict(list)
+            for rg in chunk:
+                file_batches[rg.filename].append(rg.row_group)
+
+            all_data = []
+            for filename, indices in file_batches.items():
+                pf = self._get_parquet_file(filename)
+                table = pf.read_row_groups(indices, columns=_NEEDED_COLUMNS)
+                data = ak.from_arrow(table)
+                all_data.append(data)
+
+            if len(all_data) > 1:
+                data = ak.concatenate(all_data)
+            else:
+                data = all_data[0]
+
             tensors = self.build_tensors(data)
 
             if scaling.input_scaling_enabled(self.cfg):
@@ -241,7 +268,7 @@ class ParTDataModule(LightningDataModule):
             self.test_loader = DataLoader(
                 self.test_dataset,
                 batch_size=None,
-                persistent_workers=True,
+                persistent_workers=self.cfg.training.dataloader.num_dataloader_workers > 0,
                 num_workers=self.cfg.training.dataloader.num_dataloader_workers,
                 prefetch_factor=(
                     self.cfg.training.dataloader.prefetch_factor
