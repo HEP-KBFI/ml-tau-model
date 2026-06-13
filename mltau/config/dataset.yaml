@@ -1,7 +1,6 @@
 dataset:
   max_cands: 20
-  #data_dir: /scratch/persistent/laurits/ml-tau/0528_Large_stats/
-  data_dir: /scratch/persistent/laurits/ml-tau/0509_dsinphi_to_sindphi/
+  data_dir: /scratch/persistent/laurits/ml-tau/0528_Large_stats/
   relative_sizes:
     train: 0.7
     val: 0.1
