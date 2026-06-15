@@ -3,6 +3,7 @@ training:
   lr: 0.001
   model:
     name: MultiParTau  # MultiParTau | SingleParTau
+    backbone: Mixer    # ParT | Mixer
     task: is_tau       # SingleParTau only: is_tau | charge | decay_mode | kinematics
     num_layers: 2
     num_heads: 8
