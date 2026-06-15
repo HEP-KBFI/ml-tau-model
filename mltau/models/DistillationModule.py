@@ -50,7 +50,7 @@ class DistillationModule(L.LightningModule):
         )
         print(f"Loading teacher from {teacher_checkpoint}")
         # Teacher checkpoint is likely a Lightning checkpoint, extract state_dict
-        checkpoint = torch.load(teacher_checkpoint, map_location="cpu")
+        checkpoint = torch.load(teacher_checkpoint, map_location="cpu", weights_only=False)
         state_dict = checkpoint["state_dict"]
         # Remove "ParTau." prefix from state_dict keys if it exists
         new_state_dict = {}
