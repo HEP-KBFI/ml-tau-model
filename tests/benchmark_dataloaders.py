@@ -52,7 +52,7 @@ def benchmark_dataloader(name, dm_class, cfg, num_workers, n_batches=100):
 def run_benchmarks():
     cfg = OmegaConf.create({
         "dataset": {
-            "data_dir": "0509_dsinphi_to_sindphi",
+            "data_dir": "0528_Large_stats",
             "max_cands": 20,
             "relative_sizes": {"train": 0.7, "val": 0.1, "test": 0.2}
         },

@@ -5,13 +5,18 @@ from omegaconf import OmegaConf
 from mltau.tools.io.ParT_dataloader import ParTDataModule as ParTDataModuleRaw
 from mltau.tools.io.preprocessed_ParTau_dataloader import ParTDataModule as ParTDataModulePre
 
+import os
+
 def get_cfg():
-    return OmegaConf.create({
-        "dataset": {
-            "data_dir": "0509_dsinphi_to_sindphi",
-            "max_cands": 20,
-            "relative_sizes": {"train": 0.7, "val": 0.1, "test": 0.2}
-        },
+    base_cfg = OmegaConf.load("mltau/config/dataset.yaml")
+    # If the path in the config doesn't exist locally, try the local folder as a fallback
+    # to allow the test to run in both local and remote (cluster) environments.
+    if not os.path.exists(base_cfg.dataset.data_dir):
+        local_dir = os.path.join(os.getcwd(), "0528_Large_stats")
+        if os.path.exists(local_dir):
+             base_cfg.dataset.data_dir = local_dir
+
+    training_cfg = OmegaConf.create({
         "training": {
             "model": {"task": "is_tau", "name": "MultiParTau"},
             "dataloader": {
@@ -22,6 +27,7 @@ def get_cfg():
             "input_scaling": {"enabled": False}
         }
     })
+    return OmegaConf.merge(base_cfg, training_cfg)
 
 def test_raw_dataloader_structure(cfg):
     print("Testing Raw dataloader structure...")
@@ -87,8 +93,8 @@ def test_functional_equivalence(cfg):
     assert s_raw == s_pre, f"Signal count mismatch: raw={s_raw}, pre={s_pre}"
     
     # Verify no repetition/completeness if we know the expected number
-    # From previous check: z_test (118787) + qq_test (786130) = 904917
-    expected_total = 904917
+    # From 0528_Large_stats: z_test (593540) + qq_test (3928385) = 4521925
+    expected_total = 4521925
     assert n_raw == expected_total, f"Expected {expected_total} jets, but got {n_raw}"
     
     print("OK")

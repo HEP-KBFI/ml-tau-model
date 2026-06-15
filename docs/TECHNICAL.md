@@ -52,9 +52,9 @@ Four task-specific CLS tokens independently attend to the shared backbone output
 | 12 | `isChargedHadron` | \|PDG\| = 211 (π±) |
 | 13 | `isNeutralHadron` | \|PDG\| = 130 (K⁰L) |
 | 14 | `cand_dz` | Longitudinal impact parameter $d_z$ |
-| 15 | `cand_dz_error` | Error on $d_z$ |
+| 15 | `cand_dz_error` | Significance of $d_z$ ($d_z / \sigma_{d_z}$) |
 | 16 | `cand_dxy` | Transverse impact parameter $d_{xy}$ |
-| 17 | `cand_dxy_error` | Error on $d_{xy}$ |
+| 17 | `cand_dxy_error` | Significance of $d_{xy}$ ($d_{xy} / \sigma_{d_{xy}}$) |
 
 A maximum of 20 candidates per jet are used (padded/clipped).
 
@@ -75,7 +75,7 @@ Rare decay modes (15), leptonic decays (16), and background (-1) are all mapped 
 
 - **Format**: Apache Parquet files, streamed with `awkward-array` using row-group chunking
 - **Dataset**: CLD detector simulation (key4hep framework), $e^+e^-$ collision events
-- **Split**: 70% train / 10% validation / 20% test
+- **Split**: Dataset files are provided in a 90/10 Train/Test split.
 - **Batch size**: 12288
 
 ### Expected Parquet Fields
@@ -83,14 +83,14 @@ Rare decay modes (15), leptonic decays (16), and background (-1) are all mapped 
 | Field | Description |
 |-------|-------------|
 | `reco_cand_p4s` | Jet constituent 4-momenta (px, py, pz, E) |
-| `reco_cand_charge` | Candidate charges |
-| `reco_cand_pdg` | Candidate PDG IDs |
-| `reco_jet_p4s` | Reconstructed jet 4-momenta |
-| `gen_jet_p4s` | Generator-level jet 4-momenta |
-| `gen_jet_tau_p4s` | Generator-level visible tau 4-momenta |
+| `reco_cand_charges` | Candidate charges |
+| `reco_cand_pdgs` | Candidate PDG IDs |
+| `reco_jet_p4` | Reconstructed jet 4-momenta |
+| `gen_jet_p4` | Generator-level jet 4-momenta |
+| `gen_jet_tau_p4` | Generator-level visible tau 4-momenta |
 | `gen_jet_tau_decaymode` | HPS decay mode index (−1 = background) |
 | `gen_jet_tau_charge` | True tau charge |
-| `weight` | Per-jet event weight (optional) |
+| `cls_weight` | Per-jet event weight (optional) |
 
 ## Installation
 
