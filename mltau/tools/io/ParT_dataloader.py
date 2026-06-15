@@ -31,8 +31,9 @@ def build_tensors(data: ak.Array, cfg: DictConfig):
     # Sort candidates by pT if requested.
     # This is critical for MLP-Mixer which is not permutation invariant.
     if cfg.dataset.get("sort_by_pt", False):
-        # reco_cand_p4s.pt: (N, var)
-        indices = ak.argsort(data.reco_cand_p4s.pt, ascending=False)
+        # Ensure we can access .pt
+        p4 = g.reinitialize_p4(data.reco_cand_p4s)
+        indices = ak.argsort(p4.pt, ascending=False)
         
         # Consistent sorting for all constituent-related fields
         # Note: 'reco_jet_p4', 'gen_jet_tau_p4', 'gen_jet_p4', 'gen_jet_tau_decaymode', 
