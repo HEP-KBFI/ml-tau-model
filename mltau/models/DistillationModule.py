@@ -8,6 +8,9 @@ from mltau.tools.losses import TauLoss
 from mltau.models.SingleParTau import ParTau as TeacherParT
 from mltau.models.MixerTau import MixerTau as StudentMixer
 
+from mltau.tools.logging import tagging, kinematics, decay_mode, charge_id
+import awkward as ak
+
 class DistillationModule(L.LightningModule):
     """
     LightningModule for Knowledge Distillation from ParT to MLP-Mixer.
@@ -112,9 +115,9 @@ class DistillationModule(L.LightningModule):
         # 3. Combined Loss
         total_loss = (1 - self.distill_alpha) * task_loss + self.distill_alpha * distill_loss
         
-        self.log("train/total_loss", total_loss, on_step=True, on_epoch=True, prog_bar=True)
-        self.log("train/task_loss", task_loss, on_step=True, on_epoch=True)
-        self.log("train/distill_loss", distill_loss, on_step=True, on_epoch=True)
+        self.log("train_losses/loss", total_loss, on_step=True, on_epoch=True, prog_bar=True)
+        self.log("train_losses/task_loss", task_loss, on_step=True, on_epoch=True)
+        self.log("train_losses/distill_loss", distill_loss, on_step=True, on_epoch=True)
         
         return total_loss
 
@@ -162,10 +165,104 @@ class DistillationModule(L.LightningModule):
         projected_student_embed = self.projection(student_embed)
         distill_loss = self.mse_loss(projected_student_embed, teacher_embed)
         
-        self.log("val/task_loss", task_metrics["loss"], on_epoch=True)
-        self.log("val/distill_loss", distill_loss, on_epoch=True)
+        num_jets = inputs.target["is_tau"].shape[0]
+        self.log("val_losses/loss", task_metrics["loss"], on_epoch=True, batch_size=num_jets)
+        self.log("val_losses/task_loss", task_metrics["loss"], on_epoch=True, batch_size=num_jets)
+        self.log("val_losses/distill_loss", distill_loss, on_epoch=True, batch_size=num_jets)
         
+        self.validation_outputs.append(
+            {
+                "predictions": predictions,
+                "targets": inputs.target,
+                "gen_jet_p4s": inputs.gen_jet_p4s,
+                "reco_jet_p4s": inputs.reco_jet_p4s,
+                "gen_jet_tau_p4s": inputs.gen_jet_tau_p4s,
+                "inputs": inputs if self.task == "charge" else None,
+            }
+        )
         return task_metrics["loss"]
+
+    def on_validation_epoch_start(self):
+        self.validation_outputs = []
+
+    def on_validation_epoch_end(self):
+        if self.trainer.sanity_checking:
+            return
+        self._log_at_epoch_end(dataset="val")
+
+    def _log_at_epoch_end(self, dataset: str):
+        dataset_outputs = self.validation_outputs if dataset == "val" else []
+
+        if dataset_outputs:
+            all_predictions = {}
+            all_targets = {}
+            all_gen_jet_p4s = {}
+            all_gen_jet_tau_p4s = {}
+            all_reco_jet_p4s = {}
+
+            for output in dataset_outputs:
+                for key, pred in output["predictions"].items():
+                    if key not in all_predictions:
+                        all_predictions[key] = []
+                    all_predictions[key].append(pred.detach().cpu())
+
+                for key, target in output["targets"].items():
+                    if key not in all_targets:
+                        all_targets[key] = []
+                    all_targets[key].append(target.detach().cpu())
+
+                for key, value in output["gen_jet_p4s"].items():
+                    if key not in all_gen_jet_p4s:
+                        all_gen_jet_p4s[key] = []
+                    all_gen_jet_p4s[key].append(ak.Array(value.detach().cpu()))
+
+                for key, value in output["reco_jet_p4s"].items():
+                    if key not in all_reco_jet_p4s:
+                        all_reco_jet_p4s[key] = []
+                    all_reco_jet_p4s[key].append(ak.Array(value.detach().cpu()))
+
+                for key, value in output["gen_jet_tau_p4s"].items():
+                    if key not in all_gen_jet_tau_p4s:
+                        all_gen_jet_tau_p4s[key] = []
+                    all_gen_jet_tau_p4s[key].append(ak.Array(value.detach().cpu()))
+
+            for key in all_predictions:
+                all_predictions[key] = ak.concatenate(all_predictions[key], axis=0)
+            for key in all_targets:
+                all_targets[key] = ak.concatenate(all_targets[key], axis=0)
+            for key in all_gen_jet_p4s:
+                all_gen_jet_p4s[key] = ak.concatenate(all_gen_jet_p4s[key], axis=0)
+            for key in all_reco_jet_p4s:
+                all_reco_jet_p4s[key] = ak.concatenate(all_reco_jet_p4s[key], axis=0)
+            for key in all_gen_jet_tau_p4s:
+                all_gen_jet_tau_p4s[key] = ak.concatenate(all_gen_jet_tau_p4s[key], axis=0)
+
+            gen_jet_p4s = ak.Array(all_gen_jet_p4s)
+            reco_jet_p4s = ak.Array(all_reco_jet_p4s)
+            gen_jet_tau_p4s = ak.Array(all_gen_jet_tau_p4s)
+
+            self._log_task_metrics(
+                targets=all_targets,
+                predictions=all_predictions,
+                gen_jet_p4s=gen_jet_p4s,
+                gen_jet_tau_p4s=gen_jet_tau_p4s,
+                reco_jet_p4s=reco_jet_p4s,
+                tb_logger=self.logger.experiment,
+                current_epoch=self.current_epoch,
+                dataset=dataset,
+            )
+            dataset_outputs.clear()
+
+    def _log_task_metrics(self, targets, predictions, gen_jet_p4s, gen_jet_tau_p4s, reco_jet_p4s, tb_logger, current_epoch, dataset):
+        kwargs = dict(targets=targets, predictions=predictions, tb_logger=tb_logger, current_epoch=current_epoch)
+        if self.task == "is_tau":
+            tagging.log_all_tagging_metrics(gen_jet_p4s=gen_jet_p4s, gen_jet_tau_p4s=gen_jet_tau_p4s, reco_jet_p4s=reco_jet_p4s, cfg=self.cfg, dataset=dataset, **kwargs)
+        elif self.task == "charge":
+            charge_id.log_charge_id_performance(gen_jet_tau_p4s=gen_jet_tau_p4s, reco_jet_p4s=reco_jet_p4s, cfg=self.cfg, dataset=dataset, **kwargs)
+        elif self.task == "decay_mode":
+            decay_mode.log_all_decay_mode_metrics(**kwargs)
+        elif self.task == "kinematics":
+            kinematics.log_all_kinematics_metrics(reco_jet_p4s=reco_jet_p4s, gen_jet_tau_p4s=gen_jet_tau_p4s, cfg=self.cfg, dataset=dataset, **kwargs)
 
     def configure_optimizers(self):
         optimizer = torch.optim.AdamW(
