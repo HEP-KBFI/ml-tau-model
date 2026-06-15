@@ -41,6 +41,14 @@ def train(cfg: DictConfig):
     os.makedirs(log_dir, exist_ok=True)
     os.makedirs(tb_log_dir, exist_ok=True)
 
+    # Log dataset size
+    datamodule.setup("fit")
+    n_train = len(datamodule.train_dataloader().dataset.cand_features)
+    n_val = len(datamodule.val_dataloader().dataset.cand_features)
+    with open(os.path.join(cfg.output_dir, "dataset_size.txt"), "w") as f:
+        f.write(f"train: {n_train}\nval: {n_val}\ntotal: {n_train + n_val}\n")
+    print(f"[INFO] Dataset size saved to {cfg.output_dir}/dataset_size.txt")
+
     # Configure callbacks
     callbacks = [
         TQDMProgressBar(refresh_rate=100),
