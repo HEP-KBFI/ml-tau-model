@@ -43,8 +43,18 @@ def train(cfg: DictConfig):
 
     # Log dataset size
     datamodule.setup("fit")
-    n_train = len(datamodule.train_dataloader().dataset.cand_features)
-    n_val = len(datamodule.val_dataloader().dataset.cand_features)
+    train_ds = datamodule.train_dataloader().dataset
+    val_ds = datamodule.val_dataloader().dataset
+
+    def get_ds_size(ds):
+        if hasattr(ds, "cand_features"):
+            return len(ds.cand_features)
+        elif hasattr(ds, "num_rows"):
+            return ds.num_rows
+        return 0
+
+    n_train = get_ds_size(train_ds)
+    n_val = get_ds_size(val_ds)
     with open(os.path.join(cfg.output_dir, "dataset_size.txt"), "w") as f:
         f.write(f"train: {n_train}\nval: {n_val}\ntotal: {n_train + n_val}\n")
     print(f"[INFO] Dataset size saved to {cfg.output_dir}/dataset_size.txt")
