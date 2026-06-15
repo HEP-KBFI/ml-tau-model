@@ -114,6 +114,7 @@ class ParTau(ParticleTransformer):
         cand_features,
         cand_kinematics_pxpypze=None,
         cand_mask=None,
+        return_embedding=False,
     ):
         # cand_features: (N=num_batches, C=num_features, P=num_particles)
         # cand_kinematics_pxpypze: (N, 4, P) [px,py,pz,energy]
@@ -173,4 +174,6 @@ class ParTau(ParticleTransformer):
                     f"This model is not suitable for the chosen task of {self.task}"
                 )
 
+            if return_embedding:
+                return output, x_cls
             return output

@@ -67,6 +67,7 @@ class MixerTau(nn.Module):
         cand_features,
         cand_kinematics_pxpypze=None,
         cand_mask=None,
+        return_embedding=False,
     ):
         # cand_features: (N, C, P)
         # cand_mask: (N, 1, P)
@@ -88,4 +89,6 @@ class MixerTau(nn.Module):
                 f"This model is not suitable for the chosen task of {self.task}"
             )
 
+        if return_embedding:
+            return output, x_cls
         return output

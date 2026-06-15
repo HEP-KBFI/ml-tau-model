@@ -1,5 +1,6 @@
 dataset:
   max_cands: 20
+  sort_by_pt: false # Recommended 'true' for MLP-Mixer
   data_dir: /scratch/persistent/laurits/ml-tau/0528_Large_stats/
   relative_sizes:
     train: 0.7
