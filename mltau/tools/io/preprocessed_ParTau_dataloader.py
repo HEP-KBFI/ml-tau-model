@@ -62,7 +62,7 @@ class ParticleTransformerDataset(IterableDataset):
             )
 
 
-def _load_and_split(pt_paths: list[str], train_frac: float) -> tuple:
+def _load_and_split(pt_paths: list[str], train_frac: float, limit_samples: int = None) -> tuple:
     """Load all .pt files once, globally shuffle, then return (train_tensors, val_tensors).
     Both slices are views of the same shared-memory storage — no extra RAM used."""
     print(f"Loading {len(pt_paths)} .pt file(s) into shared memory...", flush=True)
@@ -83,7 +83,11 @@ def _load_and_split(pt_paths: list[str], train_frac: float) -> tuple:
 
     # Global shuffle with fixed seed so train/val split is reproducible.
     N = cf.shape[0]
-    perm = torch.randperm(N, generator=torch.Generator().manual_seed(42))
+    if limit_samples is not None and limit_samples < N:
+        print(f"Limiting total samples from {N:,} to {limit_samples:,}", flush=True)
+        N = limit_samples
+
+    perm = torch.randperm(cf.shape[0], generator=torch.Generator().manual_seed(42))[:N]
     cf = cf[perm].share_memory_()
     ck = ck[perm].share_memory_()
     tgt = {k: v[perm].share_memory_() for k, v in tgt.items()}
@@ -173,7 +177,10 @@ class ParTDataModule(LightningDataModule):
             all_train_paths = self._get_pt_paths("train")
             total = sum(self.cfg.dataset.relative_sizes[s] for s in ["train", "val"])
             train_frac = self.cfg.dataset.relative_sizes["train"] / total
-            train_tensors, val_tensors = _load_and_split(all_train_paths, train_frac)
+            limit_samples = self.cfg.dataset.get("limit_samples", None)
+            train_tensors, val_tensors = _load_and_split(
+                all_train_paths, train_frac, limit_samples=limit_samples
+            )
             # Add the scaling call
             train_tensors, val_tensors = scaling.fit_and_apply_input_scaling(
                 train_tensors, val_tensors, self.cfg
