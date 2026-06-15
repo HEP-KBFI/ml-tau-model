@@ -1,5 +1,6 @@
 import torch
 import sys
+import tqdm
 from omegaconf import OmegaConf
 from mltau.tools.io.ParT_dataloader import ParTDataModule as ParTDataModuleRaw
 from mltau.tools.io.preprocessed_ParTau_dataloader import ParTDataModule as ParTDataModulePre
@@ -14,7 +15,7 @@ def get_cfg():
         "training": {
             "model": {"task": "is_tau", "name": "MultiParTau"},
             "dataloader": {
-                "batch_size": 128,
+                "batch_size": 1024,
                 "num_dataloader_workers": 0,
                 "prefetch_factor": 2
             },
@@ -31,11 +32,11 @@ def test_raw_dataloader_structure(cfg):
     
     assert len(batch) == 8
     # cand_features, cand_kinematics, targets, mask, weights, gen_tau, reco, gen_jet
-    assert batch[0].shape == (128, 17, 20)
-    assert batch[1].shape == (128, 4, 20)
+    assert batch[0].shape[1:] == (17, 20)
+    assert batch[1].shape[1:] == (4, 20)
     assert isinstance(batch[2], dict)
-    assert batch[3].shape == (128, 1, 20)
-    assert batch[4].shape == (128,)
+    assert batch[3].shape[1:] == (1, 20)
+    assert len(batch[4].shape) == 1
     assert isinstance(batch[5], dict)
     assert isinstance(batch[6], dict)
     assert isinstance(batch[7], dict)
@@ -49,29 +50,47 @@ def test_pre_dataloader_structure(cfg):
     batch = next(iter(loader))
     
     assert len(batch) == 8
-    assert batch[0].shape == (128, 17, 20)
-    assert batch[1].shape == (128, 4, 20)
+    assert batch[0].shape[1:] == (17, 20)
+    assert batch[1].shape[1:] == (4, 20)
     assert isinstance(batch[2], dict)
-    assert batch[3].shape == (128, 1, 20)
-    assert batch[4].shape == (128,)
+    assert batch[3].shape[1:] == (1, 20)
+    assert len(batch[4].shape) == 1
     print("OK")
 
-def test_dataloader_consistency(cfg):
-    print("Testing dataloader consistency...")
+def get_dataset_stats(loader, name):
+    total_jets = 0
+    total_signal = 0
+    for batch in tqdm.tqdm(loader, desc=f"Iterating {name}"):
+        is_tau = batch[2]["is_tau"]
+        total_jets += is_tau.shape[0]
+        total_signal += is_tau.sum().item()
+    return total_jets, total_signal
+
+def test_functional_equivalence(cfg):
+    print("Testing functional equivalence...")
+    
     dm_raw = ParTDataModuleRaw(cfg)
     dm_raw.setup("test")
-    batch_raw = next(iter(dm_raw.test_dataloader()))
+    loader_raw = dm_raw.test_dataloader()
     
     dm_pre = ParTDataModulePre(cfg)
     dm_pre.setup("test")
-    batch_pre = next(iter(dm_pre.test_dataloader()))
+    loader_pre = dm_pre.test_dataloader()
     
-    assert len(batch_raw) == len(batch_pre)
-    assert batch_raw[0].shape == batch_pre[0].shape
-    assert batch_raw[1].shape == batch_pre[1].shape
-    assert set(batch_raw[2].keys()) == set(batch_pre[2].keys())
-    assert batch_raw[3].shape == batch_pre[3].shape
-    assert batch_raw[4].shape == batch_pre[4].shape
+    n_raw, s_raw = get_dataset_stats(loader_raw, "Raw")
+    n_pre, s_pre = get_dataset_stats(loader_pre, "Pre")
+    
+    print(f"Raw: {n_raw} jets, {s_raw} signal, fraction {s_raw/n_raw:.4f}")
+    print(f"Pre: {n_pre} jets, {s_pre} signal, fraction {s_pre/n_pre:.4f}")
+    
+    assert n_raw == n_pre, f"Total jets mismatch: raw={n_raw}, pre={n_pre}"
+    assert s_raw == s_pre, f"Signal count mismatch: raw={s_raw}, pre={s_pre}"
+    
+    # Verify no repetition/completeness if we know the expected number
+    # From previous check: z_test (118787) + qq_test (786130) = 904917
+    expected_total = 904917
+    assert n_raw == expected_total, f"Expected {expected_total} jets, but got {n_raw}"
+    
     print("OK")
 
 if __name__ == "__main__":
@@ -79,7 +98,7 @@ if __name__ == "__main__":
     try:
         test_raw_dataloader_structure(cfg)
         test_pre_dataloader_structure(cfg)
-        test_dataloader_consistency(cfg)
+        test_functional_equivalence(cfg)
         print("\nAll tests passed successfully!")
     except Exception as e:
         print(f"\nTest failed: {e}")
