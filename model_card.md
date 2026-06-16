@@ -67,7 +67,7 @@ The models utilize the **Particle Transformer (ParT)** architecture, which uses 
   - Kinematics: 2.0
 
 ## Trained Models & Git Hashes
-The models located in the `cld/qq_vs_z_91gev/0609` directories correspond to the following configurations and git hashes:
+The models located in the [cld/qq_vs_z_91gev/0612](https://huggingface.co/HEP-KBFI/fcc-tau/tree/main/cld/qq_vs_z_91gev/0612) directories correspond to the following configurations and git hashes:
 
 | Model Name | Task | Git Hash |
 |------------|------|----------|
