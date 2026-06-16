@@ -2,10 +2,14 @@ import os
 import hydra
 import lightning as L
 import numpy as np
+import torch
 
-from omegaconf import DictConfig
+from omegaconf import DictConfig, ListConfig
 from lightning.pytorch.loggers import TensorBoardLogger  # , CometLogger
 from lightning.pytorch.callbacks import TQDMProgressBar, ModelCheckpoint, Callback
+
+if hasattr(torch.serialization, "add_safe_globals"):
+    torch.serialization.add_safe_globals([DictConfig, ListConfig])
 
 from mltau.tools.io import preprocessed_ParTau_dataloader as dl_pre
 from mltau.tools.io import ParT_dataloader as dl_raw
@@ -106,6 +110,7 @@ def train(cfg: DictConfig):
                 input_dim=17,
                 num_dm_classes=6,
                 task=cfg.training.model.task,
+                weights_only=False,
             )
         else:
             raise ValueError(f"Unknown model '{model_name}' for prediction.")

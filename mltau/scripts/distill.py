@@ -2,6 +2,7 @@ import os
 import hydra
 import lightning as L
 from omegaconf import DictConfig, OmegaConf
+from lightning.pytorch.loggers import TensorBoardLogger
 
 from mltau.tools.io import ParT_dataloader as dl
 from mltau.models.DistillationModule import DistillationModule
@@ -29,13 +30,21 @@ def distill(cfg: DictConfig):
         distill_alpha=cfg.get("distill_alpha", 0.5)
     )
 
-    log_dir = os.path.join(cfg.output_dir, "distill_logs")
-    os.makedirs(log_dir, exist_ok=True)
+    tb_log_dir = os.path.join(cfg.output_dir, "tensorboard")
+    os.makedirs(tb_log_dir, exist_ok=True)
 
     trainer = L.Trainer(
         max_epochs=cfg.training.trainer.max_epochs,
         accelerator="auto",
         precision="16-mixed",
+        logger=[
+            TensorBoardLogger(
+                save_dir=tb_log_dir,
+                name="ParTau_distill_experiment",
+                log_graph=False,
+                default_hp_metric=False,
+            ),
+        ],
         default_root_dir=cfg.output_dir,
     )
 
