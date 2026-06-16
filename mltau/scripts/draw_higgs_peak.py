@@ -53,9 +53,6 @@ def get_branches():
         "_PandoraPFOs_tracks.index", "_PandoraPFOs_tracks.collectionID"
     ]
 
-from ntupelizer.tools import matching as m
-from ntupelizer.tools import gen_tau_info_matcher as gtim
-
 def process_single_file(args):
     file_path, ckpt_path, cfg, device_str, max_events, is_signal = args
     device = torch.device(device_str)
@@ -76,6 +73,8 @@ def process_single_file(args):
     
     file_gen_masses = []
     file_jet_pts = []
+    file_tau_scores = []
+    file_tau_truth = [] 
     branches = get_branches()
     
     print(f"Processing {file_path}...")
@@ -100,34 +99,30 @@ def process_single_file(args):
             reco_jets, reco_constituent_indices = cl.RecoJetClusterer(particles=reco_particles, particles_p4=reco_particles_p4).results
             if len(reco_jets) == 0: continue
             
-            if is_signal:
-                event_gen_higgs_masses = []
-                for i_ev in range(len(arrays)):
-                    ev_pdgs = arrays["MCParticles.PDG"][i_ev]
-                    tau_indices = np.where(abs(ev_pdgs) == 15)[0]
-                    tau_vis_p4s = []
-                    for t_idx in tau_indices:
-                        descendants = []
-                        to_process = [t_idx]
-                        while to_process:
-                            curr = to_process.pop()
-                            d_begin = arrays["MCParticles.daughters_begin"][i_ev][curr]
-                            d_end = arrays["MCParticles.daughters_end"][i_ev][curr]
-                            d_indices = arrays["_MCParticles_daughters.index"][i_ev][d_begin:d_end]
-                            for d_idx in d_indices:
-                                if arrays["MCParticles.generatorStatus"][i_ev][d_idx] == 1:
-                                    d_pdg = abs(arrays["MCParticles.PDG"][i_ev][d_idx])
-                                    if d_pdg not in [12, 14, 16]: descendants.append(d_idx)
-                                else: to_process.append(d_idx)
-                        if descendants:
-                            ev_px = arrays["MCParticles.momentum.x"][i_ev][descendants]; ev_py = arrays["MCParticles.momentum.y"][i_ev][descendants]
-                            ev_pz = arrays["MCParticles.momentum.z"][i_ev][descendants]; ev_m = arrays["MCParticles.mass"][i_ev][descendants]
-                            ev_e = np.sqrt(ev_px**2 + ev_py**2 + ev_pz**2 + ev_m**2)
-                            total_p4 = vector.obj(px=ak.sum(ev_px), py=ak.sum(ev_py), pz=ak.sum(ev_pz), energy=ak.sum(ev_e))
-                            tau_vis_p4s.append(total_p4)
-                    if len(tau_vis_p4s) == 2: event_gen_higgs_masses.append((tau_vis_p4s[0] + tau_vis_p4s[1]).mass)
-                    else: event_gen_higgs_masses.append(-1)
+            reco_jets_v = g.reinitialize_p4(reco_jets)
             
+            # Ground truth visible taus for ROC and Gen Mass
+            event_true_tau_vis = []
+            for i_ev in range(len(arrays)):
+                ev_pdgs = arrays["MCParticles.PDG"][i_ev]
+                tau_indices = np.where(abs(ev_pdgs) == 15)[0]
+                t_vis = []
+                for t_idx in tau_indices:
+                    descendants = []
+                    to_process = [t_idx]
+                    while to_process:
+                        curr = to_process.pop()
+                        d_indices = arrays["_MCParticles_daughters.index"][i_ev][arrays["MCParticles.daughters_begin"][i_ev][curr]:arrays["MCParticles.daughters_end"][i_ev][curr]]
+                        for d_idx in d_indices:
+                            if arrays["MCParticles.generatorStatus"][i_ev][d_idx] == 1:
+                                if abs(arrays["MCParticles.PDG"][i_ev][d_idx]) not in [12, 14, 16]: descendants.append(d_idx)
+                            else: to_process.append(d_idx)
+                    if descendants:
+                        ev_px = arrays["MCParticles.momentum.x"][i_ev][descendants]; ev_py = arrays["MCParticles.momentum.y"][i_ev][descendants]
+                        ev_pz = arrays["MCParticles.momentum.z"][i_ev][descendants]; ev_m = arrays["MCParticles.mass"][i_ev][descendants]
+                        t_vis.append(vector.obj(px=ak.sum(ev_px), py=ak.sum(ev_py), pz=ak.sum(ev_pz), energy=ak.sum(np.sqrt(ev_px**2 + ev_py**2 + ev_pz**2 + ev_m**2))))
+                event_true_tau_vis.append(t_vis)
+
             file_jet_pts.extend(ak.to_numpy(ak.flatten(reco_jets.pt)))
             valid_particle_mask = reco_particles["PDG"] != 0
             all_particle_lifetime_info = lt.find_all_track_pcas(events=arrays, reco_particle_collection="PandoraPFOs", track_collection="SiTracks_Refitted", vertex_collection="PrimaryVertices", valid_particle_mask=valid_particle_mask)
@@ -177,30 +172,44 @@ def process_single_file(args):
                 logits = preds["is_tau"].cpu().numpy(); scores = np.exp(logits) / np.sum(np.exp(logits), axis=1, keepdims=True); tau_scores = scores[:, 1]
                 charges = torch.sigmoid(preds["charge"]).cpu().numpy().flatten(); kinematics = preds["kinematics"].cpu().numpy()
                 
+                # ROC Truth assignment
+                ev_reco_v = reco_jets_v[i_ev]
+                ev_true_vis = event_true_tau_vis[i_ev]
+                for ir, rj in enumerate(ev_reco_v):
+                    is_true_tau = False
+                    for gj in ev_true_vis:
+                        if rj.deltaR(gj) < 0.2:
+                            is_true_tau = True; break
+                    file_tau_scores.append(tau_scores[ir]); file_tau_truth.append(is_true_tau)
+
                 idx05 = np.where(tau_scores > 0.5)[0]; idx09 = np.where(tau_scores > 0.9)[0]
                 if len(idx05) == 2:
                     p4_1 = decode_kinematic_predictions(kinematics[idx05[0]:idx05[0]+1], ev_jets[idx05[0]:idx05[0]+1])[0]
                     p4_2 = decode_kinematic_predictions(kinematics[idx05[1]:idx05[1]+1], ev_jets[idx05[1]:idx05[1]+1])[0]
                     file_masses_id05.append((p4_1 + p4_2).mass)
                 if len(idx09) == 2:
-                    p4_1 = decode_kinematic_predictions(kinematics[idx09[0]:idx09[0]+1], ev_jets[idx09[0]:idx09[0]+1])[0]
-                    p4_2 = decode_kinematic_predictions(kinematics[idx09[1]:idx09[1]+1], ev_jets[idx09[1]:idx09[1]+1])[0]
+                    idx1, idx2 = idx09[0], idx09[1]
+                    p4_1 = decode_kinematic_predictions(kinematics[idx1:idx1+1], ev_jets[idx1:idx1+1])[0]
+                    p4_2 = decode_kinematic_predictions(kinematics[idx2:idx2+1], ev_jets[idx2:idx2+1])[0]
                     m_reco = (p4_1 + p4_2).mass; file_masses_id09.append(m_reco)
-                    if (1 if charges[idx09[0]] > 0.5 else -1) * (1 if charges[idx09[1]] > 0.5 else -1) < 0:
+                    if (1 if charges[idx1] > 0.5 else -1) * (1 if charges[idx2] > 0.5 else -1) < 0:
                         file_masses_id09os.append(m_reco)
-                        if is_signal: file_gen_masses.append(event_gen_higgs_masses[i_ev])
-    return (file_masses_id05, file_masses_id09, file_masses_id09os), file_jet_pts, file_gen_masses
+                        if is_signal and len(ev_true_vis) == 2: file_gen_masses.append((ev_true_vis[0] + ev_true_vis[1]).mass)
+                        else: file_gen_masses.append(-1)
+    return (file_masses_id05, file_masses_id09, file_masses_id09os), file_jet_pts, file_gen_masses, (file_tau_scores, file_tau_truth)
 
 def process_files_parallel(file_paths, ckpt_path, cfg, device_str, max_events, n_workers, is_signal=False):
     args = [(fp, ckpt_path, cfg, device_str, max_events, is_signal) for fp in file_paths]
     all_masses = {"05": [], "09": [], "09os": []}
     all_gen_masses = []; all_jet_pts = []
+    all_scores = []; all_truth = []
     ctx = mp.get_context('spawn') if 'cuda' in device_str else mp.get_context('fork')
     with ctx.Pool(processes=n_workers) as pool:
-        for (m05, m09, m09os), jet_pts, gen_masses in tqdm(pool.imap_unordered(process_single_file, args), total=len(file_paths), desc="Processing files"):
+        for (m05, m09, m09os), jet_pts, gen_masses, (scores, truth) in tqdm(pool.imap_unordered(process_single_file, args), total=len(file_paths), desc="Processing files"):
             all_masses["05"].extend(m05); all_masses["09"].extend(m09); all_masses["09os"].extend(m09os)
             all_jet_pts.extend(jet_pts); all_gen_masses.extend(gen_masses)
-    return all_masses, np.array(all_jet_pts), np.array(all_gen_masses)
+            all_scores.extend(scores); all_truth.extend(truth)
+    return all_masses, np.array(all_jet_pts), np.array(all_gen_masses), (np.array(all_scores), np.array(all_truth))
 
 def main():
     parser = argparse.ArgumentParser(description="Reconstruct Higgs to tautau peak.")
@@ -217,22 +226,65 @@ def main():
     t_files = sorted(glob.glob(os.path.join(t_dir, "**/*.root"), recursive=True))[:args.n_files]
     q_files = sorted(glob.glob(os.path.join(q_dir, "**/*.root"), recursive=True))[:args.n_files]
     
-    print("Processing signal..."); sig_m, sig_pt, sig_gen = process_files_parallel(s_files, args.ckpt, cfg, device_str, args.max_events, args.n_workers, is_signal=True)
-    print("Processing ttbar background..."); tt_m, tt_pt, _ = process_files_parallel(t_files, args.ckpt, cfg, device_str, args.max_events, args.n_workers, is_signal=False)
-    print("Processing qq background..."); qq_m, qq_pt, _ = process_files_parallel(q_files, args.ckpt, cfg, device_str, args.max_events, args.n_workers, is_signal=False)
+    print("Processing signal..."); sig_m, sig_pt, sig_gen, (sig_scores, sig_truth) = process_files_parallel(s_files, args.ckpt, cfg, device_str, args.max_events, args.n_workers, is_signal=True)
+    print("Processing ttbar background..."); tt_m, tt_pt, _, (tt_scores, tt_truth) = process_files_parallel(t_files, args.ckpt, cfg, device_str, args.max_events, args.n_workers, is_signal=False)
+    print("Processing qq background..."); qq_m, qq_pt, _, (qq_scores, qq_truth) = process_files_parallel(q_files, args.ckpt, cfg, device_str, args.max_events, args.n_workers, is_signal=False)
     
     hep.style.use("CMS")
+    
+    # 4. ROC Curve for Tau ID
+    from sklearn.metrics import roc_curve, auc
+    
+    # Filter signal to strictly matched true taus
+    sig_scores_true = sig_scores[sig_truth == True]
+    
+    # Filter backgrounds to strictly UNMATCHED fakes
+    tt_scores_fake = tt_scores[tt_truth == False]
+    qq_scores_fake = qq_scores[qq_truth == False]
+    
+    plt.figure(figsize=(10, 10))
+    
+    # Curve 1: ZH vs ttbar
+    if len(sig_scores_true) > 0 and len(tt_scores_fake) > 0:
+        roc_scores_tt = np.concatenate([sig_scores_true, tt_scores_fake])
+        roc_truth_tt = np.concatenate([np.ones_like(sig_scores_true, dtype=bool), np.zeros_like(tt_scores_fake, dtype=bool)])
+        fpr_tt, tpr_tt, _ = roc_curve(roc_truth_tt, roc_scores_tt)
+        roc_auc_tt = auc(fpr_tt, tpr_tt)
+        plt.plot(tpr_tt, fpr_tt, color="red", lw=2, label=rf"ParTau vs $t\bar{{t}}$ (AUC = {roc_auc_tt:.3f})")
+    
+    # Curve 2: ZH vs qq
+    if len(sig_scores_true) > 0 and len(qq_scores_fake) > 0:
+        roc_scores_qq = np.concatenate([sig_scores_true, qq_scores_fake])
+        roc_truth_qq = np.concatenate([np.ones_like(sig_scores_true, dtype=bool), np.zeros_like(qq_scores_fake, dtype=bool)])
+        fpr_qq, tpr_qq, _ = roc_curve(roc_truth_qq, roc_scores_qq)
+        roc_auc_qq = auc(fpr_qq, tpr_qq)
+        plt.plot(tpr_qq, fpr_qq, color="green", lw=2, label=rf"ParTau vs $q\bar{{q}}$ (AUC = {roc_auc_qq:.3f})")
+
+    plt.xlim((0, 1))
+    plt.ylim((1e-5, 1))
+    plt.yscale("log")
+    plt.xlabel(r"$\varepsilon_{\tau}$", fontsize=30)
+    plt.ylabel(r"$P_{misid}$", fontsize=30)
+    plt.tick_params(axis="x", labelsize=30)
+    plt.tick_params(axis="y", labelsize=30)
+    plt.gca().xaxis.set_major_locator(plt.MultipleLocator(0.2))
+    
+    plt.legend(loc="lower right", prop={"size": 30})
+    plt.grid(alpha=0.3)
+    plt.savefig("tau_id_roc.png", bbox_inches="tight")
+    print("ROC curves saved to tau_id_roc.png")
+
     plt.figure(figsize=(12, 10)); bins_m = np.linspace(0, 200, 50)
-    plt.hist(sig_m["05"], bins=bins_m, histtype="step", label="Sig (ID > 0.5)", color="blue", ls=":")
-    plt.hist(sig_m["09"], bins=bins_m, histtype="step", label="Sig (ID > 0.9)", color="blue", ls="--")
-    plt.hist(sig_m["09os"], bins=bins_m, histtype="step", label="Sig (ID > 0.9+OS)", color="blue", lw=2)
-    plt.hist(tt_m["05"], bins=bins_m, histtype="step", label="ttbar (ID > 0.5)", color="red", ls=":")
-    plt.hist(tt_m["09"], bins=bins_m, histtype="step", label="ttbar (ID > 0.9)", color="red", ls="--")
-    plt.hist(tt_m["09os"], bins=bins_m, histtype="step", label="ttbar (ID > 0.9+OS)", color="red", lw=2)
-    plt.hist(qq_m["05"], bins=bins_m, histtype="step", label="qq (ID > 0.5)", color="green", ls=":")
-    plt.hist(qq_m["09"], bins=bins_m, histtype="step", label="qq (ID > 0.9)", color="green", ls="--")
-    plt.hist(qq_m["09os"], bins=bins_m, histtype="step", label="qq (ID > 0.9+OS)", color="green", lw=2)
-    plt.xlabel(r"Visible $M_{\tau\tau}$ [GeV]"); plt.ylabel("Events"); plt.legend(ncol=3); plt.grid(alpha=0.3); plt.title("Selection Cut Flow"); plt.savefig("higgs_peak_cutflow.png")
+    plt.hist(sig_m["05"], bins=bins_m, histtype="step", label=r"ZH $\to \tau\tau$ (ID > 0.5)", color="blue", ls=":")
+    plt.hist(sig_m["09"], bins=bins_m, histtype="step", label=r"ZH $\to \tau\tau$ (ID > 0.9)", color="blue", ls="--")
+    plt.hist(sig_m["09os"], bins=bins_m, histtype="step", label=r"ZH $\to \tau\tau$ (ID > 0.9+OS)", color="blue", lw=2)
+    plt.hist(tt_m["05"], bins=bins_m, histtype="step", label=r"$t\bar{t}$ (ID > 0.5)", color="red", ls=":")
+    plt.hist(tt_m["09"], bins=bins_m, histtype="step", label=r"$t\bar{t}$ (ID > 0.9)", color="red", ls="--")
+    plt.hist(tt_m["09os"], bins=bins_m, histtype="step", label=r"$t\bar{t}$ (ID > 0.9+OS)", color="red", lw=2)
+    plt.hist(qq_m["05"], bins=bins_m, histtype="step", label=r"$q\bar{q}$ (ID > 0.5)", color="green", ls=":")
+    plt.hist(qq_m["09"], bins=bins_m, histtype="step", label=r"$q\bar{q}$ (ID > 0.9)", color="green", ls="--")
+    plt.hist(qq_m["09os"], bins=bins_m, histtype="step", label=r"$q\bar{q}$ (ID > 0.9+OS)", color="green", lw=2)
+    plt.xlabel(r"Visible $M_{\tau\tau}$ [GeV]"); plt.ylabel("Events"); plt.legend(ncol=3, fontsize=9); plt.grid(alpha=0.3); plt.title("Selection Cut Flow"); plt.savefig("higgs_peak_cutflow.png")
     
     plt.figure(figsize=(10, 8)); bins_pt = np.linspace(0, 150, 60)
     plt.hist(sig_pt, bins=bins_pt, histtype="step", label="ZH", color="blue", lw=2, density=True)
@@ -241,8 +293,8 @@ def main():
     plt.xlabel(r"Jet $p_T$ [GeV]"); plt.ylabel("Normalized Yield"); plt.legend(); plt.grid(alpha=0.3); plt.savefig("all_jets_pt.png")
     
     if np.sum(sig_gen > 0) > 0:
-        plt.figure(figsize=(10, 8)); plt.hist2d(sig_gen[sig_gen > 0], np.array(sig_m["09os"])[sig_gen > 0], bins=(50, 50), range=[[0, 150], [0, 150]], cmap="Blues")
-        plt.colorbar(label="Events"); plt.plot([0, 150], [0, 150], color="red", ls="--"); plt.xlabel("Gen Visible Mass [GeV]"); plt.ylabel("Reco Visible Mass [GeV]"); plt.savefig("gen_vs_reco_mass.png")
+        plt.figure(figsize=(10, 10)); plt.hist2d(sig_gen[sig_gen > 0], np.array(sig_m["09os"])[sig_gen > 0], bins=(50, 50), range=[[0, 150], [0, 150]], cmap="Blues")
+        plt.colorbar(label="Events", shrink=0.8); plt.plot([0, 150], [0, 150], color="red", ls="--"); plt.xlabel("Gen Visible Mass [GeV]"); plt.ylabel("Reco Visible Mass [GeV]"); plt.gca().set_aspect('equal'); plt.savefig("gen_vs_reco_mass.png")
 
 if __name__ == "__main__":
     main()
