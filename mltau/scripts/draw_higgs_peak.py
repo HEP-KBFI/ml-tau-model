@@ -105,7 +105,8 @@ def process_single_file(args):
             event_true_tau_vis = []
             for i_ev in range(len(arrays)):
                 ev_pdgs = arrays["MCParticles.PDG"][i_ev]
-                tau_indices = np.where(abs(ev_pdgs) == 15)[0]
+                status = arrays["MCParticles.generatorStatus"][i_ev]
+                tau_indices = np.where((abs(ev_pdgs) == 15) & (status == 2))[0]
                 t_vis = []
                 for t_idx in tau_indices:
                     descendants = []
@@ -183,11 +184,15 @@ def process_single_file(args):
                     file_tau_scores.append(tau_scores[ir]); file_tau_truth.append(is_true_tau)
 
                 idx05 = np.where(tau_scores > 0.5)[0]; idx09 = np.where(tau_scores > 0.9)[0]
-                if len(idx05) == 2:
+                if len(idx05) >= 2:
+                    # Sort indices by tau_score in descending order and take the top 2
+                    idx05 = idx05[np.argsort(tau_scores[idx05])[::-1]][:2]
                     p4_1 = decode_kinematic_predictions(kinematics[idx05[0]:idx05[0]+1], ev_jets[idx05[0]:idx05[0]+1])[0]
                     p4_2 = decode_kinematic_predictions(kinematics[idx05[1]:idx05[1]+1], ev_jets[idx05[1]:idx05[1]+1])[0]
                     file_masses_id05.append((p4_1 + p4_2).mass)
-                if len(idx09) == 2:
+                if len(idx09) >= 2:
+                    # Sort indices by tau_score in descending order and take the top 2
+                    idx09 = idx09[np.argsort(tau_scores[idx09])[::-1]][:2]
                     idx1, idx2 = idx09[0], idx09[1]
                     p4_1 = decode_kinematic_predictions(kinematics[idx1:idx1+1], ev_jets[idx1:idx1+1])[0]
                     p4_2 = decode_kinematic_predictions(kinematics[idx2:idx2+1], ev_jets[idx2:idx2+1])[0]
