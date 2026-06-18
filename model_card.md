@@ -12,7 +12,7 @@ tags:
 This repository contains models for tau reconstruction and identification at future colliders (FCC), based on the Particle Transformer (ParT) architecture.
 
 ## Dataset
-- **Name:** `0509_dsinphi_to_sindphi`
+- **Name:** `0528_Large_stats`
 - **Source:** Preprocessed jet-based FCC dataset for hadronic tau reconstruction.
 - **Physics Processes:**
   - **Signal:** $Z \to \tau^+\tau^-$ events.
@@ -23,16 +23,16 @@ This repository contains models for tau reconstruction and identification at fut
   - **Simulation:** Geant4 (via `ddsim`).
   - **Software Stack:** [Key4hep Project](https://github.com/key4hep) (release 2025-05-29). [Key4hep-sim (v1.2.5)](https://github.com/HEP-KBFI/key4hep-sim/tree/v1.2.5)
   - **Reconstruction:** Standard CLD reconstruction (`CLDReconstruction.py`).
-- **Split:** 70% Training, 10% Validation, 20% Testing.
+- **Split:** 90% (train+val), 10% (test).
 - **Input Features:** 17 candidate-level features (kinematics, identification, etc.).
 - **Jet Composition:** Maximum of 20 candidates per jet.
 
 ## Dataset Statistics
-- **Total Jets:** 9,049,163
-- **Signal (Tau) Jets:** 1,187,870
-- **Background (Quark/Gluon) Jets:** 7,861,293
-- **Training Set:** 7,075,163 background + 1,069,083 signal jets
-- **Test Set:** 786,130 background + 118,787 signal jets
+- **Total Jets:** 45,219,239
+- **Signal (Tau) Jets:** 5,935,398
+- **Background (Quark/Gluon) Jets:** 39,283,841
+- **Training Set:** 35,355,456 background + 5,341,858 signal jets
+- **Test Set:** 3,928,385 background + 593,540 signal jets
 
 ## Model Architecture
 The models utilize the **Particle Transformer (ParT)** architecture, which uses a combination of particle-level and pair-level features to learn jet representations.
@@ -67,15 +67,15 @@ The models utilize the **Particle Transformer (ParT)** architecture, which uses 
   - Kinematics: 2.0
 
 ## Trained Models & Git Hashes
-The models located in the `outputs/0609_*` directories correspond to the following configurations and git hashes:
+The models located in the [cld/qq_vs_z_91gev/0612](https://huggingface.co/HEP-KBFI/fcc-tau/tree/main/cld/qq_vs_z_91gev/0612) directories correspond to the following configurations and git hashes:
 
 | Model Name | Task | Git Hash |
 |------------|------|----------|
-| `multipartau_full` | Multi-task | `fef7149` |
-| `single_charge` | Charge | `a5d7ed8` |
-| `single_decaymode` | Decay Mode | `a5d7ed8` |
-| `single_kinematics` | Kinematics | `a5d7ed8` |
-| `single_tauid` | Tau ID | `a5d7ed8` |
+| `multipartau_full` | Multi-task | `b8483f6` |
+| `single_charge` | Charge | `b8483f6` |
+| `single_decaymode` | Decay Mode | `b8483f6` |
+| `single_kinematics` | Kinematics | `b8483f6` |
+| `single_tauid` | Tau ID | `b8483f6` |
 
 ---
 *Generated based on training configurations and experiment outputs.*
