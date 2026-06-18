@@ -58,6 +58,26 @@ ALGORITHM_PLOT_STYLES:
         label: HPS
         lw: 3
         marker_size: 20
+    Mixer_standard:
+        name: Mixer (Scratch)
+        marker: "o"
+        hatch: "."
+        color: "#2ca02c"
+        light_color: "#a1d99b"
+        ls: "solid"
+        label: "Mixer (Scratch)"
+        lw: 3
+        marker_size: 15
+    Mixer_distill:
+        name: Mixer (Distilled)
+        marker: "d"
+        hatch: "."
+        color: "#9467bd"
+        light_color: "#bcbddc"
+        ls: "solid"
+        label: "Mixer (Distilled)"
+        lw: 3
+        marker_size: 15
     all:
         name: ParTau
         marker: "X"

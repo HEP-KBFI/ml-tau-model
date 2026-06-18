@@ -204,13 +204,19 @@ def create_predictions_files(
     if model_name == "SingleParTau" and cfg.training.model.task != "is_tau":
         sample_pattern = "z"
 
+    # Search for parquet first, then fallback to pt
     paths_to_process = glob.glob(
-        os.path.join(cfg.dataset.data_dir, f"{sample_pattern}_{split}.pt")
+        os.path.join(cfg.dataset.data_dir, f"{sample_pattern}_{split}.parquet")
     )
     if not paths_to_process:
+        paths_to_process = glob.glob(
+            os.path.join(cfg.dataset.data_dir, f"{sample_pattern}_{split}.pt")
+        )
+
+    if not paths_to_process:
         print(
-            "[WARNING] No input files matched for prediction creation:",
-            os.path.join(cfg.dataset.data_dir, f"{sample_pattern}_{split}.pt"),
+            "[WARNING] No input files matched for prediction creation in:",
+            cfg.dataset.data_dir
         )
         return
     print("[INFO] Prediction inputs:")
@@ -223,18 +229,30 @@ def create_predictions_files(
 def create_predictions_file(
     best_model, input_path: str, model_name: str, cfg: DictConfig
 ):
-    # Load your .pt file and build the dataset
-    tensors = load_tensors(input_path)
-    # Add scaling calls
-    print("[DEBUG] Active scaler:", cfg.training.input_scaling.scaler_path)
-    tensors = scaling.apply_saved_input_scaling_from_cfg(tensors, cfg)
-    dataset = ParticleTransformerDataset(
-        tensors,
-        batch_size=cfg.training.dataloader.batch_size,
-        shuffle=False,
-    )
-    # Create DataLoader
-    dataloader = DataLoader(dataset, batch_size=None)
+    if input_path.endswith(".parquet"):
+        from mltau.tools.io import ParT_dataloader
+        from mltau.tools.io import general as ig
+        test_rowgroups = ig.get_row_groups(input_paths=[input_path])
+        dataset = ParT_dataloader.ParticleTransformerDataset(
+            row_groups=test_rowgroups,
+            cfg=cfg,
+            batch_size=cfg.training.dataloader.batch_size,
+            shuffle=False,
+        )
+        dataloader = DataLoader(dataset, batch_size=None)
+    else:
+        # Load your .pt file and build the dataset
+        tensors = load_tensors(input_path)
+        # Add scaling calls
+        print("[DEBUG] Active scaler:", cfg.training.input_scaling.scaler_path)
+        tensors = scaling.apply_saved_input_scaling_from_cfg(tensors, cfg)
+        dataset = ParticleTransformerDataset(
+            tensors,
+            batch_size=cfg.training.dataloader.batch_size,
+            shuffle=False,
+        )
+        # Create DataLoader
+        dataloader = DataLoader(dataset, batch_size=None)
 
     # --- Postprocess and save as {sample}_test.parquet ---
 
@@ -304,15 +322,28 @@ def create_predictions_file(
             charge_idx = 7  # Feature index 7 is charge
             # Extract all candidates (including padded); padded slots have charge=0
             # and p4=(0,0,0,0), so they contribute 0 to any subsequent sum.
-            batch_cand_charges = cand_features[:, :, charge_idx]  # (n_jets, n_cands)
-            batch_cand_p4 = ak.Array(
-                {
-                    "px": cand_kinematics[:, :, 0],
-                    "py": cand_kinematics[:, :, 1],
-                    "pz": cand_kinematics[:, :, 2],
-                    "energy": cand_kinematics[:, :, 3],
-                }
-            )
+            if cand_features.shape[1] == 17:
+                batch_cand_charges = cand_features[:, charge_idx, :]
+            else:
+                batch_cand_charges = cand_features[:, :, charge_idx]
+            if cand_kinematics.shape[1] == 4:
+                batch_cand_p4 = ak.Array(
+                    {
+                        "px": cand_kinematics[:, 0, :],
+                        "py": cand_kinematics[:, 1, :],
+                        "pz": cand_kinematics[:, 2, :],
+                        "energy": cand_kinematics[:, 3, :],
+                    }
+                )
+            else:
+                batch_cand_p4 = ak.Array(
+                    {
+                        "px": cand_kinematics[:, :, 0],
+                        "py": cand_kinematics[:, :, 1],
+                        "pz": cand_kinematics[:, :, 2],
+                        "energy": cand_kinematics[:, :, 3],
+                    }
+                )
             all_cand_charges.append(ak.Array(batch_cand_charges))
             all_cand_p4.append(batch_cand_p4)
 
@@ -358,7 +389,7 @@ def create_predictions_file(
         depth_limit=1,
     )
 
-    output_file = input_path.split("/")[-1].replace(".pt", ".parquet")
+    output_file = os.path.basename(input_path).replace(".pt", "").replace(".parquet", "") + ".parquet"
     output_dir = os.path.join(cfg.output_dir, "predictions")
     os.makedirs(output_dir, exist_ok=True)
     output_path = os.path.join(output_dir, output_file)
