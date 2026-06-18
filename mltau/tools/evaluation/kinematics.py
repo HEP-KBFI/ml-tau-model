@@ -74,7 +74,12 @@ def plot_regression_confusion_matrix(
     bin_counts = np.histogram2d(y_true, y_pred, bins=[bin_edges, bin_edges])[0]
     total = bin_counts.sum()
     bin_density = bin_counts / total if total > 0 else bin_counts
-    im = ax.pcolor(bin_edges, bin_edges, bin_density.T, cmap=cmap)
+    non_zero = bin_density[bin_density > 0]
+    vmin = non_zero.min() if len(non_zero) > 0 else 1e-5
+    vmax = bin_density.max() if bin_density.max() > 0 else 1.0
+    vmin = max(vmin, vmax * 1e-4)
+    norm = colors.LogNorm(vmin=vmin, vmax=vmax)
+    im = ax.pcolor(bin_edges, bin_edges, bin_density.T, cmap=cmap, norm=norm)
     ax.set_aspect("equal")
     ax.set_ylabel(f"{y_label}")
     ax.set_xlabel(f"{x_label}")
@@ -481,7 +486,7 @@ class Resolution2DPlot:
             y_pred=self.evaluator.prediction,
             left_bin_edge=self.bin_edges[0],
             right_bin_edge=self.bin_edges[-1],
-            n_bins=24,
+            n_bins=50,
             figsize=(8, 9),
             cmap="Greys",
             y_label=f"Predicted {self.xlabel}",
