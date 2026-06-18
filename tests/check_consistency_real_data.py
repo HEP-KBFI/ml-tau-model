@@ -22,7 +22,7 @@ from ntupelizer.scripts.preprocess_torch import build_tensors_from_data
 from mltau.tools.io import scaling
 
 def get_real_data_path():
-    path = os.path.join(tau_root, "ml-tau-model/0509_dsinphi_to_sindphi/z_test.parquet")
+    path = os.path.join(tau_root, "ml-tau-model/0528_Large_stats/z_test.parquet")
     if not os.path.exists(path):
         return None
     return path

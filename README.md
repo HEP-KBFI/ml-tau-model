@@ -1,6 +1,7 @@
 # End-to-End ML Reconstruction and Identification of Hadronically Decaying Tau Leptons
 
-[![Hugging Face](https://img.shields.io/badge/%F0%9F%A4%97%20Hugging%20Face-Models-orange)](https://huggingface.co/HEP-KBFI/fcc-tau)
+[![HuggingFace Model](https://img.shields.io/badge/%F0%9F%A4%97%20Hugging%20Face-Models-orange)](https://huggingface.co/HEP-KBFI/fcc-tau)
+[![HuggingFace Space](https://img.shields.io/badge/%F0%9F%A4%97%20Hugging%20Face-Spaces-orange)](https://huggingface.co/spaces/jpata/ml-tau-model)
 
 The aim of this project is to develop and test end-to-end machine learning methods for reconstruction and identification of hadronically decaying tau leptons, while also providing a thoroughly validated and tested dataset for evaluating the performance of said algorithms.
 
