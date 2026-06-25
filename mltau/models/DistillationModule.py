@@ -1,5 +1,6 @@
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 import lightning as L
 from omegaconf import DictConfig
 
@@ -11,10 +12,45 @@ from mltau.models.MixerTau import MixerTau as StudentMixer
 from mltau.tools.logging import tagging, kinematics, decay_mode, charge_id
 import awkward as ak
 
+
+class QuerySoftDistillation(nn.Module):
+    """Use student tokens as queries into teacher-token relations."""
+
+    def __init__(self, student_dim: int, teacher_dim: int):
+        super().__init__()
+        self.query = nn.Sequential(
+            nn.LayerNorm(student_dim), nn.Linear(student_dim, teacher_dim)
+        )
+        self.value = nn.Sequential(
+            nn.LayerNorm(student_dim), nn.Linear(student_dim, teacher_dim)
+        )
+        self.scale = teacher_dim**-0.5
+
+    def forward(
+        self,
+        student_tokens: torch.Tensor,
+        teacher_tokens: torch.Tensor,
+        token_mask: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        queries = self.query(student_tokens)
+        values = self.value(student_tokens)
+        attention = torch.matmul(queries, teacher_tokens.transpose(-2, -1))
+        attention = attention * self.scale
+        if token_mask is not None:
+            attention = attention.masked_fill(
+                ~token_mask[:, None, :], torch.finfo(attention.dtype).min
+            )
+        attention = attention.softmax(dim=-1)
+        return torch.matmul(attention, values)
+
+
 class DistillationModule(L.LightningModule):
     """
     LightningModule for Knowledge Distillation from ParT to MLP-Mixer.
-    Performs Feature Distillation (MSE on embeddings) and Logit Distillation.
+
+    The default schedule follows the central GKD idea:
+      1. learn the student representation without task labels;
+      2. freeze the distilled backbone and train only the task head.
     """
     def __init__(
         self, 
@@ -23,14 +59,24 @@ class DistillationModule(L.LightningModule):
         input_dim: int, 
         num_dm_classes: int, 
         task: str,
-        distill_alpha: float = 0.5, # Weight for distillation loss
-        temperature: float = 2.0
+        distill_alpha: float = 0.5,
+        temperature: float = 2.0,
+        representation_epochs: int = 20,
+        token_loss_weight: float = 1.0,
+        global_loss_weight: float = 1.0,
+        masked_token_loss_weight: float = 1.0,
+        mask_probability: float = 0.3,
     ):
         super().__init__()
         self.cfg = cfg
         self.task = task
         self.distill_alpha = distill_alpha
         self.temperature = temperature
+        self.representation_epochs = representation_epochs
+        self.token_loss_weight = token_loss_weight
+        self.global_loss_weight = global_loss_weight
+        self.masked_token_loss_weight = masked_token_loss_weight
+        self.mask_probability = mask_probability
         
         # 1. Initialize Student (Mixer)
         self.student = StudentMixer(
@@ -47,8 +93,14 @@ class DistillationModule(L.LightningModule):
             input_dim=input_dim,
             task=task,
             num_dm_classes=num_dm_classes,
-            num_layers=cfg.training.model.get("num_layers", 2), # Or load from teacher config
+            num_layers=cfg.training.model.get("num_layers", 2),
+            num_heads=cfg.training.model.get("num_heads", 8),
+            num_cls_layers=cfg.training.model.get("num_cls_layers", 2),
             embed_dims=cfg.training.model.get("embed_dims", [256, 512, 256]),
+            pair_embed_dims=cfg.training.model.get(
+                "pair_embed_dims", [64, 64, 64]
+            ),
+            use_pre_activation_pair=False,
             metric="theta-phi",
         )
         print(f"Loading teacher from {teacher_checkpoint}")
@@ -70,17 +122,54 @@ class DistillationModule(L.LightningModule):
         # 3. Projection layer to match Student (128) to Teacher (256) embedding size
         student_embed_dim = cfg.training.model.get("embed_dim", 128)
         teacher_embed_dim = cfg.training.model.get("embed_dims", [256, 512, 256])[-1]
-        self.projection = nn.Linear(student_embed_dim, teacher_embed_dim)
+        self.global_projection = nn.Sequential(
+            nn.LayerNorm(student_embed_dim),
+            nn.Linear(student_embed_dim, teacher_embed_dim),
+        )
+        # Mixer constituent tokens are the 16-dimensional stage-2 activations.
+        self.token_projection = QuerySoftDistillation(16, teacher_embed_dim)
         
         self.tau_loss = TauLoss(l_m=0.2, label_smoothing=0.1)
         self.mse_loss = nn.MSELoss()
+
+    @property
+    def in_representation_stage(self):
+        return self.current_epoch < self.representation_epochs
+
+    def _set_stage_trainability(self):
+        representation_stage = self.in_representation_stage
+        for parameter in self.student.backbone.parameters():
+            parameter.requires_grad = representation_stage
+        for parameter in self.global_projection.parameters():
+            parameter.requires_grad = representation_stage
+        for parameter in self.token_projection.parameters():
+            parameter.requires_grad = representation_stage
+
+        head = self._student_head()
+        for parameter in head.parameters():
+            parameter.requires_grad = not representation_stage
+
+    def _student_head(self):
+        if self.task in {"decay_mode"}:
+            return self.student.classification_head
+        if self.task == "kinematics":
+            return self.student.regression_head
+        return self.student.binary_head
         
     def _loss_key(self):
         task_name = "tau_id" if self.task == "is_tau" else self.task
         return f"{task_name}_loss"
 
     def _make_accumulator(self):
-        keys = ["loss", "task_loss", "distill_loss", self._loss_key()]
+        keys = [
+            "loss",
+            "task_loss",
+            "distill_loss",
+            "global_distill_loss",
+            "token_distill_loss",
+            "masked_token_distill_loss",
+            self._loss_key(),
+        ]
         if self.task == "kinematics":
             keys.extend(
                 [
@@ -93,6 +182,7 @@ class DistillationModule(L.LightningModule):
         return {key: [] for key in keys}
 
     def on_train_epoch_start(self):
+        self._set_stage_trainability()
         self.training_loss_accumulator = self._make_accumulator()
 
     def on_train_epoch_end(self):
@@ -117,51 +207,162 @@ class DistillationModule(L.LightningModule):
             }
             for k, v in epoch_metrics.items():
                 self.log(f"val_losses/{k}", v)
+            checkpoint_loss = epoch_metrics["task_loss"]
+            if self.in_representation_stage:
+                checkpoint_loss = checkpoint_loss + 1_000.0
+            self.log("val_losses/checkpoint_loss", checkpoint_loss)
         self._log_at_epoch_end(dataset="val")
 
     def forward(self, batch):
         inputs = BatchInputs(*batch)
         
         # Student forward
-        student_output, student_embed = self.student(
+        student_output, student_embed, student_tokens = self.student(
             cand_features=inputs.cand_features,
             cand_kinematics_pxpypze=inputs.cand_kinematics_pxpypze,
             cand_mask=inputs.cand_mask,
-            return_embedding=True
+            return_tokens=True,
         )
+        masked_student_tokens = None
+        if self.in_representation_stage and self.mask_probability > 0:
+            valid_tokens = inputs.cand_mask.squeeze(1).bool()
+            masked_positions = (
+                torch.rand_like(valid_tokens, dtype=torch.float32)
+                < self.mask_probability
+            ) & valid_tokens
+            masked_features = inputs.cand_features.masked_fill(
+                masked_positions.unsqueeze(1), 0
+            )
+            _, _, masked_student_tokens = self.student(
+                cand_features=masked_features,
+                cand_kinematics_pxpypze=inputs.cand_kinematics_pxpypze,
+                cand_mask=inputs.cand_mask,
+                return_tokens=True,
+            )
         
         # Teacher forward (in eval mode)
         with torch.no_grad():
-            teacher_output, teacher_embed = self.teacher(
+            teacher_output, teacher_embed, teacher_tokens = self.teacher(
                 cand_features=inputs.cand_features,
                 cand_kinematics_pxpypze=inputs.cand_kinematics_pxpypze,
                 cand_mask=inputs.cand_mask,
-                return_embedding=True
+                return_tokens=True,
             )
             
-        return student_output, teacher_output, student_embed, teacher_embed, inputs
+        return (
+            student_output,
+            teacher_output,
+            student_embed,
+            teacher_embed,
+            student_tokens,
+            masked_student_tokens,
+            teacher_tokens,
+            inputs,
+        )
+
+    def _token_distillation_loss(
+        self, student_tokens, teacher_tokens, valid_tokens
+    ):
+        projected_tokens = self.token_projection(
+            student_tokens, teacher_tokens, valid_tokens
+        )
+        if not valid_tokens.any():
+            return projected_tokens.new_zeros(())
+        projected_tokens = F.layer_norm(
+            projected_tokens, projected_tokens.shape[-1:]
+        )
+        normalized_teacher_tokens = F.layer_norm(
+            teacher_tokens, teacher_tokens.shape[-1:]
+        )
+        return F.mse_loss(
+            projected_tokens[valid_tokens],
+            normalized_teacher_tokens[valid_tokens],
+        )
+
+    def _distillation_losses(
+        self,
+        student_embed,
+        teacher_embed,
+        student_tokens,
+        masked_student_tokens,
+        teacher_tokens,
+        cand_mask,
+    ):
+        projected_global = self.global_projection(student_embed)
+        global_loss = self.mse_loss(
+            F.layer_norm(projected_global, projected_global.shape[-1:]),
+            F.layer_norm(teacher_embed, teacher_embed.shape[-1:]),
+        )
+
+        valid_tokens = cand_mask.squeeze(1).bool()
+        token_loss = self._token_distillation_loss(
+            student_tokens, teacher_tokens, valid_tokens
+        )
+        if masked_student_tokens is not None:
+            masked_token_loss = self._token_distillation_loss(
+                masked_student_tokens, teacher_tokens, valid_tokens
+            )
+        else:
+            masked_token_loss = global_loss.new_zeros(())
+
+        distill_loss = (
+            self.global_loss_weight * global_loss
+            + self.token_loss_weight * token_loss
+            + self.masked_token_loss_weight * masked_token_loss
+        )
+        return distill_loss, global_loss, token_loss, masked_token_loss
 
     def training_step(self, batch, batch_idx):
-        student_output, teacher_output, student_embed, teacher_embed, inputs = self.forward(batch)
+        (
+            student_output,
+            _teacher_output,
+            student_embed,
+            teacher_embed,
+            student_tokens,
+            masked_student_tokens,
+            teacher_tokens,
+            inputs,
+        ) = self.forward(batch)
         
         # 1. Task Loss (Student vs Ground Truth)
         predictions = self._get_predictions_dict(student_output)
         task_metrics = self._calculate_task_metrics(inputs.target, predictions, inputs.weight)
         task_loss = task_metrics["loss"]
         
-        # 2. Distillation Loss (Embedding MSE)
-        projected_student_embed = self.projection(student_embed)
-        distill_loss = self.mse_loss(projected_student_embed, teacher_embed)
+        (
+            distill_loss,
+            global_loss,
+            token_loss,
+            masked_token_loss,
+        ) = self._distillation_losses(
+            student_embed,
+            teacher_embed,
+            student_tokens,
+            masked_student_tokens,
+            teacher_tokens,
+            inputs.cand_mask,
+        )
         
-        # 3. Combined Loss
-        total_loss = (1 - self.distill_alpha) * task_loss + self.distill_alpha * distill_loss
+        # Decouple representation learning from supervised regression.
+        total_loss = distill_loss if self.in_representation_stage else task_loss
         
-        self.training_loss_accumulator["loss"].append(total_loss.detach())
-        self.training_loss_accumulator["task_loss"].append(task_loss.detach())
-        self.training_loss_accumulator["distill_loss"].append(distill_loss.detach())
+        self.training_loss_accumulator["loss"].append(total_loss.detach().cpu())
+        self.training_loss_accumulator["task_loss"].append(task_loss.detach().cpu())
+        self.training_loss_accumulator["distill_loss"].append(
+            distill_loss.detach().cpu()
+        )
+        self.training_loss_accumulator["global_distill_loss"].append(
+            global_loss.detach().cpu()
+        )
+        self.training_loss_accumulator["token_distill_loss"].append(
+            token_loss.detach().cpu()
+        )
+        self.training_loss_accumulator["masked_token_distill_loss"].append(
+            masked_token_loss.detach().cpu()
+        )
         for key, value in task_metrics.items():
             if key != "loss":
-                self.training_loss_accumulator[key].append(value.detach())
+                self.training_loss_accumulator[key].append(value.detach().cpu())
                 
         self.log("LR", self.optimizers().param_groups[0]["lr"], on_step=True, on_epoch=False, prog_bar=True)
         
@@ -237,31 +438,87 @@ class DistillationModule(L.LightningModule):
         return {"loss": loss, self._loss_key(): loss}
 
     def validation_step(self, batch, batch_idx):
-        student_output, teacher_output, student_embed, teacher_embed, inputs = self.forward(batch)
+        (
+            student_output,
+            _teacher_output,
+            student_embed,
+            teacher_embed,
+            student_tokens,
+            masked_student_tokens,
+            teacher_tokens,
+            inputs,
+        ) = self.forward(batch)
         predictions = self._get_predictions_dict(student_output)
         task_metrics = self._calculate_task_metrics(inputs.target, predictions, inputs.weight)
         task_loss = task_metrics["loss"]
         
-        projected_student_embed = self.projection(student_embed)
-        distill_loss = self.mse_loss(projected_student_embed, teacher_embed)
+        (
+            distill_loss,
+            global_loss,
+            token_loss,
+            masked_token_loss,
+        ) = self._distillation_losses(
+            student_embed,
+            teacher_embed,
+            student_tokens,
+            masked_student_tokens,
+            teacher_tokens,
+            inputs.cand_mask,
+        )
+        total_loss = distill_loss if self.in_representation_stage else task_loss
         
-        total_loss = (1 - self.distill_alpha) * task_loss + self.distill_alpha * distill_loss
-        
-        self.validation_loss_accumulator["loss"].append(total_loss.detach())
-        self.validation_loss_accumulator["task_loss"].append(task_loss.detach())
-        self.validation_loss_accumulator["distill_loss"].append(distill_loss.detach())
+        self.validation_loss_accumulator["loss"].append(total_loss.detach().cpu())
+        self.validation_loss_accumulator["task_loss"].append(task_loss.detach().cpu())
+        self.validation_loss_accumulator["distill_loss"].append(
+            distill_loss.detach().cpu()
+        )
+        self.validation_loss_accumulator["global_distill_loss"].append(
+            global_loss.detach().cpu()
+        )
+        self.validation_loss_accumulator["token_distill_loss"].append(
+            token_loss.detach().cpu()
+        )
+        self.validation_loss_accumulator["masked_token_distill_loss"].append(
+            masked_token_loss.detach().cpu()
+        )
         for key, value in task_metrics.items():
             if key != "loss":
-                self.validation_loss_accumulator[key].append(value.detach())
+                self.validation_loss_accumulator[key].append(value.detach().cpu())
+
+        # Awkward cannot consume bfloat16 tensors through DLPack. Move validation
+        # outputs to CPU immediately and promote floating-point values to float32.
+        cpu_predictions = {
+            key: value.detach().float().cpu()
+            if value.is_floating_point()
+            else value.detach().cpu()
+            for key, value in predictions.items()
+        }
+        cpu_targets = {
+            key: value.detach().float().cpu()
+            if value.is_floating_point()
+            else value.detach().cpu()
+            for key, value in inputs.target.items()
+        }
+        cpu_gen_jet_p4s = {
+            key: value.detach().float().cpu()
+            for key, value in inputs.gen_jet_p4s.items()
+        }
+        cpu_reco_jet_p4s = {
+            key: value.detach().float().cpu()
+            for key, value in inputs.reco_jet_p4s.items()
+        }
+        cpu_gen_jet_tau_p4s = {
+            key: value.detach().float().cpu()
+            for key, value in inputs.gen_jet_tau_p4s.items()
+        }
         
         self.validation_outputs.append(
             {
-                "predictions": predictions,
-                "targets": inputs.target,
-                "gen_jet_p4s": inputs.gen_jet_p4s,
-                "reco_jet_p4s": inputs.reco_jet_p4s,
-                "gen_jet_tau_p4s": inputs.gen_jet_tau_p4s,
-                "inputs": inputs if self.task == "charge" else None,
+                "predictions": cpu_predictions,
+                "targets": cpu_targets,
+                "gen_jet_p4s": cpu_gen_jet_p4s,
+                "reco_jet_p4s": cpu_reco_jet_p4s,
+                "gen_jet_tau_p4s": cpu_gen_jet_tau_p4s,
             }
         )
         return total_loss
@@ -342,7 +599,9 @@ class DistillationModule(L.LightningModule):
 
     def configure_optimizers(self):
         optimizer = torch.optim.AdamW(
-            list(self.student.parameters()) + list(self.projection.parameters()), 
+            list(self.student.parameters())
+            + list(self.global_projection.parameters())
+            + list(self.token_projection.parameters()),
             lr=self.cfg.training.lr, 
             weight_decay=1e-2
         )
