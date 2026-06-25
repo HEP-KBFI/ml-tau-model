@@ -87,10 +87,10 @@ def train(cfg: DictConfig):
                 default_hp_metric=False,
             ),
         ],
-        accelerator="auto",  # Automatically detect GPU/CPU
-        precision="16-mixed",  # fp16 activations: halves GPU memory, ~30% faster
-        num_sanity_val_steps=0,  # Skip sanity validation for faster startup
-        enable_progress_bar=True,  # Keep enabled for monitoring
+        accelerator="auto",
+        precision="bf16-mixed",
+        num_sanity_val_steps=0,
+        enable_progress_bar=True,
     )
 
     trainer.fit(model=model, datamodule=datamodule)
