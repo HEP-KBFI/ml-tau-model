@@ -148,6 +148,27 @@ Configuration files live under `mltau/config/`:
 | `training.yaml` | `lr`, `max_epochs`, `batch_size`, `num_workers` |
 | `metrics/` | Plot styles, axis settings, and working points for all tasks |
 
+### MLP-Mixer Distillation
+
+The Particle Transformer teacher is distilled into the smaller MLP-Mixer using
+a two-stage, GKD-inspired procedure:
+
+1. **Representation distillation:** the task head is frozen while the Mixer
+   backbone learns from the frozen teacher. The loss combines normalized global
+   embedding alignment, query-based constituent-token alignment, and the same
+   token objective with randomly masked input constituents.
+2. **Task adaptation:** the distilled Mixer backbone and projection modules are
+   frozen, and only the task head is trained against the ground-truth labels.
+
+This separation avoids optimizing representation matching and task supervision
+against each other in the same update. By default, the first 20 of 100 epochs
+are used for representation distillation, with a constituent masking
+probability of 0.3. These values and the three distillation loss weights are
+configured under `distillation` in `mltau/config/training.yaml`.
+
+`submit_mixer.sh` launches scratch and distilled Mixer jobs for tau
+identification, charge, decay mode, and kinematics.
+
 ### Outputs
 
 ```
@@ -180,6 +201,14 @@ Metrics are computed and logged to TensorBoard every epoch:
 - Baseline comparison with jet charge Q*κ method
 - Confusion matrix analysis with 95% average efficiency working point
 
+## Huggingface
+
+The latest model weights are available from huggingface at https://huggingface.co/HEP-KBFI/fcc-tau/tree/main/cld/qq_vs_z_91gev/0612.
+They can be upoaded with the following script, after authenticating
+```
+uv run python3 mltau/scripts/upload_model_hf.py --path-prefix cld/qq_vs_z_91gev/0612 outputs/0612_multipartau_full_b8483f6
+```
+
 ## Project Structure
 
 ```
@@ -196,7 +225,6 @@ mltau/
     train.py                 # Main training entry point
     run_inference.py         # Main inference entry point
     upload_model_hf.py       # Upload to HuggingFace Hub
-    move_models_hf.py        # Local model organization for HF
     HPS/                     # Baseline HPS processing scripts
   tools/
     features.py              # Math and kinematic utilities
