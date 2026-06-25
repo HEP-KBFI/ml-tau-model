@@ -92,6 +92,30 @@ To generate prediction parquet files from a pretrained model checkpoint:
 ```
 This will run inference on the test dataset and save `.parquet` files to `<output_directory>/predictions/`.
 
+### ONNX Runtime benchmark
+
+Export and benchmark a fully static fp32 graph on a single CPU thread and an
+NVIDIA GPU, with 16 particles per jet by default. The benchmark supports
+SingleParTau, MultiParTau, and Mixer. It requires
+`onnxruntime-gpu`, which provides both the CPU and CUDA execution providers:
+
+```bash
+PYTHONPATH=. python3 mltau/scripts/benchmark_onnx.py all \
+  --iterations 500 \
+  --num-particles 32
+```
+
+Individual targets are `singlepartau`, `multipartau`, and `mixer`; `partau`
+remains an alias for `singlepartau`. Use `--devices cpu` or `--devices gpu`
+to benchmark only one runtime. GPU
+latency is measured with inputs and outputs resident on the GPU, excluding
+host/device transfer time.
+
+Use `--checkpoint PATH` for trained weights. Architecture arguments such as
+`--num-layers`, `--embed-dims`, and `--mixer-embed-dim` must match the
+checkpoint. The JSON output reports latency, throughput, PyTorch/ONNX
+agreement, and MACs from static ONNX `MatMul`, `Gemm`, and `Conv` nodes.
+
 ### Evaluation & Plotting
 Final physics performance plots (ROC, efficiency, resolution) are typically generated via Jupyter notebooks:
 1. Open `mltau/notebooks/MultiParTau_vs_SingleParTau.ipynb`.

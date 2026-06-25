@@ -112,6 +112,128 @@ pip install -r requirements.txt
 | `tensorboard` | Training monitoring |
 | `matplotlib`, `mplhep` | CMS-style physics plots |
 | `boost-histogram` | Fast histogram filling |
+| `onnx`, `onnxruntime-gpu` | Static model export and CPU/GPU inference benchmarking |
+
+## ONNX Inference Runtime Benchmark
+
+`mltau/scripts/benchmark_onnx.py` exports a fixed-shape fp32 ONNX graph and
+benchmarks it with ONNX Runtime. The supported targets are:
+
+| Command model | Python model | Output |
+|---------------|--------------|--------|
+| `singlepartau` | `ParTau` from `mltau/models/SingleParTau.py` | Selected task head |
+| `multipartau` | `ParTau` from `mltau/models/MultiParTau.py` | All four task heads |
+| `mixer` | `MixerTau` from `mltau/models/MixerTau.py` | Selected task head |
+| `all` | All three models above | One result per model |
+
+`partau` remains an alias for `singlepartau`. The default graph uses a batch
+size of 1, 17 input features, and 16 particles per jet. All dimensions are
+static in the exported graph.
+
+### ONNX Runtime installation
+
+Install the project requirements:
+
+```bash
+pip install -r requirements.txt
+```
+
+The requirements use `onnxruntime-gpu`, not the CPU-only `onnxruntime`
+package. `onnxruntime-gpu` includes both `CUDAExecutionProvider` and
+`CPUExecutionProvider`, so the same installation runs both runtime targets.
+Do not install `onnxruntime` and `onnxruntime-gpu` in the same environment. If
+the CPU-only package was installed previously, replace it:
+
+```bash
+pip uninstall -y onnxruntime onnxruntime-gpu
+pip install onnxruntime-gpu
+```
+
+Verify the installation and available execution providers:
+
+```bash
+python3 -c "import onnxruntime as ort; print(ort.get_available_providers())"
+```
+
+A correctly configured GPU environment should include
+`CUDAExecutionProvider`; `CPUExecutionProvider` should also be present.
+`onnxruntime-gpu` works for this benchmark when its CUDA/cuDNN requirements,
+the NVIDIA driver, and GPU visibility are configured correctly.
+
+### Benchmark all models on CPU and GPU
+
+Use `all` to export and benchmark SingleParTau, MultiParTau, and Mixer in one
+run. By default, both CPU and GPU are benchmarked:
+
+```bash
+PYTHONPATH=. python3 mltau/scripts/benchmark_onnx.py all \
+  --iterations 500 \
+  --num-particles 32
+```
+
+This writes `singlepartau_static_fp32.onnx`,
+`multipartau_static_fp32.onnx`, and `mixer_static_fp32.onnx`. The `all`
+target cannot be combined with `--output` or `--checkpoint`; benchmark an
+individual model when either option is needed.
+
+The CPU session is explicitly restricted to sequential execution with one
+intra-op thread and one inter-op thread. The GPU session uses
+`CUDAExecutionProvider` and ONNX Runtime I/O binding. Its reported latency
+covers inference with inputs and outputs resident on the GPU; host-to-device
+and device-to-host transfer time is excluded.
+
+### Trained checkpoints and architecture settings
+
+Pass `--checkpoint` to benchmark trained weights:
+
+```bash
+PYTHONPATH=. python3 mltau/scripts/benchmark_onnx.py singlepartau \
+  --checkpoint /path/to/singlepartau.ckpt \
+  --task is_tau
+
+PYTHONPATH=. python3 mltau/scripts/benchmark_onnx.py multipartau \
+  --checkpoint /path/to/multipartau.ckpt
+
+PYTHONPATH=. python3 mltau/scripts/benchmark_onnx.py mixer \
+  --checkpoint /path/to/mixer.ckpt \
+  --num-particles 20
+```
+
+The command-line architecture must exactly match the checkpoint. Relevant
+options are:
+
+- All models: `--input-dim`, `--num-particles`, and `--batch-size`.
+- SingleParTau and MultiParTau: `--num-layers`, `--num-cls-layers`, `--num-heads`,
+  `--embed-dims`, `--pair-embed-dims`, and `--num-dm-classes`.
+- SingleParTau and Mixer: `--task`.
+- Mixer: `--mixer-embed-dim`.
+
+In particular, the MLP-Mixer token-mixing and pooling layers depend directly
+on `--num-particles`. A checkpoint trained with 20 constituents must therefore
+be exported with `--num-particles 20`; it cannot be loaded into the default
+16-particle architecture.
+
+Without `--checkpoint`, the script uses randomly initialized weights. This is
+useful for runtime comparisons and export smoke tests, but not for physics
+performance evaluation.
+
+### Benchmark output
+
+The command writes the ONNX model and prints JSON containing:
+
+- A top-level `summary` with `latency_median_ms` per device and
+  `estimated_macs`.
+- Static input tensor shapes and fp32 dtype.
+- The installed `onnxruntime-gpu` version.
+- CPU and GPU mean, median, p90, and p99 latency.
+- Throughput in jets per second.
+- Maximum absolute difference between PyTorch and each ONNX Runtime result.
+- MAC counts for static ONNX `MatMul`, `Gemm`, and `Conv` nodes.
+- An estimated FLOP count using two FLOPs per MAC.
+
+The FLOP estimate excludes normalization, activation, softmax, masking, and
+other elementwise operations, so it should be treated as a partial operation
+count rather than an exact total.
 
 ## Training
 
