@@ -39,12 +39,20 @@ training:
     continuous_feature_indices: [0, 1, 2, 3, 4, 5, 6, 13, 14, 15, 16]
 
 distillation:
-  # GKD-style schedule: representation-only distillation, then frozen-backbone
-  # supervised task-head training.
+  # Representation distillation, low-LR head warmup, then differential-LR
+  # joint fine-tuning of the student backbone and task head.
   representation_epochs: 20
+  head_warmup_epochs: 5
+  representation_lr: 0.001
+  head_warmup_lr: 0.0001
+  joint_head_lr: 0.0003
+  joint_backbone_lr: 0.00002
   global_loss_weight: 1.0
   token_loss_weight: 1.0
   masked_token_loss_weight: 1.0
   mask_probability: 0.3
+  output_distill_loss_weight: 1.0
+  adaptation_feature_loss_weight: 0.1
+  enable_input_scaling: true
 
 teacher_checkpoint: null

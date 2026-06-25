@@ -11,6 +11,10 @@ from lightning.pytorch.callbacks import TQDMProgressBar, ModelCheckpoint, Callba
 if hasattr(torch.serialization, "add_safe_globals"):
     torch.serialization.add_safe_globals([DictConfig, ListConfig])
 
+import matplotlib
+matplotlib.use('Agg')
+import matplotlib.pyplot as plt
+
 from mltau.tools.io import preprocessed_ParTau_dataloader as dl_pre
 from mltau.tools.io import ParT_dataloader as dl_raw
 from mltau.models import MultiParTau_module, SingleParTau_module

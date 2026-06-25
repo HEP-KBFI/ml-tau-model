@@ -148,26 +148,6 @@ Configuration files live under `mltau/config/`:
 | `training.yaml` | `lr`, `max_epochs`, `batch_size`, `num_workers` |
 | `metrics/` | Plot styles, axis settings, and working points for all tasks |
 
-### MLP-Mixer Distillation
-
-The Particle Transformer teacher is distilled into the smaller MLP-Mixer using
-a two-stage, GKD-inspired procedure:
-
-1. **Representation distillation:** the task head is frozen while the Mixer
-   backbone learns from the frozen teacher. The loss combines normalized global
-   embedding alignment, query-based constituent-token alignment, and the same
-   token objective with randomly masked input constituents.
-2. **Task adaptation:** the distilled Mixer backbone and projection modules are
-   frozen, and only the task head is trained against the ground-truth labels.
-
-This separation avoids optimizing representation matching and task supervision
-against each other in the same update. By default, the first 20 of 100 epochs
-are used for representation distillation, with a constituent masking
-probability of 0.3. These values and the three distillation loss weights are
-configured under `distillation` in `mltau/config/training.yaml`.
-
-`submit_mixer.sh` launches scratch and distilled Mixer jobs for tau
-identification, charge, decay mode, and kinematics.
 
 ### Outputs
 

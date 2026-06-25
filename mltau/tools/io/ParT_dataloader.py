@@ -311,6 +311,11 @@ class ParTDataModule(LightningDataModule):
             "reco_cand_dxy",
             "reco_cand_dxy_error",
             "reco_jet_p4",
+            "gen_jet_tau_p4",
+            "gen_jet_p4",
+            "gen_jet_tau_decaymode",
+            "gen_jet_tau_charge",
+            "cls_weight",
         ]
 
         for filename, indices in file_batches.items():
@@ -346,6 +351,12 @@ class ParTDataModule(LightningDataModule):
             self.cfg.training.dataloader.batch_size if not self.debug_run else 512
         )
         if stage == "fit":
+            # distill.py initializes the data module eagerly so scaler
+            # statistics exist before the model's on_fit_start hook. Lightning
+            # calls setup("fit") again; retain the same split and loaders.
+            if self.train_loader is not None and self.val_loader is not None:
+                return
+
             train_row_groups, val_row_groups = self.get_dataset_rowgroups(
                 dataset_type="train"
             )
