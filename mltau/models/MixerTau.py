@@ -68,12 +68,19 @@ class MixerTau(nn.Module):
         cand_kinematics_pxpypze=None,
         cand_mask=None,
         return_embedding=False,
+        return_tokens=False,
     ):
         # cand_features: (N, C, P)
         # cand_mask: (N, 1, P)
         
         # Backbone pass
-        x_cls = self.backbone(cand_features, mask=cand_mask) # (N, embed_dim)
+        backbone_output = self.backbone(
+            cand_features, mask=cand_mask, return_tokens=return_tokens
+        )
+        if return_tokens:
+            x_cls, tokens = backbone_output
+        else:
+            x_cls = backbone_output
         
         # Head pass
         if self.task == "decay_mode":
@@ -89,6 +96,8 @@ class MixerTau(nn.Module):
                 f"This model is not suitable for the chosen task of {self.task}"
             )
 
+        if return_tokens:
+            return output, x_cls, tokens
         if return_embedding:
             return output, x_cls
         return output

@@ -53,13 +53,19 @@ class MLPMixerBackbone(nn.Module):
             nn.Linear(16, embed_dim) # Output embed_dim
         )
 
-    def forward(self, x, mask=None):
+    def forward(self, x, mask=None, return_tokens=False):
         # x: (N, C, P) - follow SingleParTau convention
         x = x.transpose(1, 2) # (N, P, C)
+        token_mask = None
+        if mask is not None:
+            token_mask = mask.squeeze(1).bool()
+            x = x.masked_fill(~token_mask.unsqueeze(-1), 0)
         
         # Feature mixing
         residual = x
         x = self.feature_mixing(x)
+        if token_mask is not None:
+            x = x.masked_fill(~token_mask.unsqueeze(-1), 0)
         
         # Token mixing
         x = x.transpose(1, 2) # (N, C, P)
@@ -71,6 +77,9 @@ class MLPMixerBackbone(nn.Module):
         
         # Second stage
         x = self.stage2(x) # (N, P, 16)
+        if token_mask is not None:
+            x = x.masked_fill(~token_mask.unsqueeze(-1), 0)
+        tokens = x
         
         # Learned pooling
         x = x.transpose(1, 2) # (N, 16, P)
@@ -79,5 +88,7 @@ class MLPMixerBackbone(nn.Module):
         
         # Final MLP
         x = self.final_mlp(x) # (N, embed_dim)
-        
+
+        if return_tokens:
+            return x, tokens
         return x
