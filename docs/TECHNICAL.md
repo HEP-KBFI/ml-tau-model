@@ -112,6 +112,58 @@ pip install -r requirements.txt
 | `tensorboard` | Training monitoring |
 | `matplotlib`, `mplhep` | CMS-style physics plots |
 | `boost-histogram` | Fast histogram filling |
+| `onnx`, `onnxruntime-gpu` | Static model export and CPU/GPU inference benchmarking |
+
+## ONNX Inference Runtime Benchmark
+
+`mltau/scripts/benchmark_onnx.py` exports a fixed-shape fp32 ONNX graph and
+benchmarks it with ONNX Runtime. The supported targets are:
+
+| Command model | Python model | Output |
+|---------------|--------------|--------|
+| `singlepartau` | `ParTau` from `mltau/models/SingleParTau.py` | Selected task head |
+| `multipartau` | `ParTau` from `mltau/models/MultiParTau.py` | All four task heads |
+| `mixer` | `MixerTau` from `mltau/models/MixerTau.py` | Selected task head |
+| `all` | All three models above | One result per model |
+
+`partau` remains an alias for `singlepartau`. The default graph uses a batch
+size of 1, 17 input features, and 16 particles per jet. All dimensions are
+static in the exported graph.
+
+### ONNX Runtime installation
+
+Install the project requirements:
+
+```bash
+pip install -r requirements.txt
+```
+
+The requirements use `onnxruntime-gpu`, not the CPU-only `onnxruntime`
+package. `onnxruntime-gpu` includes both `CUDAExecutionProvider` and
+`CPUExecutionProvider`, so the same installation runs both runtime targets.
+Do not install `onnxruntime` and `onnxruntime-gpu` in the same environment.
+
+### Benchmark all models on CPU and GPU
+
+Use `all` to export and benchmark SingleParTau, MultiParTau, and Mixer in one
+run. By default, both CPU and GPU are benchmarked:
+
+```bash
+PYTHONPATH=. python3 mltau/scripts/benchmark_onnx.py all \
+  --iterations 500 \
+  --num-particles 32
+```
+
+This writes `singlepartau_static_fp32.onnx`,
+`multipartau_static_fp32.onnx`, and `mixer_static_fp32.onnx`. The `all`
+target cannot be combined with `--output` or `--checkpoint`; benchmark an
+individual model when either option is needed.
+
+The CPU session is explicitly restricted to sequential execution with one
+intra-op thread and one inter-op thread. The GPU session uses
+`CUDAExecutionProvider` and ONNX Runtime I/O binding. Its reported latency
+covers inference with inputs and outputs resident on the GPU; host-to-device
+and device-to-host transfer time is excluded.
 
 ## Training
 
@@ -148,6 +200,7 @@ Configuration files live under `mltau/config/`:
 | `training.yaml` | `lr`, `max_epochs`, `batch_size`, `num_workers` |
 | `metrics/` | Plot styles, axis settings, and working points for all tasks |
 
+
 ### Outputs
 
 ```
@@ -180,6 +233,14 @@ Metrics are computed and logged to TensorBoard every epoch:
 - Baseline comparison with jet charge Q*κ method
 - Confusion matrix analysis with 95% average efficiency working point
 
+## Huggingface
+
+The latest model weights are available from huggingface at https://huggingface.co/HEP-KBFI/fcc-tau/tree/main/cld/qq_vs_z_91gev/0612.
+They can be upoaded with the following script, after authenticating
+```
+uv run python3 mltau/scripts/upload_model_hf.py --path-prefix cld/qq_vs_z_91gev/0612 outputs/0612_multipartau_full_b8483f6
+```
+
 ## Project Structure
 
 ```
@@ -196,7 +257,6 @@ mltau/
     train.py                 # Main training entry point
     run_inference.py         # Main inference entry point
     upload_model_hf.py       # Upload to HuggingFace Hub
-    move_models_hf.py        # Local model organization for HF
     HPS/                     # Baseline HPS processing scripts
   tools/
     features.py              # Math and kinematic utilities

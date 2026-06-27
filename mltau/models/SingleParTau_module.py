@@ -10,6 +10,7 @@ from mltau.tools import general as g
 from mltau.tools.losses import FocalLoss, TauLoss
 from mltau.tools.logging import tagging, kinematics, decay_mode, charge_id
 from mltau.models.SingleParTau import ParTau
+from mltau.models.MixerTau import MixerTau
 
 VALID_TASKS = {"is_tau", "charge", "decay_mode", "kinematics"}
 
@@ -21,17 +22,28 @@ class ParTauModule(L.LightningModule):
             raise ValueError(f"task must be one of {VALID_TASKS}, got '{task}'")
         self.cfg = cfg
         self.task = task
-        self.ParTau = ParTau(
-            input_dim=input_dim,
-            task=task,
-            num_dm_classes=num_dm_classes,
-            num_layers=2,
-            embed_dims=[256, 512, 256],
-            use_pre_activation_pair=False,
-            for_inference=False,
-            use_amp=False,
-            metric="theta-phi",
-        )
+        
+        model_type = cfg.training.model.get("backbone", "ParT")
+        if model_type == "Mixer":
+            self.ParTau = MixerTau(
+                input_dim=input_dim,
+                task=task,
+                n_constituents=cfg.dataset.get("max_cands", 20),
+                num_dm_classes=num_dm_classes,
+                embed_dim=cfg.training.model.get("embed_dim", 128),
+            )
+        else:
+            self.ParTau = ParTau(
+                input_dim=input_dim,
+                task=task,
+                num_dm_classes=num_dm_classes,
+                num_layers=cfg.training.model.get("num_layers", 2),
+                embed_dims=cfg.training.model.get("embed_dims", [256, 512, 256]),
+                use_pre_activation_pair=False,
+                for_inference=False,
+                use_amp=False,
+                metric="theta-phi",
+            )
         self.tau_loss = TauLoss(l_m=0.2, label_smoothing=0.1)
 
     def _loss_key(self):
@@ -59,7 +71,7 @@ class ParTauModule(L.LightningModule):
             targets=targets, predictions=predictions, weights=weights
         )
         for key, value in metrics.items():
-            self.training_loss_accumulator[key].append(value.detach())
+            self.training_loss_accumulator[key].append(value.detach().cpu())
         self.log(
             "LR",
             self.optimizers().param_groups[0]["lr"],
@@ -206,18 +218,38 @@ class ParTauModule(L.LightningModule):
             targets=targets, predictions=predictions, weights=weights
         )
         inputs = BatchInputs(*batch)
+        cpu_predictions = {
+            key: value.detach().float().cpu()
+            if value.is_floating_point()
+            else value.detach().cpu()
+            for key, value in predictions.items()
+        }
+        cpu_targets = {
+            key: value.detach().float().cpu()
+            if value.is_floating_point()
+            else value.detach().cpu()
+            for key, value in targets.items()
+        }
         self.validation_outputs.append(
             {
-                "predictions": predictions,
-                "targets": targets,
-                "gen_jet_p4s": inputs.gen_jet_p4s,
-                "reco_jet_p4s": inputs.reco_jet_p4s,
-                "gen_jet_tau_p4s": inputs.gen_jet_tau_p4s,
-                "inputs": inputs if self.task == "charge" else None,
+                "predictions": cpu_predictions,
+                "targets": cpu_targets,
+                "gen_jet_p4s": {
+                    key: value.detach().float().cpu()
+                    for key, value in inputs.gen_jet_p4s.items()
+                },
+                "reco_jet_p4s": {
+                    key: value.detach().float().cpu()
+                    for key, value in inputs.reco_jet_p4s.items()
+                },
+                "gen_jet_tau_p4s": {
+                    key: value.detach().float().cpu()
+                    for key, value in inputs.gen_jet_tau_p4s.items()
+                },
             }
         )
         for key, value in metrics.items():
-            self.validation_loss_accumulator[key].append(value.detach())
+            self.validation_loss_accumulator[key].append(value.detach().cpu())
         return metrics["loss"]
 
     def on_validation_epoch_start(self):

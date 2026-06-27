@@ -1,6 +1,8 @@
+pyarrow
+pandas
 torch
 torchvision
-pytorch-lightning
+lightning
 omegaconf
 scikit-learn
 numpy
@@ -12,3 +14,5 @@ matplotlib
 boost-histogram
 mplhep
 numba
+onnx
+onnxruntime-gpu==1.23.2

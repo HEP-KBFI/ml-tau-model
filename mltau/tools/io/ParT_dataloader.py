@@ -28,6 +28,32 @@ np.random.seed(42)
 
 
 def build_tensors(data: ak.Array, cfg: DictConfig):
+    # Sort candidates by pT if requested.
+    # This is critical for MLP-Mixer which is not permutation invariant.
+    if cfg.dataset.get("sort_by_pt", False):
+        # Ensure we can access .pt
+        p4 = g.reinitialize_p4(data.reco_cand_p4s)
+        indices = ak.argsort(p4.pt, ascending=False)
+        
+        # Consistent sorting for all constituent-related fields
+        # Note: 'reco_jet_p4', 'gen_jet_tau_p4', 'gen_jet_p4', 'gen_jet_tau_decaymode', 
+        # 'gen_jet_tau_charge', 'cls_weight' are per-jet and don't need sorting.
+        data = ak.Array({
+            "reco_cand_p4s": data.reco_cand_p4s[indices],
+            "reco_cand_charges": data.reco_cand_charges[indices],
+            "reco_cand_pdgs": data.reco_cand_pdgs[indices],
+            "reco_cand_dz": data.reco_cand_dz[indices],
+            "reco_cand_dz_error": data.reco_cand_dz_error[indices],
+            "reco_cand_dxy": data.reco_cand_dxy[indices],
+            "reco_cand_dxy_error": data.reco_cand_dxy_error[indices],
+            "reco_jet_p4": data.reco_jet_p4,
+            "gen_jet_tau_p4": data.gen_jet_tau_p4,
+            "gen_jet_p4": data.gen_jet_p4,
+            "gen_jet_tau_decaymode": data.gen_jet_tau_decaymode,
+            "gen_jet_tau_charge": data.gen_jet_tau_charge,
+            "cls_weight": data.cls_weight,
+        })
+
     tensors = build_tensors_from_data(data, cfg.dataset.max_cands)
     # Transpose to [N, C, P] to match model expectations and preprocessed dataloader
     return (
@@ -285,6 +311,11 @@ class ParTDataModule(LightningDataModule):
             "reco_cand_dxy",
             "reco_cand_dxy_error",
             "reco_jet_p4",
+            "gen_jet_tau_p4",
+            "gen_jet_p4",
+            "gen_jet_tau_decaymode",
+            "gen_jet_tau_charge",
+            "cls_weight",
         ]
 
         for filename, indices in file_batches.items():
@@ -320,6 +351,12 @@ class ParTDataModule(LightningDataModule):
             self.cfg.training.dataloader.batch_size if not self.debug_run else 512
         )
         if stage == "fit":
+            # distill.py initializes the data module eagerly so scaler
+            # statistics exist before the model's on_fit_start hook. Lightning
+            # calls setup("fit") again; retain the same split and loaders.
+            if self.train_loader is not None and self.val_loader is not None:
+                return
+
             train_row_groups, val_row_groups = self.get_dataset_rowgroups(
                 dataset_type="train"
             )
