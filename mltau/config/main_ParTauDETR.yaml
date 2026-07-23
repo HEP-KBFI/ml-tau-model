@@ -1,0 +1,35 @@
+# Dedicated Hydra entrypoint for ParTauDETR training
+# Keeps existing configs untouched.
+output_dir: /home/laurits/20260722_ParTauDETR
+
+model:
+    num_queries: 8
+    num_charge_classes: 3
+    num_pdg_classes: 9
+    num_kinematics_components: 5
+    detr:
+        decoder_num_layers: 4
+        tau_id_head: false # TODO: Need to implement
+        decoder_ffn_ratio: 4
+        decoder_dropout: 0.1
+        matcher:
+            cost_objectness: 1.0
+            cost_kinematics_l1: 2.0
+            cost_p4_l1: 2.0 # Redundant
+            cost_charge: 1.0
+            cost_pdg_ce: 1.0
+        loss:
+            weight_objectness: 1.0
+            weight_kinematics: 5.0
+            weight_p4: 1.0 # Redundant
+            weight_charge: 1.0
+            weight_pdg: 1.0
+            eos_coef: 0.1
+        inference:
+            score_threshold: 0.5
+
+defaults:
+    - _self_
+    - metrics/metrics
+    - dataset_ParTauDETR
+    - training

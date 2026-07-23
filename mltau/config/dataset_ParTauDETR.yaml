@@ -1,0 +1,13 @@
+dataset:
+    max_cands: 20
+    num_features: 17
+    max_tau_daughters: 8
+    data_dir: /home/laurits/tmp/ParTauDETR_dataset
+
+    # PDG classes for daughter one-hot encoding (order defines class index)
+    tau_daughter_pdg_ids: [211, 111, 321, 311, 310, 130, 11, 13, 22, 2212, 2112, 221, 323, 223]
+
+    relative_sizes:
+        train: 0.7
+        val: 0.1
+        test: 0.2
