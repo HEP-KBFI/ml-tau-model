@@ -1,15 +1,17 @@
-import os
-import math
-import json
 import copy
-import vector
-import numpy as np
-import awkward as ak
+import json
+import math
+import os
 from functools import cmp_to_key
-from omegaconf import OmegaConf
-from omegaconf import DictConfig
-from mltau.tools import general as g
+
+import awkward as ak
+import numpy as np
+import tqdm
+import vector
+from omegaconf import DictConfig, OmegaConf
+
 from mltau.tools import features as f
+from mltau.tools import general as g
 
 
 class hpsParticleBase:
@@ -684,6 +686,7 @@ def writeTaus(taus):
         "tauSigCand_d0err": write_tau_cand_attrs(taus, "signal_cands", "d0err", float),
         "tauSigCand_dz": write_tau_cand_attrs(taus, "signal_cands", "dz", float),
         "tauSigCand_dzerr": write_tau_cand_attrs(taus, "signal_cands", "dzerr", float),
+        "tauStrip_p4s": write_tau_cand_p4s(taus, "signal_strips"),
         "tauIsoCand_p4s": write_tau_cand_p4s(taus, "iso_cands"),
         "tauIsoCand_pdgIds": write_tau_cand_attrs(taus, "iso_cands", "pdgId", int),
         "tauIsoCand_q": write_tau_cand_attrs(taus, "iso_cands", "q", float),
@@ -1297,16 +1300,7 @@ class HPSTauBuilder:
         event_cands = readCands(data)
 
         taus = []
-        for idxJet, jet in enumerate(jets):
-            if self.verbosity >= 2:
-                print("Processing entry %i" % idxJet)
-                jet.print()
-            elif idxJet > 0 and (idxJet % 100) == 0:
-                print("Processing entry %i" % idxJet)
-            # CV: enable the following two lines for faster turn-around time when testing
-            # if idxJet > 10:
-            #    continue
-
+        for idxJet, jet in enumerate(tqdm.tqdm(jets)):
             event_iso_cands = event_cands[idxJet]
             # CV: reverse=True argument needed in order to sort candidates in order of decreasing (and NOT increasing) pT)
             event_iso_cands.sort(key=lambda cand: cand.pt, reverse=True)

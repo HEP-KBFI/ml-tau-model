@@ -451,7 +451,8 @@ class ParTauDETRDataModule(ParTDataModule):
             self.train_loader = DataLoader(
                 self.train_dataset,
                 batch_size=None,
-                persistent_workers=False if self.debug_run else True,
+                # persistent_workers=False if self.debug_run else True,
+                persistent_workers=False,
                 num_workers=(
                     0
                     if self.debug_run

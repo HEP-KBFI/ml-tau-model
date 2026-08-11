@@ -12,7 +12,8 @@
 #
 
 env | grep CUDA
-nvidia-smi -L
+nvidia-smi --query-gpu=memory.used,memory.total,utilization.gpu \
+           --format=csv -l 10 > logs/gpu_log.txt &
 export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 ./run.sh python3 mltau/scripts/train_ParTauDETR.py --config-name main_ParTauDETR "$@"
 #SBATCH --gres gpu:l40:1

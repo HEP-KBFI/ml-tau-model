@@ -210,16 +210,20 @@ class HungarianMatcher(nn.Module):
 
 
 class SetCriterion(nn.Module):
-    """DETR-style criterion with objectness + kinematics + charge + pdg losses."""
+    """DETR-style criterion with objectness + kinematics + charge + pdg
+    losses, plus auxiliary consistency penalties."""
 
     def __init__(
         self,
         matcher: HungarianMatcher,
         tau_loss: TauLoss,
+        pdg_class_ids: list[int],
         loss_objectness_weight: float = 1.0,
         loss_kinematics_weight: float = 5.0,
         loss_charge_weight: float = 1.0,
         loss_pdg_weight: float = 1.0,
+        loss_consistency_weight: float = 0.0,
+        loss_charge_count_weight: float = 0.0,
         no_object_class_index: int = 1,
         object_class_index: int = 0,
         eos_coef: float = 0.1,
@@ -228,14 +232,36 @@ class SetCriterion(nn.Module):
         super().__init__()
         self.matcher = matcher
         self.tau_loss = tau_loss
+        self.pdg_class_ids = pdg_class_ids
         self.loss_objectness_weight = loss_objectness_weight
         self.loss_kinematics_weight = loss_kinematics_weight
         self.loss_charge_weight = loss_charge_weight
         self.loss_pdg_weight = loss_pdg_weight
+        self.loss_consistency_weight = loss_consistency_weight
+        self.loss_charge_count_weight = loss_charge_count_weight
         self.no_object_class_index = no_object_class_index
         self.object_class_index = object_class_index
         self.eos_coef = eos_coef
         self.ignore_index = ignore_index
+
+        # Build (charge_class, pdg_class) validity mask.
+        # charge classes: 0 = -1,  1 = 0,  2 = +1
+        # pdg classes: indices into pdg_class_ids (abs PDG values)
+        n_charge = 3
+        n_pdg = len(pdg_class_ids)
+        valid = torch.zeros(n_charge, n_pdg, dtype=torch.float32)
+        # Neutral-only PDGs can only have charge 0 (class 1)
+        neutral_pdgs = {111, 311, 310, 130, 22, 2112, 221, 223}
+        # Charged PDGs can have charge ±1 (classes 0 and 2)
+        charged_pdgs = {211, 321, 11, 13, 2212, 323}
+        for pdg_idx, pdg_abs in enumerate(pdg_class_ids):
+            if pdg_abs in charged_pdgs:
+                valid[0, pdg_idx] = 1.0  # charge -1
+                valid[2, pdg_idx] = 1.0  # charge +1
+            elif pdg_abs in neutral_pdgs:
+                valid[1, pdg_idx] = 1.0  # charge 0
+            # else: unknown → all invalid (no penalty needed)
+        self.register_buffer("charge_pdg_valid", valid)  # [3, N_pdg]
 
     @staticmethod
     def _weighted_mean(
@@ -402,6 +428,29 @@ class SetCriterion(nn.Module):
             + self.loss_pdg_weight * loss_pdg
         )
 
+        # ---- Auxiliary penalties ----
+        loss_consistency = pred_logits.new_zeros(())
+        loss_charge_count = pred_logits.new_zeros(())
+
+        if self.loss_consistency_weight > 0:
+            p_charge = F.softmax(pred_charge_logits, dim=-1)  # [B, Q, 3]
+            p_pdg = F.softmax(pred_pdg_logits, dim=-1)  # [B, Q, N_pdg]
+            p_joint = p_charge[..., :, None] * p_pdg[..., None, :]  # [B, Q, 3, N_pdg]
+            invalid_prob = (p_joint * (1 - self.charge_pdg_valid)).sum(dim=(-2, -1))
+            loss_consistency = invalid_prob.mean()
+            total_loss = total_loss + self.loss_consistency_weight * loss_consistency
+
+        if self.loss_charge_count_weight > 0:
+            p_object = F.softmax(pred_logits, dim=-1)[..., 0]  # [B, Q]
+            pred_charge_cls = pred_charge_logits.argmax(dim=-1)  # [B, Q]
+            is_charged_pred = (pred_charge_cls != 1).float()  # class 1 = charge 0
+            expected_charged = (p_object * is_charged_pred).sum(dim=-1)  # [B]
+            is_charged_true = (target_charge_cls != 1).float()  # [B, T]
+            n_charged_true = is_charged_true.sum(dim=-1)  # [B]
+            excess = F.relu(expected_charged - n_charged_true)
+            loss_charge_count = excess.mean()
+            total_loss = total_loss + self.loss_charge_count_weight * loss_charge_count
+
         num_matched = sum(int(pred_idx.numel()) for pred_idx, _ in assignments)
 
         return {
@@ -414,6 +463,8 @@ class SetCriterion(nn.Module):
             "kinematics_log_mass_loss": kin_components["log_mass"],
             "loss_charge": loss_charge,
             "loss_pdg": loss_pdg,
+            "loss_consistency": loss_consistency,
+            "loss_charge_count": loss_charge_count,
             "num_matched": pred_logits.new_tensor(float(num_matched)),
             "num_charge_supervised": pred_logits.new_tensor(
                 float(num_charge_supervised)
@@ -482,10 +533,15 @@ class ParTauDETRModule(L.LightningModule):
         self.criterion = SetCriterion(
             matcher=self.matcher,
             tau_loss=self.tau_loss,
+            pdg_class_ids=pdg_class_ids,
             loss_objectness_weight=cfg.model.detr.loss.weight_objectness,
             loss_kinematics_weight=cfg.model.detr.loss.weight_kinematics,
             loss_charge_weight=cfg.model.detr.loss.weight_charge,
             loss_pdg_weight=cfg.model.detr.loss.weight_pdg,
+            loss_consistency_weight=cfg.model.detr.loss.get("weight_consistency", 0.0),
+            loss_charge_count_weight=cfg.model.detr.loss.get(
+                "weight_charge_count", 0.0
+            ),
             no_object_class_index=1,
             object_class_index=0,
             eos_coef=cfg.model.detr.loss.eos_coef,
@@ -591,48 +647,60 @@ class ParTauDETRModule(L.LightningModule):
             jet_weights=weights,
         )
 
-        self.log("train_losses/loss", losses["loss"], on_step=True, on_epoch=True)
+        self.log("train_losses/loss", losses["loss"], on_step=False, on_epoch=True)
         self.log(
             "train_losses/objectness",
             losses["loss_objectness"],
-            on_step=True,
+            on_step=False,
             on_epoch=True,
         )
         self.log(
             "train_losses/kinematics",
             losses["loss_kinematics"],
-            on_step=True,
+            on_step=False,
             on_epoch=True,
         )
         self.log(
             "train_losses/kinematics_log_pt_loss",
             losses["kinematics_log_pt_loss"],
-            on_step=True,
+            on_step=False,
             on_epoch=True,
         )
         self.log(
             "train_losses/kinematics_delta_eta_loss",
             losses["kinematics_delta_eta_loss"],
-            on_step=True,
+            on_step=False,
             on_epoch=True,
         )
         self.log(
             "train_losses/kinematics_phi_chord_loss",
             losses["kinematics_phi_chord_loss"],
-            on_step=True,
+            on_step=False,
             on_epoch=True,
         )
         self.log(
             "train_losses/kinematics_log_mass_loss",
             losses["kinematics_log_mass_loss"],
-            on_step=True,
+            on_step=False,
             on_epoch=True,
         )
         self.log(
-            "train_losses/charge", losses["loss_charge"], on_step=True, on_epoch=True
+            "train_losses/charge", losses["loss_charge"], on_step=False, on_epoch=True
         )
         self.log(
-            "train_losses/pdg_loss", losses["loss_pdg"], on_step=True, on_epoch=True
+            "train_losses/pdg_loss", losses["loss_pdg"], on_step=False, on_epoch=True
+        )
+        self.log(
+            "train_losses/consistency",
+            losses["loss_consistency"],
+            on_step=False,
+            on_epoch=True,
+        )
+        self.log(
+            "train_losses/charge_count",
+            losses["loss_charge_count"],
+            on_step=False,
+            on_epoch=True,
         )
 
         return losses["loss"]
@@ -694,6 +762,18 @@ class ParTauDETRModule(L.LightningModule):
         )
         self.log(
             "val_losses/pdg_loss", losses["loss_pdg"], on_step=False, on_epoch=True
+        )
+        self.log(
+            "val_losses/consistency",
+            losses["loss_consistency"],
+            on_step=False,
+            on_epoch=True,
+        )
+        self.log(
+            "val_losses/charge_count",
+            losses["loss_charge_count"],
+            on_step=False,
+            on_epoch=True,
         )
 
         return losses["loss"]
