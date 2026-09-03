@@ -3,6 +3,7 @@ import math
 import awkward as ak
 import numpy as np
 import torch
+from omegaconf import DictConfig
 from torch.utils.data import DataLoader
 
 from mltau.tools.io.ParT_dataloader import ParTDataModule, ParticleTransformerDataset
@@ -42,6 +43,7 @@ class ParticleTransformerDETRDataset(ParticleTransformerDataset):
         "gen_jet_tau_vis_daughter_p4s",
         "gen_jet_tau_vis_daughter_pdgs",
         "gen_jet_tau_vis_daughter_charges",
+        "gen_jet_tau_decaymode",
         "cls_weight",
     ]
 
@@ -117,10 +119,10 @@ class ParticleTransformerDETRDataset(ParticleTransformerDataset):
             return self._pad_jagged(arr, max_cands, fill=fill, dtype=np.float32)
 
         # Candidate-level quantities
-        cand_pt = pad_cand(data.reco_cand_p4s["rho"])
+        cand_pt = pad_cand(data.reco_cand_p4s["pt"])
         cand_eta = pad_cand(data.reco_cand_p4s["eta"])
         cand_phi = pad_cand(data.reco_cand_p4s["phi"])
-        cand_en = pad_cand(data.reco_cand_p4s["t"])
+        cand_en = pad_cand(data.reco_cand_p4s["energy"])
         cand_charge = pad_cand(data.reco_cand_charges)
         cand_pdg_abs = pad_cand(abs(data.reco_cand_pdgs))
         cand_dz = pad_cand(data.reco_cand_dz)
@@ -132,20 +134,20 @@ class ParticleTransformerDETRDataset(ParticleTransformerDataset):
         mask_np = np.arange(max_cands)[None, :] < lengths[:, None]
 
         # Jet-level p4 for feature engineering and bookkeeping
-        jet_pt = ak.to_numpy(data.reco_jet_p4["rho"]).astype(np.float32)
+        jet_pt = ak.to_numpy(data.reco_jet_p4["pt"]).astype(np.float32)
         jet_eta = ak.to_numpy(data.reco_jet_p4["eta"]).astype(np.float32)
         jet_phi = ak.to_numpy(data.reco_jet_p4["phi"]).astype(np.float32)
-        jet_en = ak.to_numpy(data.reco_jet_p4["t"]).astype(np.float32)
+        jet_en = ak.to_numpy(data.reco_jet_p4["energy"]).astype(np.float32)
 
-        gen_tau_pt = ak.to_numpy(data.gen_jet_tau_p4["rho"]).astype(np.float32)
+        gen_tau_pt = ak.to_numpy(data.gen_jet_tau_p4["pt"]).astype(np.float32)
         gen_tau_eta = ak.to_numpy(data.gen_jet_tau_p4["eta"]).astype(np.float32)
         gen_tau_phi = ak.to_numpy(data.gen_jet_tau_p4["phi"]).astype(np.float32)
-        gen_tau_energy = ak.to_numpy(data.gen_jet_tau_p4["t"]).astype(np.float32)
+        gen_tau_energy = ak.to_numpy(data.gen_jet_tau_p4["energy"]).astype(np.float32)
 
-        gen_jet_pt = ak.to_numpy(data.gen_jet_p4["rho"]).astype(np.float32)
+        gen_jet_pt = ak.to_numpy(data.gen_jet_p4["pt"]).astype(np.float32)
         gen_jet_eta = ak.to_numpy(data.gen_jet_p4["eta"]).astype(np.float32)
         gen_jet_phi = ak.to_numpy(data.gen_jet_p4["phi"]).astype(np.float32)
-        gen_jet_energy = ak.to_numpy(data.gen_jet_p4["t"]).astype(np.float32)
+        gen_jet_energy = ak.to_numpy(data.gen_jet_p4["energy"]).astype(np.float32)
 
         # 17 ParticleTransformer features
         jpt = jet_pt[:, None]
@@ -218,7 +220,11 @@ class ParticleTransformerDETRDataset(ParticleTransformerDataset):
         daughter_counts = ak.to_numpy(ak.num(daughter_pdg_jag)).astype(np.int64)
         max_tau_daughters = self._get_max_tau_daughters(daughter_counts)
 
-        if max_tau_daughters > 0:
+        # Failsafe: background samples (and any jet with no visible daughters)
+        # store daughter_p4 as an empty/unknown-typed array with no fields, so
+        # there is nothing to extract.  Fall through to the zero-filled branch
+        # instead of raising KeyError in _get_record_field.
+        if max_tau_daughters > 0 and len(daughter_p4.fields) > 0:
             dau_pt = self._pad_jagged(
                 self._get_record_field(daughter_p4, ["pt", "rho"]),
                 max_tau_daughters,
@@ -361,6 +367,11 @@ class ParticleTransformerDETRDataset(ParticleTransformerDataset):
             "particles_kinematics": torch.from_numpy(daughter_kinematics_np).float(),
             "particles_charge_ohe": torch.from_numpy(charge_ohe).float(),
             "particles_pdg_ohe": torch.from_numpy(pdg_ohe).float(),
+            # Jet-level tau-tagging label, following ParticleTransformerDataset:
+            # -1 -> no genuine tau (background), >= 0 -> genuine tau (signal).
+            "is_tau": torch.from_numpy(
+                (ak.to_numpy(data.gen_jet_tau_decaymode) != -1).astype(np.int64)
+            ),
         }
 
         return (
@@ -409,6 +420,7 @@ class ParticleTransformerDETRDataset(ParticleTransformerDataset):
                 columns=self._NEEDED_COLUMNS,
             )
             tensors = self.build_tensors(data)
+            del data
             n_rows = tensors[0].shape[0]
 
             for start in range(0, n_rows, self.batch_size):
@@ -434,6 +446,14 @@ class ParTauDETRDataModule(ParTDataModule):
     `cfg.dataset.data_dir`.
     """
 
+    def __init__(self, cfg: DictConfig, debug_run: bool = False):
+        super().__init__(cfg=cfg, debug_run=debug_run)
+        # Tau tagging is a binary signal-vs-background task, so we need the
+        # background samples in addition to the signal samples. The base class
+        # otherwise defaults to signal-only (`sample = "z"`) for set-to-set.
+        if cfg.model.detr.get("tau_id_head", True):
+            self.sample = "*"
+
     def setup(self, stage: str) -> None:
         batch_size = (
             self.cfg.training.dataloader.batch_size if not self.debug_run else 512
@@ -451,8 +471,7 @@ class ParTauDETRDataModule(ParTDataModule):
             self.train_loader = DataLoader(
                 self.train_dataset,
                 batch_size=None,
-                # persistent_workers=False if self.debug_run else True,
-                persistent_workers=False,
+                persistent_workers=False if self.debug_run else True,
                 num_workers=(
                     0
                     if self.debug_run
@@ -512,7 +531,3 @@ class ParTauDETRDataModule(ParTDataModule):
             )
         else:
             raise ValueError(f"Unexpected stage: {stage}")
-
-
-# Backward-compatible alias
-ParTDETRDataModule = ParTauDETRDataModule

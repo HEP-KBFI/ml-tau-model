@@ -41,23 +41,26 @@ def plot_performance(
         bin_centers,
         true_hist,
         fmt="o",
+        color="k",
         markersize=5,
         label="Truth",
     )
     for name, pred_hist in pred_hists.items():
-        ax.errorbar(
+        eb = ax.errorbar(
             bin_centers,
             pred_hist,
             fmt="o",
             markersize=5,
             label=name,
         )
+        color = eb.lines[0].get_color()
         ax_diff.errorbar(
             bin_centers,
             true_hist - pred_hist,
             marker="o",
             linestyle="none",
             markersize=4,
+            color=color,
         )
     ax_diff.axhline(0, linewidth=1, color="k")
 
@@ -95,4 +98,15 @@ def hps_x_dm0(hps_data: ak.Array):
     return pred_x_dm0, true_x_dm0
 
 
-# TODO: Need to evaluate also the pT and the dR between pred tau and true vis tau for HPS and ParTauDETR.
+# TODO: Need to evaluate also the pT and the dR between pred tau and true vis tau for HPS and ParTauDETR like in the following:
+#
+# from mltau.tools.evaluation import kinematics as k
+# hps_ke = k.KinematicsEvaluator(
+#     predicted_p4=hps_data.tau_p4s,
+#     true_p4=hps_data.gen_jet_tau_p4,
+#     cfg=cfg,
+#     algorithm="HPS",
+#     sample_name='z'
+# )
+# kme = k.KinematicsMultiEvaluator(output_dir="/home/laurits/HPS_kin_eval", cfg=cfg, sample="z")
+# kme.combine_results([hps_ke])

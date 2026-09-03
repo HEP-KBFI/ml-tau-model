@@ -19,6 +19,7 @@ model:
             cost_pdg_ce: 1.0
         loss:
             weight_objectness: 1.0
+            weight_tau_id: 1.0
             weight_kinematics: 5.0
             weight_charge: 1.0
             weight_pdg: 1.0
@@ -26,7 +27,7 @@ model:
             weight_charge_count: 0.1
             eos_coef: 0.1
         inference:
-            score_threshold: 0.5
+            score_threshold: 0.85
 
 defaults:
     - _self_

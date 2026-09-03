@@ -202,7 +202,7 @@ class HungarianMatcher(nn.Module):
                 + self.cost_charge_ce * charge_cost
                 + self.cost_pdg_ce * pdg_cost
             )
-
+            total_cost = torch.nan_to_num(total_cost, nan=0.0, posinf=1e4, neginf=-1e4)
             pred_idx, tgt_idx = hungarian_min_cost_assignment(total_cost)
             assignments.append((pred_idx, tgt_idx))
 
@@ -219,6 +219,7 @@ class SetCriterion(nn.Module):
         tau_loss: TauLoss,
         pdg_class_ids: list[int],
         loss_objectness_weight: float = 1.0,
+        loss_tau_id_weight: float = 1.0,
         loss_kinematics_weight: float = 5.0,
         loss_charge_weight: float = 1.0,
         loss_pdg_weight: float = 1.0,
@@ -234,6 +235,7 @@ class SetCriterion(nn.Module):
         self.tau_loss = tau_loss
         self.pdg_class_ids = pdg_class_ids
         self.loss_objectness_weight = loss_objectness_weight
+        self.loss_tau_id_weight = loss_tau_id_weight
         self.loss_kinematics_weight = loss_kinematics_weight
         self.loss_charge_weight = loss_charge_weight
         self.loss_pdg_weight = loss_pdg_weight
@@ -280,6 +282,7 @@ class SetCriterion(nn.Module):
         target_charge_cls: torch.Tensor,
         target_pdg_cls: torch.Tensor,
         target_mask: torch.Tensor,
+        target_is_tau: torch.Tensor | None = None,
         jet_weights: torch.Tensor | None = None,
     ) -> dict[str, torch.Tensor]:
         pred_logits = outputs["pred_logits"]
@@ -289,6 +292,14 @@ class SetCriterion(nn.Module):
 
         batch_size, num_queries, _ = pred_logits.shape
         device = pred_logits.device
+
+        # Daughter-level losses are signal-only: background jets only supervise
+        # the tau-tagging head (loss_tau_id). If no tau label is provided we treat
+        # every jet as signal to preserve the previous behaviour.
+        if target_is_tau is not None:
+            signal_mask = target_is_tau.bool()
+        else:
+            signal_mask = pred_logits.new_ones(batch_size, dtype=torch.bool)
 
         assignments = self.matcher(
             pred_logits=pred_logits,
@@ -317,6 +328,8 @@ class SetCriterion(nn.Module):
         pdg_weights = []
 
         for b, (pred_idx, tgt_idx) in enumerate(assignments):
+            if not signal_mask[b]:
+                continue
             if pred_idx.numel() == 0:
                 continue
 
@@ -378,11 +391,27 @@ class SetCriterion(nn.Module):
         )
         if jet_weights is not None:
             w = jet_weights.to(dtype=pred_logits.dtype, device=device)
+            w = w * signal_mask.to(dtype=w.dtype)
             loss_objectness = (ce_per_query * w[:, None]).sum() / (
                 w.sum() * num_queries + 1e-8
             )
         else:
-            loss_objectness = ce_per_query.mean()
+            signal_ce = ce_per_query[signal_mask]
+            loss_objectness = (
+                signal_ce.mean() if signal_ce.numel() > 0 else pred_logits.new_zeros(())
+            )
+
+        # jet-level tau-tagging loss
+        if "is_tau" in outputs and target_is_tau is not None:
+            if jet_weights is not None:
+                tau_w = jet_weights.to(dtype=pred_logits.dtype, device=device)
+            else:
+                tau_w = pred_logits.new_ones(batch_size)
+            loss_tau_id = self.tau_loss.compute_tagging_loss(
+                outputs["is_tau"], target_is_tau, tau_w
+            )
+        else:
+            loss_tau_id = pred_logits.new_zeros(())
 
         # matched losses
         if len(kin_pred) > 0:
@@ -423,6 +452,7 @@ class SetCriterion(nn.Module):
 
         total_loss = (
             self.loss_objectness_weight * loss_objectness
+            + self.loss_tau_id_weight * loss_tau_id
             + self.loss_kinematics_weight * loss_kinematics
             + self.loss_charge_weight * loss_charge
             + self.loss_pdg_weight * loss_pdg
@@ -437,7 +467,12 @@ class SetCriterion(nn.Module):
             p_pdg = F.softmax(pred_pdg_logits, dim=-1)  # [B, Q, N_pdg]
             p_joint = p_charge[..., :, None] * p_pdg[..., None, :]  # [B, Q, 3, N_pdg]
             invalid_prob = (p_joint * (1 - self.charge_pdg_valid)).sum(dim=(-2, -1))
-            loss_consistency = invalid_prob.mean()
+            signal_invalid = invalid_prob[signal_mask]
+            loss_consistency = (
+                signal_invalid.mean()
+                if signal_invalid.numel() > 0
+                else pred_logits.new_zeros(())
+            )
             total_loss = total_loss + self.loss_consistency_weight * loss_consistency
 
         if self.loss_charge_count_weight > 0:
@@ -445,10 +480,18 @@ class SetCriterion(nn.Module):
             pred_charge_cls = pred_charge_logits.argmax(dim=-1)  # [B, Q]
             is_charged_pred = (pred_charge_cls != 1).float()  # class 1 = charge 0
             expected_charged = (p_object * is_charged_pred).sum(dim=-1)  # [B]
-            is_charged_true = (target_charge_cls != 1).float()  # [B, T]
+            # Charged daughters are class 0 (-1) or class 2 (+1); ignore padded slots.
+            is_charged_true = (
+                (target_charge_cls == 0) | (target_charge_cls == 2)
+            ).float()
             n_charged_true = is_charged_true.sum(dim=-1)  # [B]
             excess = F.relu(expected_charged - n_charged_true)
-            loss_charge_count = excess.mean()
+            signal_excess = excess[signal_mask]
+            loss_charge_count = (
+                signal_excess.mean()
+                if signal_excess.numel() > 0
+                else pred_logits.new_zeros(())
+            )
             total_loss = total_loss + self.loss_charge_count_weight * loss_charge_count
 
         num_matched = sum(int(pred_idx.numel()) for pred_idx, _ in assignments)
@@ -456,6 +499,7 @@ class SetCriterion(nn.Module):
         return {
             "loss": total_loss,
             "loss_objectness": loss_objectness,
+            "loss_tau_id": loss_tau_id,
             "loss_kinematics": loss_kinematics,
             "kinematics_log_pt_loss": kin_components["log_pt"],
             "kinematics_delta_eta_loss": kin_components["delta_eta"],
@@ -519,6 +563,8 @@ class ParTauDETRModule(L.LightningModule):
             use_amp=False,
             metric="theta-phi",
             append_global_token=True,
+            tau_id_head=cfg.model.detr.get("tau_id_head", True),
+            head_dropout=cfg.model.detr.get("head_dropout", 0.1),
         )
 
         self.matcher = HungarianMatcher(
@@ -535,6 +581,7 @@ class ParTauDETRModule(L.LightningModule):
             tau_loss=self.tau_loss,
             pdg_class_ids=pdg_class_ids,
             loss_objectness_weight=cfg.model.detr.loss.weight_objectness,
+            loss_tau_id_weight=cfg.model.detr.loss.get("weight_tau_id", 1.0),
             loss_kinematics_weight=cfg.model.detr.loss.weight_kinematics,
             loss_charge_weight=cfg.model.detr.loss.weight_charge,
             loss_pdg_weight=cfg.model.detr.loss.weight_pdg,
@@ -566,7 +613,7 @@ class ParTauDETRModule(L.LightningModule):
 
     def _extract_set_targets(
         self, targets: dict
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         required = [
             "particles_kinematics",
             "particles_charge_ohe",
@@ -621,7 +668,25 @@ class ParTauDETRModule(L.LightningModule):
         )
         target_pdg_cls = target_pdg_cls.masked_fill(~target_mask, self.ignore_index)
 
-        return target_kinematics, target_charge_cls, target_pdg_cls, target_mask
+        # Jet-level tau-tagging label. Prefer an explicit `is_tau` target when the
+        # dataloader provides it; otherwise fall back to "has at least one valid
+        # daughter", which is the same signal/background distinction.
+        if "is_tau" in targets:
+            target_is_tau = targets["is_tau"].long()
+        else:
+            target_is_tau = target_mask.any(dim=1).long()
+        if target_is_tau.ndim != 1 or target_is_tau.size(0) != target_mask.size(0):
+            raise ValueError(
+                f"Expected is_tau shape [{target_mask.size(0)}], got {tuple(target_is_tau.shape)}"
+            )
+
+        return (
+            target_kinematics,
+            target_charge_cls,
+            target_pdg_cls,
+            target_mask,
+            target_is_tau,
+        )
 
     def forward(self, batch):
         inputs = BatchInputs(*batch)
@@ -634,9 +699,13 @@ class ParTauDETRModule(L.LightningModule):
 
     def training_step(self, batch, _batch_idx):
         outputs, targets, weights = self.forward(batch)
-        target_kinematics, target_charge_cls, target_pdg_cls, target_mask = (
-            self._extract_set_targets(targets)
-        )
+        (
+            target_kinematics,
+            target_charge_cls,
+            target_pdg_cls,
+            target_mask,
+            target_is_tau,
+        ) = self._extract_set_targets(targets)
 
         losses = self.criterion(
             outputs=outputs,
@@ -644,6 +713,7 @@ class ParTauDETRModule(L.LightningModule):
             target_charge_cls=target_charge_cls,
             target_pdg_cls=target_pdg_cls,
             target_mask=target_mask,
+            target_is_tau=target_is_tau,
             jet_weights=weights,
         )
 
@@ -651,6 +721,12 @@ class ParTauDETRModule(L.LightningModule):
         self.log(
             "train_losses/objectness",
             losses["loss_objectness"],
+            on_step=False,
+            on_epoch=True,
+        )
+        self.log(
+            "train_losses/tau_id",
+            losses["loss_tau_id"],
             on_step=False,
             on_epoch=True,
         )
@@ -707,9 +783,13 @@ class ParTauDETRModule(L.LightningModule):
 
     def validation_step(self, batch, _batch_idx):
         outputs, targets, weights = self.forward(batch)
-        target_kinematics, target_charge_cls, target_pdg_cls, target_mask = (
-            self._extract_set_targets(targets)
-        )
+        (
+            target_kinematics,
+            target_charge_cls,
+            target_pdg_cls,
+            target_mask,
+            target_is_tau,
+        ) = self._extract_set_targets(targets)
 
         losses = self.criterion(
             outputs=outputs,
@@ -717,6 +797,7 @@ class ParTauDETRModule(L.LightningModule):
             target_charge_cls=target_charge_cls,
             target_pdg_cls=target_pdg_cls,
             target_mask=target_mask,
+            target_is_tau=target_is_tau,
             jet_weights=weights,
         )
 
@@ -724,6 +805,12 @@ class ParTauDETRModule(L.LightningModule):
         self.log(
             "val_losses/objectness",
             losses["loss_objectness"],
+            on_step=False,
+            on_epoch=True,
+        )
+        self.log(
+            "val_losses/tau_id",
+            losses["loss_tau_id"],
             on_step=False,
             on_epoch=True,
         )
@@ -796,7 +883,7 @@ class ParTauDETRModule(L.LightningModule):
         )
         pred_pdg = pdg_lut[pdg_class]
 
-        return {
+        result = {
             "pred_kinematics": outputs["pred_kinematics"],
             "pred_charge_logits": outputs["pred_charge_logits"],
             "pred_pdg_logits": outputs["pred_pdg_logits"],
@@ -806,6 +893,12 @@ class ParTauDETRModule(L.LightningModule):
             "pred_charge": pred_charge,
             "pred_pdg": pred_pdg,
         }
+
+        if "is_tau" in outputs:
+            result["is_tau_logits"] = outputs["is_tau"]
+            result["is_tau"] = torch.softmax(outputs["is_tau"], dim=-1)[..., 1]
+
+        return result
 
     def test_step(self, batch, _batch_idx):
         return self.predict_step(batch, _batch_idx)

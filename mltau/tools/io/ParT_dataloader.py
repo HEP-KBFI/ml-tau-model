@@ -1,18 +1,18 @@
-import os
 import glob
 import math
-import torch
-import numpy as np
-import awkward as ak
-
+import os
 from collections.abc import Sequence
-from torch.utils.data import DataLoader, IterableDataset
-from omegaconf import DictConfig
-from lightning import LightningDataModule
 
-from mltau.tools.io import general as ig  # RowGroupDataset
-from mltau.tools import general as g
+import awkward as ak
+import numpy as np
+import torch
+from lightning import LightningDataModule
+from omegaconf import DictConfig
+from torch.utils.data import DataLoader, IterableDataset
+
 from mltau.tools import features as f
+from mltau.tools import general as g
+from mltau.tools.io import general as ig  # RowGroupDataset
 
 np.random.seed(42)
 
@@ -312,7 +312,7 @@ class ParTDataModule(LightningDataModule):
     def get_dataset_rowgroups(self, dataset_type: str):
         if dataset_type == "test":
             test_paths_wcp = os.path.join(
-                self.cfg.dataset.data_dir, f"{self.sample}_test.parquet"
+                self.cfg.dataset.data_dir, f"{self.sample}_test*.parquet"
             )
             test_paths = list(glob.glob(test_paths_wcp))
             test_rowgroups = ig.get_row_groups(input_paths=test_paths)
@@ -330,7 +330,7 @@ class ParTDataModule(LightningDataModule):
                 for dataset in ["train", "val"]
             }
             train_paths_wcp = os.path.join(
-                self.cfg.dataset.data_dir, f"{self.sample}_train.parquet"
+                self.cfg.dataset.data_dir, f"{self.sample}_train*.parquet"
             )
             train_paths = list(glob.glob(train_paths_wcp))
             all_train_rowgroups = ig.get_row_groups(input_paths=train_paths)

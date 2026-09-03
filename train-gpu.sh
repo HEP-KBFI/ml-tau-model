@@ -14,6 +14,7 @@
 #   sbatch train-gpu.sh training.model.name=SingleParTau training.model.task=kinematics
 
 env | grep CUDA
-nvidia-smi -L
+nvidia-smi --query-gpu=memory.used,memory.total,utilization.gpu \
+           --format=csv -l 10 > logs/gpu_log.txt &
 export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 ./run.sh python3 mltau/scripts/train.py "$@"

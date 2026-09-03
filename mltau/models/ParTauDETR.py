@@ -1,7 +1,7 @@
 import contextlib
 
 import torch
-import torch.nn as nn
+from torch import nn
 
 from mltau.models.ParticleTransformer import ParticleTransformer
 
@@ -20,6 +20,9 @@ class ParTauDETR(ParticleTransformer):
       - pred_kinematics: regression (5D kinematics target)
       - pred_charge_logits: charge classification logits
       - pred_pdg_logits: PDG/PID classification logits
+
+    Jet-level head:
+      - is_tau: binary tau-tagging logits from the pooled global token.
     """
 
     def __init__(
@@ -34,6 +37,9 @@ class ParTauDETR(ParticleTransformer):
         decoder_num_heads: int | None = None,
         decoder_ffn_ratio: int = 4,
         decoder_dropout: float = 0.1,
+        # jet-level readout head configuration
+        head_dropout: float = 0.1,
+        tau_id_head: bool = True,
         # encoder configuration (same as parent)
         pair_input_dim: int = 4,
         pair_extra_dim: int = 0,
@@ -59,6 +65,7 @@ class ParTauDETR(ParticleTransformer):
         verbosity: int = 0,
         append_global_token: bool = True,
         return_memory: bool = False,
+        return_cls: bool = False,
         **kwargs,
     ):
         super().__init__(
@@ -89,6 +96,8 @@ class ParTauDETR(ParticleTransformer):
         self.use_amp = use_amp
         self.append_global_token = append_global_token
         self.return_memory = return_memory
+        self.return_cls = return_cls
+        self.tau_id_head = tau_id_head
 
         embed_dim = embed_dims[-1] if len(embed_dims) > 0 else input_dim
         decoder_heads = (
@@ -121,6 +130,20 @@ class ParTauDETR(ParticleTransformer):
         )
         self.charge_head = nn.Linear(embed_dim, num_charge_classes)
         self.pdg_head = nn.Linear(embed_dim, num_pdg_classes)
+
+        # Jet-level tau-tagging head. The global (cls) token already pools the
+        # whole jet, so a small MLP on top of it is all that is needed for the
+        # binary signal-vs-background classification.
+        if tau_id_head:
+            head_hidden = embed_dim // 2
+            self.tau_head = nn.Sequential(
+                nn.Linear(embed_dim, head_hidden),
+                nn.GELU() if activation == "gelu" else nn.ReLU(),
+                nn.Dropout(head_dropout / 2),
+                nn.Linear(head_hidden, 2),
+            )
+        else:
+            self.tau_head = None
 
     @torch.jit.ignore()
     def no_weight_decay(self):
@@ -164,20 +187,32 @@ class ParTauDETR(ParticleTransformer):
 
         return particle_memory, padding_mask
 
-    def build_decoder_memory(
+    def compute_global_token(
         self,
         particle_memory: torch.Tensor,
         padding_mask: torch.Tensor,
-    ):
-        if not self.append_global_token:
-            return particle_memory, padding_mask
+    ) -> torch.Tensor:
+        """
+        Pool the whole jet into a single (cls) token.
 
+        Returns:
+            global_token: (1, N, C)
+        """
         cls_tokens = self.cls_token.expand(1, particle_memory.size(1), -1)
         for block in self.cls_blocks:
             cls_tokens = block(
                 particle_memory, x_cls=cls_tokens, padding_mask=padding_mask
             )
-        global_token = self.norm(cls_tokens)
+        return self.norm(cls_tokens)
+
+    def build_decoder_memory(
+        self,
+        particle_memory: torch.Tensor,
+        padding_mask: torch.Tensor,
+        global_token: torch.Tensor | None,
+    ):
+        if not self.append_global_token or global_token is None:
+            return particle_memory, padding_mask
 
         memory = torch.cat((particle_memory, global_token), dim=0)
         global_pad = torch.zeros_like(padding_mask[:, :1])
@@ -203,9 +238,20 @@ class ParTauDETR(ParticleTransformer):
                 cand_kinematics_pxpypze=cand_kinematics_pxpypze,
                 cand_mask=cand_mask,
             )
+
+            need_global_token = (
+                self.append_global_token or self.tau_id_head or self.return_cls
+            )
+            global_token = (
+                self.compute_global_token(particle_memory, padding_mask)
+                if need_global_token
+                else None
+            )
+
             memory, memory_padding_mask = self.build_decoder_memory(
                 particle_memory=particle_memory,
                 padding_mask=padding_mask,
+                global_token=global_token,
             )
 
             batch_size = memory.size(1)
@@ -227,13 +273,16 @@ class ParTauDETR(ParticleTransformer):
                 "pred_pdg_logits": self.pdg_head(hs),
             }
 
+            # Jet-level tau-tagging logits from the pooled global token.
+            if self.tau_head is not None and global_token is not None:
+                output["is_tau"] = self.tau_head(global_token.squeeze(0))
+
+            if self.return_cls and global_token is not None:
+                output["x_cls"] = global_token.squeeze(0)
+
             if self.return_memory:
                 output["particle_memory"] = particle_memory.transpose(0, 1).contiguous()
                 output["memory"] = memory.transpose(0, 1).contiguous()
                 output["memory_padding_mask"] = memory_padding_mask
 
             return output
-
-
-# Backward-compatible alias.
-DETRParTau = ParTauDETR

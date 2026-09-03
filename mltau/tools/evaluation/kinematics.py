@@ -520,7 +520,7 @@ class RegressionMultiEvaluator:
             nticks=var_cfg.response_plot.nticks,
             axhline_loc=axhline_loc,
         )
-        self.resolution_lineplot = LinePlot(
+        self.d_lineplot = LinePlot(
             cfg=self.cfg,
             xlabel=var_cfg.resolution_plot.xlabel,
             ylabel=var_cfg.resolution_plot.ylabel,
@@ -596,7 +596,7 @@ class KinematicsEvaluator:
         true_p4: ak.Array,
         cfg: DictConfig,
         algorithm: str,
-        sample_name: str = "",
+        sample_name: str = "z",
     ):
         self.predicted_p4 = reinitialize_p4(predicted_p4)
         self.true_p4 = reinitialize_p4(true_p4)

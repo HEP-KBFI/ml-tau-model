@@ -1,15 +1,14 @@
 import os
+
 import hydra
 import lightning as L
-import numpy as np
-
-from omegaconf import DictConfig
+from lightning.pytorch.callbacks import Callback, ModelCheckpoint, TQDMProgressBar
 from lightning.pytorch.loggers import TensorBoardLogger  # , CometLogger
-from lightning.pytorch.callbacks import TQDMProgressBar, ModelCheckpoint, Callback
+from omegaconf import DictConfig
 
-from mltau.tools.io import preprocessed_ParTau_dataloader as dl
 from mltau.models import MultiParTau_module, SingleParTau_module
 from mltau.tools.evaluation import inference
+from mltau.tools.io import preprocessed_ParTau_dataloader as dl
 
 
 @hydra.main(config_path="../config", config_name="main", version_base=None)

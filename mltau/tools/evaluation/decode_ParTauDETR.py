@@ -51,7 +51,7 @@ def get_predicted_particles(
     pred_charge = charge_lut[pred_charge_cls]
 
     pred_pdg_cls = pred_pdg_probs.argmax(dim=-1)
-    pdg_lut = torch.tensor(pdg_class_ids, dtype=torch.long, device=device)
+    pdg_lut = torch.tensor(pdg_class_ids, dtype=torch.long, device=DEVICE)
     pred_pdg = pdg_lut[pred_pdg_cls]
 
     pred_p4 = decode_kinematics(
@@ -77,7 +77,7 @@ def get_true_particles(targets, reco_jet_p4s, pdg_class_ids):
     target_charge = ak.drop_none(ak.mask(target_charge, target_mask))
 
     target_pdg_cls = targets["particles_pdg_ohe"].argmax(dim=-1)
-    pdg_lut = torch.tensor(pdg_class_ids, dtype=torch.long, device=device)
+    pdg_lut = torch.tensor(pdg_class_ids, dtype=torch.long, device=DEVICE)
     target_pdg = pdg_lut[target_pdg_cls]
     target_pdg = ak.drop_none(ak.mask(target_pdg, target_mask))
 
@@ -428,9 +428,3 @@ def scan_thresholds(
         target_pdg,
         max_dr=0.4,
     )  # Matches is needed to compare against true particle.
-
-
-# checkpoint_path = (
-#     "/home/laurits/20260725_ParTauDETR_physPenalty/models/ParTauDETR-model_best.ckpt"
-# )
-# data_path = "/home/laurits/20260722_tauDaughterDataset/split/z_test.parquet"
