@@ -1,6 +1,7 @@
 from typing import Any
 
 import lightning as L
+import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -9,6 +10,11 @@ from omegaconf import DictConfig, OmegaConf
 from mltau.models.ParTauDETR import ParTauDETR
 from mltau.tools.io.general import BatchInputs
 from mltau.tools.losses import TauLoss
+
+try:  # scipy's LAPJVsp solver is ~10x faster than the pure-python fallback below
+    from scipy.optimize import linear_sum_assignment as _scipy_lsa
+except ImportError:  # pragma: no cover - scipy is a hard dependency in practice
+    _scipy_lsa = None
 
 
 def _hungarian_rect_min_cost(cost: list[list[float]]) -> tuple[list[int], list[int]]:
@@ -77,27 +83,21 @@ def _hungarian_rect_min_cost(cost: list[list[float]]) -> tuple[list[int], list[i
     return rows, cols
 
 
-def hungarian_min_cost_assignment(
-    cost_matrix: torch.Tensor,
-) -> tuple[torch.Tensor, torch.Tensor]:
-    """Minimum-cost bipartite matching for a single cost matrix [N_pred, N_tgt]."""
-    n_pred, n_tgt = cost_matrix.shape
-    device = cost_matrix.device
+def _solve_assignment(cost: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+    """Minimum-cost bipartite matching for one [n_rows, n_cols] cost matrix."""
+    if _scipy_lsa is not None:
+        return _scipy_lsa(cost)
 
-    if n_pred == 0 or n_tgt == 0:
-        empty = torch.empty(0, dtype=torch.long, device=device)
-        return empty, empty
+    n_rows, n_cols = cost.shape
+    if n_rows <= n_cols:
+        rows, cols = _hungarian_rect_min_cost(cost.tolist())
+        return np.asarray(rows, dtype=np.int64), np.asarray(cols, dtype=np.int64)
 
-    if n_pred <= n_tgt:
-        rows, cols = _hungarian_rect_min_cost(cost_matrix.detach().cpu().tolist())
-        pred_idx = torch.tensor(rows, dtype=torch.long, device=device)
-        tgt_idx = torch.tensor(cols, dtype=torch.long, device=device)
-        return pred_idx, tgt_idx
-
-    rows_t, cols_t = _hungarian_rect_min_cost(cost_matrix.t().detach().cpu().tolist())
-    pred_idx = torch.tensor(cols_t, dtype=torch.long, device=device)
-    tgt_idx = torch.tensor(rows_t, dtype=torch.long, device=device)
-    return pred_idx, tgt_idx
+    rows_t, cols_t = _hungarian_rect_min_cost(cost.T.tolist())
+    pred_idx = np.asarray(cols_t, dtype=np.int64)
+    tgt_idx = np.asarray(rows_t, dtype=np.int64)
+    order = np.argsort(pred_idx)  # scipy returns row indices in ascending order
+    return pred_idx[order], tgt_idx[order]
 
 
 def _classification_cost_matrix(
@@ -109,26 +109,28 @@ def _classification_cost_matrix(
     Per-query/per-target classification matching cost based on -log softmax.
 
     Args:
-        pred_logits: [Q, C]
-        target_classes: [T]
+        pred_logits: [B, Q, C]
+        target_classes: [B, T]
     Returns:
-        cost: [Q, T] in float32
+        cost: [B, Q, T] in float32, zero where the target is `ignore_index`.
     """
     # Build matching costs in fp32 for AMP stability.
-    nll = -F.log_softmax(pred_logits.float(), dim=-1)
-    q = pred_logits.size(0)
-    t = target_classes.numel()
-    cost = torch.zeros((q, t), dtype=nll.dtype, device=pred_logits.device)
-
-    valid = target_classes != ignore_index
-    if valid.any():
-        idx = target_classes[valid].to(torch.long)
-        cost[:, valid] = nll[:, idx]
-    return cost
+    nll = -F.log_softmax(pred_logits.float(), dim=-1)  # [B, Q, C]
+    valid = target_classes != ignore_index  # [B, T]
+    # `gather` needs in-range indices even for the entries we discard afterwards.
+    idx = target_classes.clamp_min(0).unsqueeze(1).expand(-1, nll.size(1), -1)
+    cost = torch.gather(nll, 2, idx)  # [B, Q, T]
+    return cost * valid.unsqueeze(1)
 
 
 class HungarianMatcher(nn.Module):
     """DETR-style matcher with mixed regression/classification costs."""
+
+    # Cost charged to padded target slots. Constant across queries, so it only
+    # shifts the objective by a constant and leaves the optimum over the real
+    # targets untouched -- this lets every jet be solved on one fixed [Q, T]
+    # matrix instead of a per-jet compacted one.
+    _PAD_COST = 1.0e6
 
     def __init__(
         self,
@@ -158,7 +160,7 @@ class HungarianMatcher(nn.Module):
         target_charge_cls: torch.Tensor,
         target_pdg_cls: torch.Tensor,
         target_mask: torch.Tensor,
-    ) -> list[tuple[torch.Tensor, torch.Tensor]]:
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """
         Args:
             pred_logits: [B, Q, 2]
@@ -169,44 +171,78 @@ class HungarianMatcher(nn.Module):
             target_charge_cls: [B, T]
             target_pdg_cls: [B, T]
             target_mask: [B, T]
+
+        Returns:
+            (batch_idx, query_idx, target_idx), three flat int64 tensors of equal
+            length listing every matched (jet, query, target-slot) triplet.
         """
-        batch_size = pred_logits.size(0)
-        assignments: list[tuple[torch.Tensor, torch.Tensor]] = []
+        device = pred_logits.device
+        batch_size, num_queries, _ = pred_logits.shape
+        num_targets = target_mask.size(1)
 
-        for b in range(batch_size):
-            valid_tgt = target_mask[b]
-            tgt_kin = target_kinematics[b][valid_tgt]
-            tgt_charge = target_charge_cls[b][valid_tgt]
-            tgt_pdg = target_pdg_cls[b][valid_tgt]
+        empty = torch.empty(0, dtype=torch.long, device=device)
+        if num_targets == 0 or batch_size == 0:
+            return empty, empty, empty
 
-            if tgt_kin.numel() == 0:
-                empty = torch.empty(0, dtype=torch.long, device=pred_logits.device)
-                assignments.append((empty, empty))
-                continue
+        # ------------------------------------------------------------------
+        # All costs are built for the whole batch at once, in fp32 to avoid AMP
+        # dtype mismatches. Roughly a dozen kernels per step instead of ~10 per
+        # jet, and no host synchronisation until the single transfer below.
+        # ------------------------------------------------------------------
+        obj_cost = -F.log_softmax(pred_logits.float(), dim=-1)[
+            ..., self.object_class_index
+        ]  # [B, Q]
+        # L1 distance by explicit broadcast: torch.cdist(p=1) has no fast kernel.
+        kin_cost = (
+            (pred_kinematics.float().unsqueeze(2) - target_kinematics.float().unsqueeze(1))
+            .abs()
+            .sum(-1)
+        )  # [B, Q, T]
+        charge_cost = _classification_cost_matrix(
+            pred_charge_logits, target_charge_cls, self.ignore_index
+        )
+        pdg_cost = _classification_cost_matrix(
+            pred_pdg_logits, target_pdg_cls, self.ignore_index
+        )
 
-            # Build all matching costs in fp32 to avoid AMP dtype mismatches.
-            obj_cost = -F.log_softmax(pred_logits[b].float(), dim=-1)[
-                :, self.object_class_index
-            ]
-            kin_cost = torch.cdist(pred_kinematics[b].float(), tgt_kin.float(), p=1)
-            charge_cost = _classification_cost_matrix(
-                pred_charge_logits[b], tgt_charge, self.ignore_index
-            )
-            pdg_cost = _classification_cost_matrix(
-                pred_pdg_logits[b], tgt_pdg, self.ignore_index
-            )
+        total_cost = (
+            self.cost_objectness * obj_cost.unsqueeze(-1)
+            + self.cost_kinematics_l1 * kin_cost
+            + self.cost_charge_ce * charge_cost
+            + self.cost_pdg_ce * pdg_cost
+        )
+        total_cost = torch.nan_to_num(total_cost, nan=0.0, posinf=1e4, neginf=-1e4)
+        total_cost = total_cost.masked_fill(
+            ~target_mask.unsqueeze(1), self._PAD_COST
+        )
 
-            total_cost = (
-                self.cost_objectness * obj_cost[:, None]
-                + self.cost_kinematics_l1 * kin_cost
-                + self.cost_charge_ce * charge_cost
-                + self.cost_pdg_ce * pdg_cost
-            )
-            total_cost = torch.nan_to_num(total_cost, nan=0.0, posinf=1e4, neginf=-1e4)
-            pred_idx, tgt_idx = hungarian_min_cost_assignment(total_cost)
-            assignments.append((pred_idx, tgt_idx))
+        # One device -> host transfer per step for the whole batch.
+        cost_np = total_cost.cpu().numpy()
+        valid_np = target_mask.cpu().numpy()
+        to_solve = np.flatnonzero(valid_np.any(axis=1))
+        if to_solve.size == 0:
+            return empty, empty, empty
 
-        return assignments
+        # Every solve returns exactly min(Q, T) pairs, so the results pack into
+        # a dense array and the padded slots are dropped in one vectorised pass.
+        num_pairs = min(num_queries, num_targets)
+        query_idx = np.empty((to_solve.size, num_pairs), dtype=np.int64)
+        target_idx = np.empty((to_solve.size, num_pairs), dtype=np.int64)
+        for i, b in enumerate(to_solve):
+            rows, cols = _solve_assignment(cost_np[b])
+            query_idx[i] = rows
+            target_idx[i] = cols
+
+        batch_idx = np.repeat(to_solve, num_pairs)
+        query_idx = query_idx.reshape(-1)
+        target_idx = target_idx.reshape(-1)
+        keep = valid_np[batch_idx, target_idx]
+
+        return (
+            torch.from_numpy(batch_idx[keep]).to(device, non_blocking=True),
+            torch.from_numpy(query_idx[keep]).to(device, non_blocking=True),
+            torch.from_numpy(target_idx[keep]).to(device, non_blocking=True),
+        )
 
 
 class SetCriterion(nn.Module):
@@ -299,9 +335,13 @@ class SetCriterion(nn.Module):
         if target_is_tau is not None:
             signal_mask = target_is_tau.bool()
         else:
-            signal_mask = pred_logits.new_ones(batch_size, dtype=torch.bool)
+            signal_mask = torch.ones(batch_size, dtype=torch.bool, device=device)
 
-        assignments = self.matcher(
+        # Restricting the matcher to signal jets means background jets are never
+        # even handed to the assignment solver -- with a 7:1 background:signal mix
+        # that alone removes most of the matching work.
+        match_mask = target_mask & signal_mask.unsqueeze(1)
+        pair_b, pair_q, pair_t = self.matcher(
             pred_logits=pred_logits,
             pred_kinematics=pred_kinematics,
             pred_charge_logits=pred_charge_logits,
@@ -309,8 +349,9 @@ class SetCriterion(nn.Module):
             target_kinematics=target_kinematics,
             target_charge_cls=target_charge_cls,
             target_pdg_cls=target_pdg_cls,
-            target_mask=target_mask,
+            target_mask=match_mask,
         )
+        num_matched = pair_b.numel()
 
         tgt_classes = torch.full(
             (batch_size, num_queries),
@@ -318,68 +359,38 @@ class SetCriterion(nn.Module):
             dtype=torch.long,
             device=device,
         )
+        tgt_classes[pair_b, pair_q] = self.object_class_index
 
-        kin_pred = []
-        kin_tgt = []
-        kin_weights = []
-        charge_losses = []
-        charge_weights = []
-        pdg_losses = []
-        pdg_weights = []
-
-        for b, (pred_idx, tgt_idx) in enumerate(assignments):
-            if not signal_mask[b]:
-                continue
-            if pred_idx.numel() == 0:
-                continue
-
-            tgt_classes[b, pred_idx] = self.object_class_index
-
-            valid_tgt = target_mask[b]
-            tgt_kin_valid = target_kinematics[b][valid_tgt]
-            tgt_charge_valid = target_charge_cls[b][valid_tgt]
-            tgt_pdg_valid = target_pdg_cls[b][valid_tgt]
-
-            pred_kin_sel = pred_kinematics[b, pred_idx]
-            tgt_kin_sel = tgt_kin_valid[tgt_idx]
-            kin_pred.append(pred_kin_sel)
-            kin_tgt.append(tgt_kin_sel)
-
+        if num_matched > 0:
             if jet_weights is not None:
-                pair_w = (
-                    jet_weights[b].to(dtype=pred_logits.dtype).expand(pred_idx.numel())
-                )
+                pair_w = jet_weights.to(dtype=pred_logits.dtype, device=device)[pair_b]
             else:
-                pair_w = pred_logits.new_ones(pred_idx.numel())
-            kin_weights.append(pair_w)
+                pair_w = pred_logits.new_ones(num_matched)
 
-            # charge CE on matched pairs with valid labels
-            tgt_charge_sel = tgt_charge_valid[tgt_idx]
-            pred_charge_sel = pred_charge_logits[b, pred_idx]
+            kin_pred_cat = pred_kinematics[pair_b, pair_q]
+            kin_tgt_cat = target_kinematics[pair_b, pair_t]
+
+            tgt_charge_sel = target_charge_cls[pair_b, pair_t]
             valid_charge = tgt_charge_sel != self.ignore_index
-            if valid_charge.any():
-                ce_charge = F.cross_entropy(
-                    pred_charge_sel[valid_charge],
-                    tgt_charge_sel[valid_charge],
-                    reduction="none",
-                    ignore_index=self.ignore_index,
-                )
-                charge_losses.append(ce_charge)
-                charge_weights.append(pair_w[valid_charge])
+            # cross_entropy zeroes the ignored entries, so folding the validity
+            # flag into the weights reproduces the mean over valid pairs only.
+            ce_charge = F.cross_entropy(
+                pred_charge_logits[pair_b, pair_q],
+                tgt_charge_sel,
+                reduction="none",
+                ignore_index=self.ignore_index,
+            )
+            charge_w = pair_w * valid_charge.to(pair_w.dtype)
 
-            # pdg CE on matched pairs with valid labels
-            tgt_pdg_sel = tgt_pdg_valid[tgt_idx]
-            pred_pdg_sel = pred_pdg_logits[b, pred_idx]
+            tgt_pdg_sel = target_pdg_cls[pair_b, pair_t]
             valid_pdg = tgt_pdg_sel != self.ignore_index
-            if valid_pdg.any():
-                ce_pdg = F.cross_entropy(
-                    pred_pdg_sel[valid_pdg],
-                    tgt_pdg_sel[valid_pdg],
-                    reduction="none",
-                    ignore_index=self.ignore_index,
-                )
-                pdg_losses.append(ce_pdg)
-                pdg_weights.append(pair_w[valid_pdg])
+            ce_pdg = F.cross_entropy(
+                pred_pdg_logits[pair_b, pair_q],
+                tgt_pdg_sel,
+                reduction="none",
+                ignore_index=self.ignore_index,
+            )
+            pdg_w = pair_w * valid_pdg.to(pair_w.dtype)
 
         # objectness over all queries
         class_weight = pred_logits.new_tensor([1.0, self.eos_coef])
@@ -396,9 +407,9 @@ class SetCriterion(nn.Module):
                 w.sum() * num_queries + 1e-8
             )
         else:
-            signal_ce = ce_per_query[signal_mask]
-            loss_objectness = (
-                signal_ce.mean() if signal_ce.numel() > 0 else pred_logits.new_zeros(())
+            sig_w = signal_mask.to(dtype=ce_per_query.dtype)
+            loss_objectness = (ce_per_query * sig_w[:, None]).sum() / (
+                sig_w.sum() * num_queries + 1e-8
             )
 
         # jet-level tau-tagging loss
@@ -414,15 +425,16 @@ class SetCriterion(nn.Module):
             loss_tau_id = pred_logits.new_zeros(())
 
         # matched losses
-        if len(kin_pred) > 0:
-            kin_pred_cat = torch.cat(kin_pred, dim=0)
-            kin_tgt_cat = torch.cat(kin_tgt, dim=0)
-            kin_w = torch.cat(kin_weights, dim=0)
+        if num_matched > 0:
             loss_kinematics, kin_components = self.tau_loss.compute_kinematics_loss(
                 kin_pred_cat,
                 kin_tgt_cat,
-                kin_w,
+                pair_w,
             )
+            loss_charge = self._weighted_mean(ce_charge, charge_w)
+            loss_pdg = self._weighted_mean(ce_pdg, pdg_w)
+            num_charge_supervised = valid_charge.sum()
+            num_pdg_supervised = valid_pdg.sum()
         else:
             loss_kinematics = pred_logits.new_zeros(())
             kin_components = {
@@ -431,24 +443,10 @@ class SetCriterion(nn.Module):
                 "phi_chord": pred_logits.new_zeros(()),
                 "log_mass": pred_logits.new_zeros(()),
             }
-
-        if len(charge_losses) > 0:
-            charge_vals = torch.cat(charge_losses, dim=0)
-            charge_w = torch.cat(charge_weights, dim=0)
-            loss_charge = self._weighted_mean(charge_vals, charge_w)
-            num_charge_supervised = charge_vals.numel()
-        else:
             loss_charge = pred_logits.new_zeros(())
-            num_charge_supervised = 0
-
-        if len(pdg_losses) > 0:
-            pdg_vals = torch.cat(pdg_losses, dim=0)
-            pdg_w = torch.cat(pdg_weights, dim=0)
-            loss_pdg = self._weighted_mean(pdg_vals, pdg_w)
-            num_pdg_supervised = pdg_vals.numel()
-        else:
             loss_pdg = pred_logits.new_zeros(())
-            num_pdg_supervised = 0
+            num_charge_supervised = pred_logits.new_zeros(())
+            num_pdg_supervised = pred_logits.new_zeros(())
 
         total_loss = (
             self.loss_objectness_weight * loss_objectness
@@ -467,11 +465,9 @@ class SetCriterion(nn.Module):
             p_pdg = F.softmax(pred_pdg_logits, dim=-1)  # [B, Q, N_pdg]
             p_joint = p_charge[..., :, None] * p_pdg[..., None, :]  # [B, Q, 3, N_pdg]
             invalid_prob = (p_joint * (1 - self.charge_pdg_valid)).sum(dim=(-2, -1))
-            signal_invalid = invalid_prob[signal_mask]
-            loss_consistency = (
-                signal_invalid.mean()
-                if signal_invalid.numel() > 0
-                else pred_logits.new_zeros(())
+            sig_w = signal_mask.to(dtype=invalid_prob.dtype)
+            loss_consistency = (invalid_prob * sig_w[:, None]).sum() / (
+                sig_w.sum() * num_queries + 1e-8
             )
             total_loss = total_loss + self.loss_consistency_weight * loss_consistency
 
@@ -486,15 +482,9 @@ class SetCriterion(nn.Module):
             ).float()
             n_charged_true = is_charged_true.sum(dim=-1)  # [B]
             excess = F.relu(expected_charged - n_charged_true)
-            signal_excess = excess[signal_mask]
-            loss_charge_count = (
-                signal_excess.mean()
-                if signal_excess.numel() > 0
-                else pred_logits.new_zeros(())
-            )
+            sig_w = signal_mask.to(dtype=excess.dtype)
+            loss_charge_count = (excess * sig_w).sum() / (sig_w.sum() + 1e-8)
             total_loss = total_loss + self.loss_charge_count_weight * loss_charge_count
-
-        num_matched = sum(int(pred_idx.numel()) for pred_idx, _ in assignments)
 
         return {
             "loss": total_loss,
@@ -510,11 +500,14 @@ class SetCriterion(nn.Module):
             "loss_consistency": loss_consistency,
             "loss_charge_count": loss_charge_count,
             "num_matched": pred_logits.new_tensor(float(num_matched)),
-            "num_charge_supervised": pred_logits.new_tensor(
-                float(num_charge_supervised)
-            ),
-            "num_pdg_supervised": pred_logits.new_tensor(float(num_pdg_supervised)),
+            "num_charge_supervised": num_charge_supervised.to(pred_logits.dtype),
+            "num_pdg_supervised": num_pdg_supervised.to(pred_logits.dtype),
         }
+
+
+# Config subtrees ParTauDETRModule.__init__ reads. `output_dir` is included
+# because training.input_scaling.scaler_path interpolates it.
+_HPARAM_CFG_KEYS = ("model", "dataset", "training", "output_dir")
 
 
 class ParTauDETRModule(L.LightningModule):
@@ -528,50 +521,99 @@ class ParTauDETRModule(L.LightningModule):
       - particles_mask: [B, T]
     """
 
-    def __init__(
-        self,
-        cfg: DictConfig,
-        input_dim: int,
-        num_queries: int = 8,
-        num_charge_classes: int = 3,
-    ):
+    def __init__(self, cfg: DictConfig):
+        """
+        Args:
+            cfg: fully composed Hydra config. Every architecture choice is read
+                from it -- nothing about the network is hardcoded here, so a
+                checkpoint's architecture is fully described by its config.
+        """
         super().__init__()
         self.cfg = cfg
         self.ignore_index = -100
+        # Persist cfg into the checkpoint so `load_from_checkpoint(path)` rebuilds
+        # the exact architecture without the caller having to supply a config.
+        # Only the subtrees __init__ reads are kept: loggers flatten hparams and
+        # resolve every interpolation, so carrying unrelated config (e.g. the
+        # metrics plotting tree) turns any unresolvable key elsewhere into a
+        # crash at fit() time, and floods the hyperparameter table.
+        self.save_hyperparameters(
+            {
+                "cfg": OmegaConf.masked_copy(
+                    cfg, [k for k in _HPARAM_CFG_KEYS if k in cfg]
+                )
+            }
+        )
 
+        arch = cfg.model
+        encoder_cfg = arch.encoder
+        detr_cfg = arch.detr
+
+        num_charge_classes = int(arch.num_charge_classes)
         if num_charge_classes != 3:
             raise ValueError("This module expects 3 charge classes for {-1, 0, +1}.")
 
+        # The PDG class list is the single source of truth for the head width;
+        # deriving it here keeps the model, the dataloader one-hot targets and the
+        # decoder LUT from ever disagreeing.
         pdg_class_ids = [int(x) for x in cfg.dataset.tau_daughter_pdg_ids]
-
         self.pdg_class_ids = pdg_class_ids
+
         self.tau_loss = TauLoss(
-            l_m=0.2, label_smoothing=0.1
-        )  # TODO: since the masses are rather well reconstructed, I guess the penalty does not need to be so big.
-        self.num_kinematics_components = cfg.model.num_kinematics_components
+            l_m=float(arch.tau_loss.l_m),
+            label_smoothing=float(arch.tau_loss.label_smoothing),
+        )
+        self.num_kinematics_components = int(arch.num_kinematics_components)
+
+        embed_dims = [int(d) for d in encoder_cfg.embed_dims]
+        num_heads = int(encoder_cfg.num_heads)
+        decoder_num_heads = detr_cfg.get("decoder_num_heads", None)
+        decoder_num_heads = (
+            num_heads if decoder_num_heads is None else int(decoder_num_heads)
+        )
+        embed_dim = embed_dims[-1]
+        for label, heads in (("encoder", num_heads), ("decoder", decoder_num_heads)):
+            if embed_dim % heads != 0:
+                raise ValueError(
+                    f"{label} num_heads ({heads}) must divide the model dimension "
+                    f"embed_dims[-1] ({embed_dim})."
+                )
 
         self.ParTauDETR = ParTauDETR(
-            input_dim=input_dim,
-            num_queries=num_queries,
+            input_dim=int(cfg.dataset.num_features),
+            num_queries=int(arch.num_queries),
             num_charge_classes=num_charge_classes,
             num_pdg_classes=len(pdg_class_ids),
             num_kinematics_components=self.num_kinematics_components,
-            num_layers=2,
-            embed_dims=[256, 512, 256],
-            use_pre_activation_pair=False,
+            # encoder
+            num_layers=int(encoder_cfg.num_layers),
+            num_heads=num_heads,
+            num_cls_layers=int(encoder_cfg.num_cls_layers),
+            embed_dims=embed_dims,
+            pair_embed_dims=[int(d) for d in encoder_cfg.pair_embed_dims],
+            pair_input_dim=int(encoder_cfg.pair_input_dim),
+            use_pre_activation_pair=bool(encoder_cfg.use_pre_activation_pair),
+            remove_self_pair=bool(encoder_cfg.remove_self_pair),
+            activation=str(encoder_cfg.activation),
+            metric=str(encoder_cfg.metric),
+            trim=bool(encoder_cfg.trim),
+            # DETR decoder and heads
+            decoder_num_layers=int(detr_cfg.decoder_num_layers),
+            decoder_num_heads=decoder_num_heads,
+            decoder_ffn_ratio=int(detr_cfg.decoder_ffn_ratio),
+            decoder_dropout=float(detr_cfg.decoder_dropout),
+            append_global_token=bool(detr_cfg.append_global_token),
+            tau_id_head=bool(detr_cfg.tau_id_head),
+            head_dropout=float(detr_cfg.head_dropout),
             for_inference=False,
             use_amp=False,
-            metric="theta-phi",
-            append_global_token=True,
-            tau_id_head=cfg.model.detr.get("tau_id_head", True),
-            head_dropout=cfg.model.detr.get("head_dropout", 0.1),
         )
 
         self.matcher = HungarianMatcher(
-            cost_objectness=cfg.model.detr.matcher.cost_objectness,
-            cost_kinematics_l1=cfg.model.detr.matcher.cost_kinematics_l1,
-            cost_charge_ce=cfg.model.detr.matcher.cost_charge,
-            cost_pdg_ce=cfg.model.detr.matcher.cost_pdg_ce,
+            cost_objectness=float(detr_cfg.matcher.cost_objectness),
+            cost_kinematics_l1=float(detr_cfg.matcher.cost_kinematics_l1),
+            cost_charge_ce=float(detr_cfg.matcher.cost_charge),
+            cost_pdg_ce=float(detr_cfg.matcher.cost_pdg_ce),
             object_class_index=0,
             ignore_index=self.ignore_index,
         )
@@ -580,22 +622,22 @@ class ParTauDETRModule(L.LightningModule):
             matcher=self.matcher,
             tau_loss=self.tau_loss,
             pdg_class_ids=pdg_class_ids,
-            loss_objectness_weight=cfg.model.detr.loss.weight_objectness,
-            loss_tau_id_weight=cfg.model.detr.loss.get("weight_tau_id", 1.0),
-            loss_kinematics_weight=cfg.model.detr.loss.weight_kinematics,
-            loss_charge_weight=cfg.model.detr.loss.weight_charge,
-            loss_pdg_weight=cfg.model.detr.loss.weight_pdg,
-            loss_consistency_weight=cfg.model.detr.loss.get("weight_consistency", 0.0),
-            loss_charge_count_weight=cfg.model.detr.loss.get(
-                "weight_charge_count", 0.0
-            ),
+            # Read strictly: a `.get(key, default)` here would silently fall back
+            # to a hidden default if the key were renamed or misspelled.
+            loss_objectness_weight=float(detr_cfg.loss.weight_objectness),
+            loss_tau_id_weight=float(detr_cfg.loss.weight_tau_id),
+            loss_kinematics_weight=float(detr_cfg.loss.weight_kinematics),
+            loss_charge_weight=float(detr_cfg.loss.weight_charge),
+            loss_pdg_weight=float(detr_cfg.loss.weight_pdg),
+            loss_consistency_weight=float(detr_cfg.loss.weight_consistency),
+            loss_charge_count_weight=float(detr_cfg.loss.weight_charge_count),
             no_object_class_index=1,
             object_class_index=0,
-            eos_coef=cfg.model.detr.loss.eos_coef,
+            eos_coef=float(detr_cfg.loss.eos_coef),
             ignore_index=self.ignore_index,
         )
 
-        self.score_threshold = cfg.model.detr.inference.score_threshold
+        self.score_threshold = float(detr_cfg.inference.score_threshold)
 
     @staticmethod
     def _ohe_to_class_indices(

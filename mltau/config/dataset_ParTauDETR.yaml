@@ -4,8 +4,22 @@ dataset:
     max_tau_daughters: 8
     data_dir: /scratch/persistent/laurits/ml-tau/20260818_tauDaughterDataset/
 
-    # PDG classes for daughter one-hot encoding (order defines class index)
-    tau_daughter_pdg_ids: [211, 111, 321, 311, 310, 130, 11, 13, 22, 2212, 2112, 221, 323, 223]  # Not used currently?
+    # PDG classes for daughter one-hot encoding (order defines class index).
+    # Single source of truth: the dataloader builds particles_pdg_ohe from this,
+    # ParTauDETRModule sizes its PDG head from len(...), and predict_step decodes
+    # class indices back to PDG ids through it.
+    tau_daughter_pdg_ids: [211, 111, 321, 311, 310, 130, 11, 13, 22, 2212, 2112, 221, 323, 223]
+
+    # Cap how many jets each sample contributes to train+val. Keys are the
+    # filename prefixes before "_train" (e.g. z_train_0003.parquet -> "z").
+    # Omit a sample or set it to null to use everything. Selection is
+    # deterministic given selection_seed, and the chosen counts are printed at
+    # startup, so a run is reproducible from the config alone. Never applied to
+    # the test set.
+    max_jets_per_sample:
+        z: null
+        qq: 5000000
+    selection_seed: 42
 
     relative_sizes:
         train: 0.7

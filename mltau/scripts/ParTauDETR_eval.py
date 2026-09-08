@@ -51,10 +51,6 @@ def evaluate_ParTauDETR(data_path, checkpoint_path, cfg):
         checkpoint_path=checkpoint_path,
         map_location=device,
         cfg=cfg,
-        input_dim=17,
-        num_queries=cfg.num_queries,
-        pdg_class_ids=cfg.pdg_class_ids,
-        num_charge_classes=cfg.num_charge_classes,
     )
     model.to(device)
     model.eval()

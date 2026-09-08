@@ -1,10 +1,15 @@
 import math
+import os
+import warnings
+from collections.abc import Sequence
 
 import awkward as ak
 import numpy as np
 import torch
 from omegaconf import DictConfig
 from torch.utils.data import DataLoader
+
+from mltau.tools.io import general as ig
 
 from mltau.tools.io.ParT_dataloader import ParTDataModule, ParticleTransformerDataset
 
@@ -23,7 +28,8 @@ class ParticleTransformerDETRDataset(ParticleTransformerDataset):
       - particles_kinematics: [N, T, 5] =
           [log(pt_dau/pt_jet), delta_eta(dau-jet), sin(delta_phi), cos(delta_phi), log(m_dau/m_jet)]
       - particles_charge_ohe: [N, T, 3] one-hot for charges [-1, 0, +1]
-      - particles_pdg_ohe: [N, T, N_PDG] one-hot over PDG_CLASS_IDS map
+      - particles_pdg_ohe: [N, T, N_PDG] one-hot over
+          cfg.dataset.tau_daughter_pdg_ids
 
     where T = cfg.dataset.max_tau_daughters if provided, otherwise inferred from
     the currently loaded row-group.
@@ -47,27 +53,110 @@ class ParticleTransformerDETRDataset(ParticleTransformerDataset):
         "cls_weight",
     ]
 
-    # Fixed PDG class map for one-hot targets.
-    # Charged particle sign is handled by charge target; here we map by abs(PDG).
-    PDG_CLASS_IDS = [
-        211,
-        111,
-        321,
-        311,
-        310,
-        130,
-        11,
-        13,
-        22,
-        2212,
-        2112,
-        221,
-        323,
-        223,
-    ]
-    PDG_TO_CLASS = {pdg: i for i, pdg in enumerate(PDG_CLASS_IDS)}
+    # Charge classes are a structural constant, not configuration: the model
+    # rejects anything but three classes and ParTauDETRModule.predict_step maps
+    # them back through a fixed [-1, 0, +1] lookup table.
     CHARGE_CLASS_VALUES = [-1, 0, 1]
     CHARGE_TO_CLASS = {q: i for i, q in enumerate(CHARGE_CLASS_VALUES)}
+
+    @property
+    def pdg_class_ids(self) -> list[int]:
+        """
+        PDG ids defining the one-hot target classes, in class-index order.
+
+        Read from `cfg.dataset.tau_daughter_pdg_ids`, which is the same key
+        ParTauDETRModule uses to size its PDG head and to build the lookup table
+        in predict_step. Keeping one source of truth means the targets, the head
+        width and the decoded predictions cannot silently disagree.
+        """
+        return [int(x) for x in self.cfg.dataset.tau_daughter_pdg_ids]
+
+    @property
+    def pdg_to_class(self) -> dict[int, int]:
+        """abs(PDG) -> class index. Sign is carried by the charge target."""
+        return {pdg: i for i, pdg in enumerate(self.pdg_class_ids)}
+
+    def __init__(
+        self,
+        row_groups: Sequence[ig.RowGroup],
+        cfg: DictConfig,
+        batch_size: int = 1,
+        shuffle: bool = False,
+        row_groups_per_read: int = 1,
+        mixing_reads: int = 1,
+        cache_parquet_handles: bool = True,
+    ):
+        """
+        Args:
+            shuffle: reshuffle the read order and the jets inside each loaded
+                chunk on every epoch.
+            row_groups_per_read: number of consecutive row groups pulled in a
+                single `ak.from_parquet` call. Each such call re-opens the file
+                and re-parses the whole Parquet footer (every row group x every
+                column), so with small row groups that fixed cost dominates the
+                actual payload and scales as O(n_row_groups^2) per epoch.
+                Coalescing divides the number of footer parses by this factor.
+            mixing_reads: number of reads held in memory at once. Values > 1 mix
+                signal and background into the same batch, at the cost of
+                proportionally more worker memory. Note that `__len__` then
+                becomes an upper bound on the batch count (fewer trailing
+                partial batches), which is the safe direction for OneCycleLR.
+        """
+        super().__init__(row_groups=row_groups, cfg=cfg, batch_size=batch_size)
+        self.shuffle = shuffle
+        self.cache_parquet_handles = bool(cache_parquet_handles)
+        # Filled lazily inside the worker; see _parquet_handle.
+        self._handles = None
+        self.mixing_reads = max(1, int(mixing_reads))
+        self.read_units = self._build_read_units(
+            row_groups, max(1, int(row_groups_per_read))
+        )
+        print(
+            f"Grouped {len(row_groups):,} row groups into "
+            f"{len(self.read_units):,} parquet read(s)."
+        )
+
+    @staticmethod
+    def _build_read_units(
+        row_groups: Sequence[ig.RowGroup], row_groups_per_read: int
+    ) -> list[tuple[str, list[int], int]]:
+        """
+        Group row groups into (filename, row_group_indices, num_rows) reads.
+
+        Row groups are batched per file in ascending index order, up to
+        `row_groups_per_read` each. Contiguity is deliberately NOT required:
+        `get_dataset_rowgroups` shuffles and then splits train/val, so a train
+        shard is a random ~87% subset whose indices have gaps every ~8 entries.
+        Insisting on consecutive runs would cap reads at that gap spacing and
+        undo the coalescing entirely. pyarrow accepts an arbitrary index list,
+        and ascending order keeps enough locality; the cost being amortised here
+        is the per-call Parquet footer parse, not seek time.
+        """
+        by_file: dict[str, list[ig.RowGroup]] = {}
+        for rg in row_groups:
+            by_file.setdefault(rg.filename, []).append(rg)
+
+        units: list[tuple[str, list[int], int]] = []
+        for filename, groups in by_file.items():
+            groups.sort(key=lambda rg: rg.row_group)
+            for start in range(0, len(groups), row_groups_per_read):
+                block = groups[start : start + row_groups_per_read]
+                units.append(
+                    (
+                        filename,
+                        [rg.row_group for rg in block],
+                        sum(rg.num_rows for rg in block),
+                    )
+                )
+        return units
+
+    def __len__(self):
+        # Upper bound: a batch never spans two reads, so each read contributes
+        # its own trailing partial batch. See ParticleTransformerDataset.__len__.
+        return sum(
+            math.ceil(num_rows / self.batch_size)
+            for _, _, num_rows in self.read_units
+        )
 
     @staticmethod
     def _pad_jagged(arr, max_len: int, fill=0.0, dtype=None):
@@ -99,12 +188,11 @@ class ParticleTransformerDETRDataset(ParticleTransformerDataset):
             out[q == val] = idx
         return out
 
-    @classmethod
-    def _pdg_to_class_indices(cls, raw_pdg: np.ndarray) -> np.ndarray:
+    def _pdg_to_class_indices(self, raw_pdg: np.ndarray) -> np.ndarray:
         # Map by absolute PDG so that sign is represented by charge target.
         out = np.full(raw_pdg.shape, -1, dtype=np.int64)
         p_abs = np.abs(raw_pdg.astype(np.int64))
-        for pdg, idx in cls.PDG_TO_CLASS.items():
+        for pdg, idx in self.pdg_to_class.items():
             out[p_abs == pdg] = idx
         return out
 
@@ -333,19 +421,26 @@ class ParticleTransformerDETRDataset(ParticleTransformerDataset):
                 daughter_kinematics_np, copy=False, nan=0.0, posinf=0.0, neginf=0.0
             )
         else:
+            # Keep the daughter axis at max_tau_daughters even with nothing to
+            # put in it. A background read that emitted T=0 while a signal read
+            # emitted T=8 cannot be concatenated, which breaks batches that mix
+            # the two, and would make the target shape depend on which file a
+            # batch happened to come from. The all-False mask already tells the
+            # criterion that none of these slots carry supervision.
             n_jets = len(data)
-            daughter_mask_np = np.zeros((n_jets, 0), dtype=bool)
-            daughter_p4_np = np.zeros((n_jets, 0, 4), dtype=np.float32)
-            daughter_kinematics_np = np.zeros((n_jets, 0, 5), dtype=np.float32)
-            daughter_charge = np.zeros((n_jets, 0), dtype=np.int64)
-            daughter_pdg = np.zeros((n_jets, 0), dtype=np.int64)
+            n_slots = max(int(max_tau_daughters), 0)
+            daughter_mask_np = np.zeros((n_jets, n_slots), dtype=bool)
+            daughter_p4_np = np.zeros((n_jets, n_slots, 4), dtype=np.float32)
+            daughter_kinematics_np = np.zeros((n_jets, n_slots, 5), dtype=np.float32)
+            daughter_charge = np.zeros((n_jets, n_slots), dtype=np.int64)
+            daughter_pdg = np.zeros((n_jets, n_slots), dtype=np.int64)
 
         charge_cls = self._charges_to_class_indices(daughter_charge)
         pdg_cls = self._pdg_to_class_indices(daughter_pdg)
 
         # Prepare one-hot targets; unknown classes stay all-zero.
         n_charge = len(self.CHARGE_CLASS_VALUES)
-        n_pdg = len(self.PDG_CLASS_IDS)
+        n_pdg = len(self.pdg_class_ids)
         charge_ohe = np.zeros((*charge_cls.shape, n_charge), dtype=np.float32)
         pdg_ohe = np.zeros((*pdg_cls.shape, n_pdg), dtype=np.float32)
 
@@ -400,41 +495,142 @@ class ParticleTransformerDETRDataset(ParticleTransformerDataset):
             },
         )
 
+    def _parquet_handle(self, filename: str):
+        """
+        Return a cached pyarrow handle for `filename`.
+
+        `ak.from_parquet(path, row_groups=...)` re-opens the file and re-parses
+        the entire Parquet footer on every call, which with tens of thousands of
+        row groups costs far more than the rows being read. A ParquetFile holds
+        the parsed footer, so keeping one per file turns that into a one-off cost
+        per worker.
+
+        Handles are opened lazily here rather than in __init__ because __init__
+        runs in the parent process and the dataset is pickled out to the workers;
+        an open file handle must not cross that boundary.
+        """
+        import pyarrow.parquet as pq
+
+        if self._handles is None:
+            self._handles = {}
+        handle = self._handles.get(filename)
+        if handle is None:
+            handle = pq.ParquetFile(filename)
+            self._handles[filename] = handle
+        return handle
+
+    def _load_read_unit(self, read_unit):
+        filename, row_group_indices, _ = read_unit
+        if self.cache_parquet_handles:
+            table = self._parquet_handle(filename).read_row_groups(
+                row_group_indices, columns=self._NEEDED_COLUMNS
+            )
+            data = ak.from_arrow(table)
+            del table
+        else:
+            data = ak.from_parquet(
+                filename,
+                row_groups=row_group_indices,
+                columns=self._NEEDED_COLUMNS,
+            )
+        tensors = self.build_tensors(data)
+        del data
+        return tensors
+
+    @staticmethod
+    def _concat_tensors(parts: list[tuple]):
+        """Concatenate several build_tensors() outputs along the jet axis."""
+        if len(parts) == 1:
+            return parts[0]
+        def _cat(tensors, label):
+            shapes = {t.shape[1:] for t in tensors}
+            if len(shapes) > 1:
+                raise RuntimeError(
+                    f"Cannot concatenate '{label}' across reads: trailing shapes "
+                    f"differ ({sorted(str(s) for s in shapes)}). All reads must "
+                    "agree on every axis but the jet axis; check that "
+                    "dataset.max_tau_daughters is set so signal and background "
+                    "produce the same number of daughter slots."
+                )
+            return torch.cat(tensors, dim=0)
+
+        out = []
+        for field in range(len(parts[0])):
+            if isinstance(parts[0][field], dict):
+                out.append(
+                    {
+                        k: _cat([p[field][k] for p in parts], f"{field}.{k}")
+                        for k in parts[0][field]
+                    }
+                )
+            else:
+                out.append(_cat([p[field] for p in parts], str(field)))
+        return tuple(out)
+
+    @staticmethod
+    def _take(tensors: tuple, idx):
+        return tuple(
+            {k: v[idx] for k, v in t.items()} if isinstance(t, dict) else t[idx]
+            for t in tensors
+        )
+
     def __iter__(self):
         worker_info = torch.utils.data.get_worker_info()
         if worker_info is None:
-            row_groups_to_process = self.row_groups
+            reads_to_process = list(self.read_units)
         else:
-            per_worker = int(
-                math.ceil(float(len(self.row_groups)) / float(worker_info.num_workers))
+            # Strided instead of contiguous sharding: contiguous slicing with
+            # ceil() hands the last worker a short (or empty) shard while the
+            # first ones do a full share, so the epoch is paced by the slowest.
+            reads_to_process = list(
+                self.read_units[worker_info.id :: worker_info.num_workers]
             )
-            worker_id = worker_info.id
-            row_groups_start = worker_id * per_worker
-            row_groups_end = row_groups_start + per_worker
-            row_groups_to_process = self.row_groups[row_groups_start:row_groups_end]
 
-        for row_group in row_groups_to_process:
-            data = ak.from_parquet(
-                row_group.filename,
-                row_groups=[row_group.row_group],
-                columns=self._NEEDED_COLUMNS,
-            )
-            tensors = self.build_tensors(data)
-            del data
+        if self.shuffle:
+            np.random.default_rng().shuffle(reads_to_process)
+
+        # A read covers one file, hence one class. Emitting one read at a time
+        # therefore yields runs of pure-signal followed by runs of pure-background
+        # batches. Draining several reads at once and permuting across them
+        # restores a mixed class composition per batch.
+        for start_read in range(0, len(reads_to_process), self.mixing_reads):
+            chunk = reads_to_process[start_read : start_read + self.mixing_reads]
+            tensors = self._concat_tensors([self._load_read_unit(u) for u in chunk])
             n_rows = tensors[0].shape[0]
+
+            if self.shuffle:
+                tensors = self._take(tensors, torch.randperm(n_rows))
 
             for start in range(0, n_rows, self.batch_size):
                 end = min(start + self.batch_size, n_rows)
-                yield (
-                    tensors[0][start:end],
-                    tensors[1][start:end],
-                    {k: v[start:end] for k, v in tensors[2].items()},
-                    tensors[3][start:end],
-                    tensors[4][start:end],
-                    {k: v[start:end] for k, v in tensors[5].items()},
-                    {k: v[start:end] for k, v in tensors[6].items()},
-                    {k: v[start:end] for k, v in tensors[7].items()},
-                )
+                yield self._take(tensors, slice(start, end))
+
+
+def resolve_num_workers(requested: int) -> int:
+    """
+    Clamp the worker count to the CPUs this process may actually use.
+
+    `os.sched_getaffinity` reflects the Slurm cpuset, so this catches a job that
+    asked for one cpu but configured several workers -- they would otherwise
+    timeshare a single core and stall the first batch for minutes.
+    """
+    requested = int(requested)
+    try:
+        available = len(os.sched_getaffinity(0))
+    except AttributeError:  # pragma: no cover - non-Linux
+        available = os.cpu_count() or 1
+    # Leave one core for the main process that feeds the GPU.
+    usable = max(1, available - 1) if available > 1 else 1
+    if requested > usable:
+        warnings.warn(
+            f"training.dataloader.num_dataloader_workers={requested} but only "
+            f"{available} cpu(s) are available to this process; using {usable}. "
+            "Request more cpus (e.g. #SBATCH --cpus-per-task=8) to use more "
+            "workers.",
+            stacklevel=2,
+        )
+        return usable
+    return requested
 
 
 class ParTauDETRDataModule(ParTDataModule):
@@ -451,7 +647,7 @@ class ParTauDETRDataModule(ParTDataModule):
         # Tau tagging is a binary signal-vs-background task, so we need the
         # background samples in addition to the signal samples. The base class
         # otherwise defaults to signal-only (`sample = "z"`) for set-to-set.
-        if cfg.model.detr.get("tau_id_head", True):
+        if cfg.model.detr.tau_id_head:
             self.sample = "*"
 
     def setup(self, stage: str) -> None:
@@ -462,11 +658,30 @@ class ParTauDETRDataModule(ParTDataModule):
             train_row_groups, val_row_groups = self.get_dataset_rowgroups(
                 dataset_type="train"
             )
+            row_groups_per_read = self.cfg.training.dataloader.get(
+                "row_groups_per_read", 1
+            )
+            mixing_reads = self.cfg.training.dataloader.get("mixing_reads", 1)
+            cache_handles = self.cfg.training.dataloader.get(
+                "cache_parquet_handles", True
+            )
             self.train_dataset = ParticleTransformerDETRDataset(
-                row_groups=train_row_groups, cfg=self.cfg, batch_size=batch_size
+                row_groups=train_row_groups,
+                cfg=self.cfg,
+                batch_size=batch_size,
+                shuffle=True,
+                row_groups_per_read=row_groups_per_read,
+                mixing_reads=mixing_reads,
+                cache_parquet_handles=cache_handles,
             )
             self.val_dataset = ParticleTransformerDETRDataset(
-                row_groups=val_row_groups, cfg=self.cfg, batch_size=batch_size
+                row_groups=val_row_groups,
+                cfg=self.cfg,
+                batch_size=batch_size,
+                shuffle=False,
+                row_groups_per_read=row_groups_per_read,
+                mixing_reads=mixing_reads,
+                cache_parquet_handles=cache_handles,
             )
             self.train_loader = DataLoader(
                 self.train_dataset,
@@ -475,7 +690,9 @@ class ParTauDETRDataModule(ParTDataModule):
                 num_workers=(
                     0
                     if self.debug_run
-                    else self.cfg.training.dataloader.num_dataloader_workers
+                    else resolve_num_workers(
+                        self.cfg.training.dataloader.num_dataloader_workers
+                    )
                 ),
                 multiprocessing_context=(
                     "forkserver"
@@ -496,7 +713,9 @@ class ParTauDETRDataModule(ParTDataModule):
                 num_workers=(
                     0
                     if self.debug_run
-                    else self.cfg.training.dataloader.num_dataloader_workers
+                    else resolve_num_workers(
+                        self.cfg.training.dataloader.num_dataloader_workers
+                    )
                 ),
                 multiprocessing_context=(
                     "forkserver"
@@ -515,13 +734,21 @@ class ParTauDETRDataModule(ParTDataModule):
             if isinstance(test_row_groups, tuple):
                 test_row_groups = test_row_groups[0]
             self.test_dataset = ParticleTransformerDETRDataset(
-                row_groups=test_row_groups, cfg=self.cfg, batch_size=batch_size
+                row_groups=test_row_groups,
+                cfg=self.cfg,
+                batch_size=batch_size,
+                shuffle=False,
+                row_groups_per_read=self.cfg.training.dataloader.get(
+                    "row_groups_per_read", 1
+                ),
             )
             self.test_loader = DataLoader(
                 self.test_dataset,
                 batch_size=None,
                 persistent_workers=True,
-                num_workers=self.cfg.training.dataloader.num_dataloader_workers,
+                num_workers=resolve_num_workers(
+                    self.cfg.training.dataloader.num_dataloader_workers
+                ),
                 prefetch_factor=(
                     self.cfg.training.dataloader.prefetch_factor
                     if self.cfg.training.dataloader.num_dataloader_workers > 0

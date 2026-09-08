@@ -29,7 +29,14 @@ class ParticleTransformerDataset(IterableDataset):
         print(f"There are {'{:,}'.format(self.num_rows)} jets in the dataset.")
 
     def __len__(self):
-        return math.ceil(self.num_rows / self.batch_size)
+        # A batch never spans two row groups, so every row group contributes its
+        # own trailing partial batch. Using ceil(num_rows / batch_size) here
+        # under-counts, which makes the progress bar wrong and -- worse -- makes
+        # Trainer.estimated_stepping_batches too small, so OneCycleLR runs out of
+        # schedule and raises part-way through training.
+        return sum(
+            math.ceil(rg.num_rows / self.batch_size) for rg in self.row_groups
+        )
 
     def build_tensors(self, data: ak.Array):
         max_cands = self.cfg.dataset.max_cands
@@ -309,14 +316,76 @@ class ParTDataModule(LightningDataModule):
         self.save_hyperparameters()
         super().__init__()
 
+    @staticmethod
+    def _sample_name(path: str) -> str:
+        """Sample label from a `{sample}_train*.parquet` / `{sample}_test*.parquet` path."""
+        base = os.path.basename(path)
+        for split in ("_train", "_test"):
+            if split in base:
+                return base.split(split)[0]
+        return os.path.splitext(base)[0]
+
+    def _select_row_groups(
+        self, row_groups: list, rng: np.random.Generator
+    ) -> list:
+        """
+        Apply `cfg.dataset.max_jets_per_sample` to a flat row-group list.
+
+        Selection is deterministic given `cfg.dataset.selection_seed`: row groups
+        are ordered canonically by (filename, row-group index) before being
+        shuffled by the seeded generator, so the same seed and the same files
+        always yield the same subset regardless of glob order.
+
+        Row groups are the smallest readable unit, so the kept jet count
+        overshoots the limit by at most one row group.
+        """
+        limits = self.cfg.dataset.get("max_jets_per_sample", None)
+
+        by_sample: dict[str, list] = {}
+        for row_group in row_groups:
+            by_sample.setdefault(self._sample_name(row_group.filename), []).append(
+                row_group
+            )
+
+        selected = []
+        for sample in sorted(by_sample):
+            groups = sorted(
+                by_sample[sample], key=lambda rg: (rg.filename, rg.row_group)
+            )
+            rng.shuffle(groups)
+
+            limit = None if limits is None else limits.get(sample, None)
+            available = sum(rg.num_rows for rg in groups)
+            if limit is None:
+                kept, n_jets = groups, available
+                note = "all"
+            else:
+                kept, n_jets = [], 0
+                for row_group in groups:
+                    if n_jets >= int(limit):
+                        break
+                    kept.append(row_group)
+                    n_jets += row_group.num_rows
+                note = f"limit {int(limit):,}"
+            print(
+                f"[dataset] {sample}: {n_jets:,} / {available:,} jets "
+                f"({len(kept):,} / {len(groups):,} row groups, {note})"
+            )
+            selected.extend(kept)
+        return selected
+
     def get_dataset_rowgroups(self, dataset_type: str):
         if dataset_type == "test":
             test_paths_wcp = os.path.join(
                 self.cfg.dataset.data_dir, f"{self.sample}_test*.parquet"
             )
-            test_paths = list(glob.glob(test_paths_wcp))
+            test_paths = sorted(glob.glob(test_paths_wcp))
             test_rowgroups = ig.get_row_groups(input_paths=test_paths)
-            np.random.shuffle(test_rowgroups)
+            # max_jets_per_sample is deliberately NOT applied here: truncating the
+            # evaluation set would silently change every reported metric.
+            np.random.default_rng(
+                int(self.cfg.dataset.get("selection_seed", 42))
+            ).shuffle(test_rowgroups)
             return test_rowgroups
         elif dataset_type == "train":
             total = sum(
@@ -332,9 +401,17 @@ class ParTDataModule(LightningDataModule):
             train_paths_wcp = os.path.join(
                 self.cfg.dataset.data_dir, f"{self.sample}_train*.parquet"
             )
-            train_paths = list(glob.glob(train_paths_wcp))
-            all_train_rowgroups = ig.get_row_groups(input_paths=train_paths)
-            np.random.shuffle(all_train_rowgroups)
+            train_paths = sorted(glob.glob(train_paths_wcp))
+            # A dedicated generator rather than the global numpy state, so the
+            # train/val split and the per-sample subsampling cannot be perturbed
+            # by unrelated random draws elsewhere in the process.
+            rng = np.random.default_rng(
+                int(self.cfg.dataset.get("selection_seed", 42))
+            )
+            all_train_rowgroups = self._select_row_groups(
+                ig.get_row_groups(input_paths=train_paths), rng
+            )
+            rng.shuffle(all_train_rowgroups)
             n_train_rowgroups = int(len(all_train_rowgroups) * fractions["train"])
             train_rowgroups = all_train_rowgroups[:n_train_rowgroups]
             val_rowgroups = all_train_rowgroups[n_train_rowgroups:]

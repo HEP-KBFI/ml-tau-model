@@ -2,16 +2,68 @@
 # Keeps existing configs untouched.
 output_dir: /home/laurits/20260722_ParTauDETR
 
+logging:
+    tensorboard:
+        enabled: true
+    comet:
+        enabled: true
+        # The project is deliberately NOT configurable: it is fixed to
+        # COMET_PROJECT_NAME in mltau/scripts/train_ParTauDETR.py so that every
+        # run lands in the same Comet project.
+        # Human-readable name shown in the Comet UI. Leave null and Comet
+        # generates one itself.
+        experiment_name: null
+        # Set to append to / resume an existing Comet experiment instead of
+        # creating a new one. Leave null for a fresh experiment.
+        experiment_key: null
+        # true needs outbound network access from the compute node. false writes
+        # an archive under <output_dir>/comet to upload afterwards with
+        # `comet upload <output_dir>/comet/*.zip`.
+        online: true
+        log_code: false
+        log_graph: false
+        # System metrics -> Comet's "System Metrics" tab: GPU utilisation %,
+        # GPU memory, power, temperature (via pynvml), plus CPU and host info.
+        # log_env_gpu/cpu are force-disabled by comet_ml unless log_env_details
+        # is also true, so keep them consistent.
+        log_env_details: true
+        log_env_gpu: true
+        log_env_cpu: true
+        # The API key is deliberately NOT here: it is a secret, and
+        # save_hyperparameters() would bake it into every checkpoint. comet_ml
+        # resolves it from ~/.comet.config or COMET_API_KEY. Workspace may be
+        # set here, or left null to come from the same place.
+        workspace: null
+
 model:
     num_queries: 8
     num_charge_classes: 3
-    num_pdg_classes: 9
     num_kinematics_components: 5
+    # The PDG head width is derived from dataset.tau_daughter_pdg_ids, which is
+    # the same list the dataloader one-hot encodes against. Do not duplicate it.
+
+    # ParticleTransformer encoder
+    encoder:
+        num_layers: 2
+        num_heads: 8
+        num_cls_layers: 2
+        embed_dims: [256, 512, 256] # last entry is the model dimension
+        pair_embed_dims: [64, 64, 64]
+        pair_input_dim: 4
+        use_pre_activation_pair: false
+        remove_self_pair: false
+        activation: gelu
+        metric: theta-phi # theta-phi for e+e-, eta-phi for pp
+        trim: true
+
     detr:
         decoder_num_layers: 4
-        tau_id_head: true
+        decoder_num_heads: null # null -> reuse encoder.num_heads
         decoder_ffn_ratio: 4
         decoder_dropout: 0.1
+        append_global_token: true
+        tau_id_head: true
+        head_dropout: 0.1
         matcher:
             cost_objectness: 1.0
             cost_kinematics_l1: 2.0
@@ -28,6 +80,10 @@ model:
             eos_coef: 0.1
         inference:
             score_threshold: 0.85
+
+    tau_loss:
+        l_m: 0.2 # mass-term weight in the kinematics loss
+        label_smoothing: 0.1
 
 defaults:
     - _self_

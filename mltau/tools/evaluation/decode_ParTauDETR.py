@@ -337,8 +337,6 @@ def model_inference(checkpoint_path, data_path, cfg):
         checkpoint_path=checkpoint_path,
         map_location=DEVICE,
         cfg=cfg,
-        input_dim=17,
-        num_queries=8,
     )
     model.to(DEVICE)
     model.eval()

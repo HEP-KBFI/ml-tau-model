@@ -6,6 +6,12 @@ training:
         task: is_tau # SingleParTau only: is_tau | charge | decay_mode | kinematics
     trainer:
         max_epochs: 250
+        # "gpu" fails loudly if no CUDA device is visible. "auto" silently falls
+        # back to CPU, which looks like a working-but-inexplicably-slow run.
+        accelerator: gpu
+        devices: 1
+        # fp16 AMP is CUDA-only; use bf16-mixed if you ever run on CPU.
+        precision: 16-mixed
 
     task_weights:
         tau_id: 1.0
@@ -22,8 +28,27 @@ training:
 
     dataloader:
         batch_size: 12288
-        num_dataloader_workers: 1
+        # Keep this a couple below #SBATCH --cpus-per-task in train-gpu-DETR.sh:
+        # the main process also needs cores for the CPU-side Hungarian matching
+        # and the pin_memory thread. Clamped automatically to the real cpuset.
+        num_dataloader_workers: 10
         prefetch_factor: 2
+
+        # Keep one pyarrow handle per file per worker so the Parquet footer is
+        # parsed once instead of on every read. With ~34k row groups per file
+        # that is the difference between seconds and ~90 s per read.
+        cache_parquet_handles: true
+
+        # Consecutive row groups coalesced into a single read. Amortises the
+        # per-read fixed cost; 100 x 1024 ~= 100k jets per read. Set to 1 once
+        # the input files are repacked to ~100k-row row groups, otherwise a read
+        # becomes millions of jets and the worker runs out of memory.
+        row_groups_per_read: 100
+
+        # Reads held in memory at once. >1 is what puts signal and background in
+        # the same batch, at proportionally more worker RAM. Do not set to 1: a
+        # single read is one file, hence one class.
+        mixing_reads: 2
 
     input_scaling:
         enabled: false

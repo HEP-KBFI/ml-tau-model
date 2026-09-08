@@ -2,7 +2,7 @@ kinematics:
     base_dir: /path/to/base/dir
     algorithms:
         ParticleTransformer:
-            data_dir: ${kinematics.base_dir}
+            data_dir: ${...base_dir}
     pt:
         bin_edges:
             zh: [5, 10, 15, 20, 25, 30, 35, 40, 45]

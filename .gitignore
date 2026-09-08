@@ -215,3 +215,11 @@ lightning_logs/
 .codex
 .vscode/lightning_logs/
 .vscode
+
+# Comet: .comet.config holds the API key, never commit it.
+.comet.config
+.cometml-runs/
+*.zip.comet
+
+# Python sources mirrored out of the Apptainer image for editor LSPs.
+.container-python/

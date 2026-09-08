@@ -2,7 +2,7 @@ tagging:
     base_dir: /path/to/base/dir
     algorithms:
         ParticleTransformer:
-            data_dir: ${tagging.base_dir}
+            data_dir: ${...base_dir}
     performances:
         efficiency:
             xlabel:

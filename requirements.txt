@@ -8,6 +8,7 @@ vector
 awkward
 hydra-core
 tensorboard
+comet_ml
 matplotlib
 boost-histogram
 mplhep

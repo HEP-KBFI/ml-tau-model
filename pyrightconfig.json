@@ -1,0 +1,34 @@
+{
+  "//": "The code runs inside pytorch.simg:2025-09-01, not in ./.venv. Package",
+  "//2": "stubs are mirrored into .container-python by mltau/scripts/sync_container_stubs.sh.",
+  "pythonVersion": "3.11",
+  "extraPaths": [
+    ".",
+    "mltau",
+    ".container-python/site-packages"
+  ],
+  "include": ["mltau"],
+  "exclude": [
+    "**/__pycache__",
+    ".venv",
+    ".container-python",
+    "logs",
+    "outputs",
+    "**/notebooks"
+  ],
+  "ignore": [".venv", ".container-python"],
+  "typeCheckingMode": "basic",
+  "useLibraryCodeForTypes": true,
+  "reportMissingImports": "error",
+  "reportMissingModuleSource": "none",
+  "reportPrivateImportUsage": "none",
+  "reportAttributeAccessIssue": "warning",
+  "reportIndexIssue": "none",
+  "reportCallIssue": "warning",
+  "reportArgumentType": "warning",
+  "reportOptionalMemberAccess": "none",
+  "reportOptionalSubscript": "none",
+  "reportGeneralTypeIssues": "warning",
+  "reportUnusedExpression": "none",
+  "reportRedeclaration": "none"
+}
