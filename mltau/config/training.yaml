@@ -13,6 +13,18 @@ training:
         # fp16 AMP is CUDA-only; use bf16-mixed if you ever run on CPU.
         precision: 16-mixed
 
+        # Validation runs at epoch end by default. With a multi-hour epoch that
+        # means no val_losses/* metrics and no ModelCheckpoint(monitor=
+        # "val_losses/loss") for hours. Validate every N training steps instead.
+        # null -> end of epoch only.
+        val_check_interval: 500
+        # Cap each validation pass: the full val split is ~12.5% of the dataset,
+        # which would cost several hundred steps every time. null -> all of it.
+        limit_val_batches: 50
+        # A couple of sanity batches before training surfaces a broken val path
+        # in seconds rather than after the first epoch.
+        num_sanity_val_steps: 2
+
     task_weights:
         tau_id: 1.0
         charge: 1.0

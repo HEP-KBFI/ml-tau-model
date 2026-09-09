@@ -119,6 +119,22 @@ def build_comet_logger(cfg: DictConfig, save_dir: str):
     return CometLogger(**kwargs, **env_kwargs)
 
 
+def _optional_trainer_kwargs(cfg: DictConfig) -> dict:
+    """
+    Trainer arguments that are only passed when set, because Lightning's own
+    defaults (validate once per epoch, use every val batch) are not expressible
+    as an explicit value we would want to hardcode here.
+    """
+    kwargs = {}
+    interval = cfg.training.trainer.get("val_check_interval", None)
+    if interval is not None:
+        kwargs["val_check_interval"] = int(interval)
+    limit = cfg.training.trainer.get("limit_val_batches", None)
+    if limit is not None:
+        kwargs["limit_val_batches"] = int(limit)
+    return kwargs
+
+
 def _cuda_visible_devices_hint() -> str:
     """
     Detect a CUDA_VISIBLE_DEVICES that indexes past the devices actually present.
@@ -248,7 +264,8 @@ def train(cfg: DictConfig):
 
     callbacks = [
         TQDMProgressBar(refresh_rate=10),
-        # Best by validation loss
+        # Best by validation loss. Evaluated at the end of a validation pass,
+        # which is the only time val_losses/* exist in callback_metrics.
         ModelCheckpoint(
             dirpath=models_dir,
             monitor="val_losses/loss",
@@ -257,8 +274,14 @@ def train(cfg: DictConfig):
             save_last=True,
             save_weights_only=True,
             filename="ParTauDETR-model_best",
+            save_on_train_epoch_end=False,
         ),
-        # Fallback: best by train loss (useful if val metric is unavailable)
+        # Fallback: best by train loss. train_losses/* are logged with
+        # on_epoch=True, so they only appear once the training epoch has been
+        # reduced -- this must run at train epoch end, not at validation end.
+        # Lightning otherwise infers this flag from val_check_interval and would
+        # point both checkpoints at the same hook, where one of the two metrics
+        # is always missing.
         ModelCheckpoint(
             dirpath=models_dir,
             monitor="train_losses/loss",
@@ -266,6 +289,7 @@ def train(cfg: DictConfig):
             save_top_k=1,
             save_weights_only=True,
             filename="ParTauDETR-model_best_train",
+            save_on_train_epoch_end=True,
         ),
     ]
 
@@ -278,8 +302,9 @@ def train(cfg: DictConfig):
         precision=str(cfg.training.trainer.precision),
         gradient_clip_val=1.0,
         gradient_clip_algorithm="norm",
-        num_sanity_val_steps=0,
+        num_sanity_val_steps=cfg.training.trainer.num_sanity_val_steps,
         enable_progress_bar=True,
+        **_optional_trainer_kwargs(cfg),
     )
 
     try:
