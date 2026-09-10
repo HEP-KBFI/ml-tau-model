@@ -5,9 +5,8 @@ import vector
 from scipy.optimize import linear_sum_assignment
 
 from mltau.models.ParTauDETR_module import ParTauDETRModule
+from mltau.tools.general import reinitialize_p4
 from mltau.tools.io.ParTauDETR_dataloader import ParticleTransformerDETRDataset
-
-# from mltau.tools.general import reinitialize_p4
 
 # from hydra import compose, initialize
 # from omegaconf import OmegaConf
@@ -22,26 +21,7 @@ from mltau.tools.io.ParTauDETR_dataloader import ParticleTransformerDETRDataset
 
 # num_queries: int = 16
 # num_charge_classes: int = 3
-# num_pdg_classes: int = 9
 # num_kinematics_components: int = 5
-
-# PDG_CLASS_IDS = [
-#         211,
-#         111,
-#         321,
-#         311,
-#         310,
-#         130,
-#         11,
-#         13,
-#         22,
-#         2212,
-#         2112,
-#         221,
-#         323,
-#         223,
-# ]
-# pdg_class_ids = [int(x) for x in PDG_CLASS_IDS]
 
 device = "cuda" if torch.cuda.is_available() else "cpu"
 
@@ -65,17 +45,16 @@ def evaluate_ParTauDETR(data_path, checkpoint_path, cfg):
     with torch.no_grad():
         outputs, targets, _weights = model.forward(batch)
 
-    true_p4, target_charge, target_pdg = get_true_particles(
-        targets, reco_jet_p4s, cfg.pdg_class_ids
+    true_p4, target_charge, target_meson_class = get_true_particles(
+        targets, reco_jet_p4s
     )
 
     thresholds = np.linspace(0, 1, 101)
     f1_scores = []
     for obj_cls_trsh in thresholds:
-        pred_p4, pred_charge, pred_pdg = get_predicted_particles(
+        pred_p4, pred_charge, pred_meson_class = get_predicted_particles(
             outputs,
             reco_jet_p4s,
-            cfg.dataset.tau_daughter_pdg_ids,
             obj_cls_trsh=obj_cls_trsh,
         )
         matches = match_particles(
@@ -83,31 +62,33 @@ def evaluate_ParTauDETR(data_path, checkpoint_path, cfg):
             true_p4,
             pred_charge,
             target_charge,
-            pred_pdg,
-            target_pdg,
+            pred_meson_class,
+            target_meson_class,
             max_dr=0.4,
         )
-        _, _, f1 = calculate_metrics(matches, target_pdg, pred_pdg)
+        _, _, f1 = calculate_metrics(
+            matches, target_meson_class, pred_meson_class
+        )
         f1_scores.append(f1)
     best_thrsh_idx = np.argmax(f1_scores)
     best_thrsh = thresholds[best_thrsh_idx]
 
-    pred_p4, pred_charge, pred_pdg = get_predicted_particles(
-        outputs, reco_jet_p4s, cfg.dataset.tau_daughter_pdg_ids, obj_cls_trsh=best_thrsh
+    pred_p4, pred_charge, pred_meson_class = get_predicted_particles(
+        outputs, reco_jet_p4s, obj_cls_trsh=best_thrsh
     )
     matches = match_particles(
         pred_p4,
         true_p4,
         pred_charge,
         target_charge,
-        pred_pdg,
-        target_pdg,
+        pred_meson_class,
+        target_meson_class,
         max_dr=0.4,
     )
 
     compare_true_pred(
-        pred_pdg,
-        target_pdg,
+        pred_meson_class,
+        target_meson_class,
         pred_charge,
         target_charge,
         pred_p4,
@@ -117,9 +98,9 @@ def evaluate_ParTauDETR(data_path, checkpoint_path, cfg):
     )
 
 
-def calculate_metrics(matches, target_pdg, pred_pdg):
-    n_true = ak.num(target_pdg)
-    n_pred = ak.num(pred_pdg)
+def calculate_metrics(matches, target_meson_class, pred_meson_class):
+    n_true = ak.num(target_meson_class)
+    n_pred = ak.num(pred_meson_class)
     n_matched = ak.num(matches.pred_idx)
     efficiency = n_matched / n_true
     purity = n_matched / n_pred
@@ -127,24 +108,19 @@ def calculate_metrics(matches, target_pdg, pred_pdg):
     return efficiency, purity, f1
 
 
-def get_predicted_particles(
-    outputs, reco_jet_p4s, pdg_class_ids, obj_cls_trsh: float = 0.5
-):
+def get_predicted_particles(outputs, reco_jet_p4s, obj_cls_trsh: float = 0.5):
     """Actual separation happens closer to obj_cls_trsh=[0.8-0.9] for well-trained models"""
     object_probs = torch.softmax(outputs["pred_logits"], dim=-1)
     pred_scores = object_probs[..., 0]
     pred_mask = pred_scores >= obj_cls_trsh
 
     pred_charge_probs = torch.softmax(outputs["pred_charge_logits"], dim=-1)
-    pred_pdg_probs = torch.softmax(outputs["pred_pdg_logits"], dim=-1)
 
     pred_charge_cls = pred_charge_probs.argmax(dim=-1)
     charge_lut = outputs["pred_charge_logits"].new_tensor([-1, 0, 1], dtype=torch.long)
     pred_charge = charge_lut[pred_charge_cls]
 
-    pred_pdg_cls = pred_pdg_probs.argmax(dim=-1)
-    pdg_lut = torch.tensor(pdg_class_ids, dtype=torch.long, device=device)
-    pred_pdg = pdg_lut[pred_pdg_cls]
+    pred_meson_class = outputs["pred_meson_class_logits"].argmax(dim=-1)
 
     pred_p4 = decode_kinematics(
         kin=outputs["pred_kinematics"],
@@ -156,11 +132,11 @@ def get_predicted_particles(
 
     pred_p4 = ak.drop_none(ak.mask(pred_p4, pred_mask))
     pred_charge = ak.drop_none(ak.mask(pred_charge, pred_mask))
-    pred_pdg = ak.drop_none(ak.mask(pred_pdg, pred_mask))
-    return pred_p4, pred_charge, pred_pdg
+    pred_meson_class = ak.drop_none(ak.mask(pred_meson_class, pred_mask))
+    return pred_p4, pred_charge, pred_meson_class
 
 
-def get_true_particles(targets, reco_jet_p4s, pdg_class_ids):
+def get_true_particles(targets, reco_jet_p4s):
     target_mask = targets["particles_mask"].bool()
 
     target_charge_cls = targets["particles_charge_ohe"].argmax(dim=-1)
@@ -168,10 +144,8 @@ def get_true_particles(targets, reco_jet_p4s, pdg_class_ids):
     target_charge = charge_lut[target_charge_cls]
     target_charge = ak.drop_none(ak.mask(target_charge, target_mask))
 
-    target_pdg_cls = targets["particles_pdg_ohe"].argmax(dim=-1)
-    pdg_lut = torch.tensor(pdg_class_ids, dtype=torch.long, device=device)
-    target_pdg = pdg_lut[target_pdg_cls]
-    target_pdg = ak.drop_none(ak.mask(target_pdg, target_mask))
+    target_meson_class = targets["particles_meson_class_ohe"].argmax(dim=-1)
+    target_meson_class = ak.drop_none(ak.mask(target_meson_class, target_mask))
 
     true_p4 = decode_kinematics(
         kin=targets["particles_kinematics"],
@@ -181,7 +155,7 @@ def get_true_particles(targets, reco_jet_p4s, pdg_class_ids):
         reco_energy=reco_jet_p4s["energy"],
     )
     true_p4 = ak.drop_none(ak.mask(true_p4, target_mask))
-    return true_p4, target_charge, target_pdg
+    return true_p4, target_charge, target_meson_class
 
 
 def match_particles(
@@ -189,14 +163,14 @@ def match_particles(
     true_p4: ak.Array,
     pred_charge: ak.Array,
     true_charge: ak.Array,
-    pred_pdg: ak.Array,
-    true_pdg: ak.Array,
+    pred_meson_class: ak.Array,
+    true_meson_class: ak.Array,
     max_dr: float = 0.4,
     mismatch_penalty: float = 5.0,
 ) -> ak.Array:
     """Match predicted to true particles per event via Hungarian matching.
 
-    Cost = ΔR + penalty * (charge_mismatch + pdg_mismatch).
+    Cost = ΔR + penalty * (charge_mismatch + meson_class_mismatch).
     Unmatched particles are excluded.
 
 
@@ -204,7 +178,7 @@ def match_particles(
         pred_p4: jagged ak.Array of predicted 4-momenta per event.
         true_p4: jagged ak.Array of true 4-momenta per event.
         pred_charge, true_charge: charge arrays.
-        pred_pdg, true_pdg: PDG ID arrays.
+        pred_meson_class, true_meson_class: meson class arrays (0 charged, 1 neutral).
         max_dr: maximum ΔR for a valid match.
         mismatch_penalty: additive penalty for charge or PDG mismatch.
             A value of 5.0 means the matcher prefers a correct-identity
@@ -216,8 +190,13 @@ def match_particles(
     pred_idx_list = []
     true_idx_list = []
 
-    for evt_p, evt_t, p_ch, t_ch, p_pdg, t_pdg in zip(
-        pred_p4, true_p4, pred_charge, true_charge, pred_pdg, true_pdg
+    for evt_p, evt_t, p_ch, t_ch, pred_class, true_class in zip(
+        pred_p4,
+        true_p4,
+        pred_charge,
+        true_charge,
+        pred_meson_class,
+        true_meson_class,
     ):
         n_pred = len(evt_p)
         n_true = len(evt_t)
@@ -240,11 +219,11 @@ def match_particles(
         ch_mismatch = (np.asarray(p_ch)[:, None] != np.asarray(t_ch)[None, :]).astype(
             np.float64
         )
-        pdg_mismatch = (
-            np.asarray(p_pdg)[:, None] != np.asarray(t_pdg)[None, :]
+        meson_class_mismatch = (
+            np.asarray(pred_class)[:, None] != np.asarray(true_class)[None, :]
         ).astype(np.float64)
 
-        cost = dr + mismatch_penalty * (ch_mismatch + pdg_mismatch)
+        cost = dr + mismatch_penalty * (ch_mismatch + meson_class_mismatch)
 
         pred_idx, true_idx = linear_sum_assignment(cost)
 
@@ -327,8 +306,8 @@ def p4_from_components(p4):
 
 
 def compare_true_pred(
-    pred_pdg: ak.Array,
-    target_pdg: ak.Array,
+    pred_meson_class: ak.Array,
+    target_meson_class: ak.Array,
     pred_charge: ak.Array,
     target_charge: ak.Array,
     pred_p4: ak.Array,
@@ -347,14 +326,16 @@ def compare_true_pred(
         print(f"------------- Event {i} -----------------")
         print("--------------------------------------")
         print(
-            f"Number predicted particles: {len(pred_pdg[i])}, \t Number true particles: {len(target_pdg[i])}"
+            f"Number predicted particles: {len(pred_meson_class[i])}, \t Number true particles: {len(target_meson_class[i])}"
         )
         print("Best matches:")
-        print("[PDG]")
+        print("[Meson class: 0=charged, 1=neutral]")
         print(
-            f"Pred: {pred_pdg[matches.pred_idx][i]}\t True: {target_pdg[matches.true_idx][i]}"
+            f"Pred: {pred_meson_class[matches.pred_idx][i]}\t True: {target_meson_class[matches.true_idx][i]}"
         )
-        print(f"AllPred: {pred_pdg[i]} \t AllTrue: {target_pdg[i]}")
+        print(
+            f"AllPred: {pred_meson_class[i]} \t AllTrue: {target_meson_class[i]}"
+        )
         print("[Ch]")
         print(
             f"Pred: {pred_charge[matches.pred_idx][i]}\t True: {target_charge[matches.true_idx][i]}"

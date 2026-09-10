@@ -100,7 +100,7 @@ def construct_prediction_file_content(data, pred_daughters, true_daughters):
     data_of_interest = ak.Array(data[fields_of_interest])
     pred_tau_daughter_data = ak.Array(
         {
-            "pred_tau_daughter_pdgs": pred_daughters.pdg,
+            "pred_tau_daughter_meson_classes": pred_daughters.meson_class,
             "pred_tau_daughter_p4s": pred_daughters.p4,
             "pred_tau_daughter_charges": pred_daughters.charge,
         }
