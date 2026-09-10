@@ -415,6 +415,17 @@ class ParticleTransformerDETRDataset(ParticleTransformerDataset):
         # DETR set targets
         # -------------------------
         daughter_pdg_jag = data.gen_jet_tau_vis_daughter_pdgs
+        daughter_p4 = data.gen_jet_tau_vis_daughter_p4s
+        daughter_charge_jag = data.gen_jet_tau_vis_daughter_charges
+
+        daughter_pt_cut = float(self.cfg.dataset.get("tau_daughter_pt_cut", -1.0))
+        if daughter_pt_cut >= 0.0 and len(daughter_p4.fields) > 0:
+            daughter_pt = self._get_record_field(daughter_p4, ["pt", "rho"])
+            passes_pt_cut = daughter_pt >= daughter_pt_cut
+            daughter_p4 = daughter_p4[passes_pt_cut]
+            daughter_pdg_jag = daughter_pdg_jag[passes_pt_cut]
+            daughter_charge_jag = daughter_charge_jag[passes_pt_cut]
+
         daughter_pdg_abs = abs(daughter_pdg_jag)
         supported_ids = [
             pdg_id for pdg_ids in self.pdg_class_groups for pdg_id in pdg_ids
@@ -423,9 +434,9 @@ class ParticleTransformerDETRDataset(ParticleTransformerDataset):
         for pdg_id in supported_ids[1:]:
             supported_pdg = supported_pdg | (daughter_pdg_abs == pdg_id)
 
-        daughter_p4 = data.gen_jet_tau_vis_daughter_p4s[supported_pdg]
+        daughter_p4 = daughter_p4[supported_pdg]
         daughter_pdg_jag = daughter_pdg_jag[supported_pdg]
-        daughter_charge_jag = data.gen_jet_tau_vis_daughter_charges[supported_pdg]
+        daughter_charge_jag = daughter_charge_jag[supported_pdg]
 
         daughter_counts = ak.to_numpy(ak.num(daughter_pdg_jag)).astype(np.int64)
         max_tau_daughters = self._get_max_tau_daughters(daughter_counts)

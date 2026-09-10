@@ -2,6 +2,7 @@ dataset:
     max_cands: 20
     num_features: 17
     max_tau_daughters: 8
+    tau_daughter_pt_cut: -1.0 # negative disables the cut
     data_dir: /scratch/project_465001293/0914_ParTauDETR_dataset/
     # data_dir: /scratch/persistent/laurits/ml-tau/0914_ParTauDETR_dataset/
 
