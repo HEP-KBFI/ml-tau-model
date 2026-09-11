@@ -10,7 +10,9 @@ except ImportError as exc:  # pragma: no cover
     _COMET_IMPORT_ERROR = exc
 
 import inspect
+import json
 import os
+import time
 import warnings
 
 import hydra
@@ -99,7 +101,7 @@ def build_comet_logger(cfg: DictConfig, save_dir: str):
             # Resume the run carrying this key, creating it if it is new.
             kwargs["experiment_key"] = experiment_key
             kwargs["mode"] = "get_or_create"
-        return CometLogger(**kwargs)
+        return _apply_tags(CometLogger(**kwargs), comet_cfg)
 
     # Lightning < 2.5
     kwargs = {
@@ -116,7 +118,24 @@ def build_comet_logger(cfg: DictConfig, save_dir: str):
     # Older CometLogger forwards unknown kwargs to the comet Experiment, so the
     # env_* flags reach it even though they are not named in the signature.
     kwargs = {k: v for k, v in kwargs.items() if k in accepted}
-    return CometLogger(**kwargs, **env_kwargs)
+    return _apply_tags(CometLogger(**kwargs, **env_kwargs), comet_cfg)
+
+
+def _apply_tags(logger, comet_cfg):
+    """
+    Attach cfg.logging.comet.tags to the experiment.
+
+    Done through experiment.add_tags rather than a constructor argument because
+    only the >=2.5 CometLogger forwards unknown kwargs to ExperimentConfig; this
+    path works on both.
+    """
+    tags = [str(t) for t in (comet_cfg.get("tags", None) or [])]
+    if tags:
+        try:
+            logger.experiment.add_tags(tags)
+        except Exception as exc:  # pragma: no cover - never fail a run over a label
+            warnings.warn(f"Could not set Comet tags {tags}: {exc}")
+    return logger
 
 
 def _optional_trainer_kwargs(cfg: DictConfig) -> dict:
@@ -126,6 +145,14 @@ def _optional_trainer_kwargs(cfg: DictConfig) -> dict:
     as an explicit value we would want to hardcode here.
     """
     kwargs = {}
+    max_steps = cfg.training.trainer.get("max_steps", None)
+    if max_steps is not None:
+        # A step budget and an epoch budget together mean whichever binds first
+        # wins, which for small datasets is max_epochs -- defeating the point.
+        kwargs["max_steps"] = int(max_steps)
+        kwargs["max_epochs"] = -1
+    else:
+        kwargs["max_epochs"] = int(cfg.training.trainer.max_epochs)
     interval = cfg.training.trainer.get("val_check_interval", None)
     if interval is not None:
         kwargs["val_check_interval"] = int(interval)
@@ -228,8 +255,116 @@ def build_loggers(cfg: DictConfig, tb_log_dir: str) -> list:
     return loggers
 
 
+def write_run_metrics(cfg, trainer, datamodule, loggers, wall_seconds, path):
+    """
+    Summarise the run into one JSON file next to the checkpoints.
+
+    The best validation loss is otherwise recorded nowhere machine-readable:
+    `save_weights_only=True` drops the `callbacks` block from the checkpoint (so
+    no best_model_score), the filename carries no metric template, and the value
+    survives only in the TensorBoard event files and in Comet. Aggregating a
+    scaling study then means parsing protobufs or hitting the network.
+    """
+    summary = {
+        "wall_seconds": round(wall_seconds, 1),
+        "global_step": int(trainer.global_step),
+        "epochs_completed": int(trainer.current_epoch),
+        # global_step is fixed by max_steps; epochs are NOT, they scale with
+        # 1/dataset_size, so this says how many passes over the data were made.
+        "max_steps_requested": (
+            None
+            if cfg.training.trainer.get("max_steps", None) is None
+            else int(cfg.training.trainer.max_steps)
+        ),
+        "seed": int(cfg.training.get("seed", 42)),
+        "selection_seed": int(cfg.dataset.get("selection_seed", 42)),
+        "max_jets_per_sample": OmegaConf.to_container(
+            cfg.dataset.get("max_jets_per_sample", {}) or {}, resolve=True
+        ),
+    }
+
+    # Jets and batches actually used, which differ from the requested limits:
+    # selection rounds up to whole row groups.
+    for split in ("train", "val"):
+        dataset = getattr(datamodule, f"{split}_dataset", None)
+        if dataset is not None:
+            summary[f"n_{split}_jets"] = int(dataset.num_rows)
+            summary[f"n_{split}_batches"] = int(len(dataset))
+
+    # Best scores, per monitored checkpoint.
+    for callback in trainer.checkpoint_callbacks:
+        monitor = callback.monitor
+        if monitor is None:
+            continue
+        key = "best_val_loss" if monitor.startswith("val") else "best_train_loss"
+        score = callback.best_model_score
+        summary[key] = None if score is None else float(score)
+        summary[f"{key}_checkpoint"] = callback.best_model_path or None
+        # The epoch/step the best checkpoint was taken at lives inside the file;
+        # a large gap to global_step means it stopped improving early.
+        if callback.best_model_path and os.path.exists(callback.best_model_path):
+            try:
+                ckpt = torch.load(
+                    callback.best_model_path, map_location="cpu", weights_only=False
+                )
+                summary[f"{key}_epoch"] = int(ckpt.get("epoch", -1))
+                summary[f"{key}_step"] = int(ckpt.get("global_step", -1))
+                del ckpt
+            except Exception as exc:  # pragma: no cover
+                warnings.warn(f"Could not read {callback.best_model_path}: {exc}")
+
+    # A missing best_val_loss means validation never produced a score. The most
+    # likely cause with a step budget is max_steps < batches-per-epoch, so the
+    # run ends before the first end-of-epoch validation. Recorded explicitly:
+    # 36 silently null runs would be discovered only at aggregation time.
+    if summary.get("best_val_loss") is None:
+        n_train_batches = summary.get("n_train_batches")
+        detail = (
+            f"max_steps={summary['max_steps_requested']} vs "
+            f"{n_train_batches} training batches per epoch"
+            if summary.get("max_steps_requested") and n_train_batches
+            else "check val_check_interval / limit_val_batches"
+        )
+        note = (
+            "no best validation score was recorded: validation never ran or "
+            f"logged nothing ({detail})"
+        )
+        summary["warning"] = note
+        warnings.warn(note)
+
+    # Every metric from the final validation pass, so the per-head breakdown is
+    # available without opening TensorBoard.
+    summary["final_metrics"] = {
+        name: float(value)
+        for name, value in trainer.callback_metrics.items()
+        if hasattr(value, "item") or isinstance(value, (int, float))
+    }
+
+    # Link back to the Comet run.
+    for logger in loggers:
+        experiment = getattr(logger, "_experiment", None)
+        if experiment is None:
+            continue
+        for attr, out in (("get_key", "comet_experiment_key"), ("url", "comet_url")):
+            try:
+                value = getattr(experiment, attr)
+                summary[out] = value() if callable(value) else value
+            except Exception:
+                pass
+
+    with open(path, "w") as out_file:
+        json.dump(summary, out_file, indent=2, sort_keys=True)
+        out_file.write("\n")
+    print(f"[ParTauDETR] wrote {path}")
+    return summary
+
+
 @hydra.main(config_path="../config", config_name="main_ParTauDETR", version_base=None)
 def train(cfg: DictConfig):
+    # Seed before anything builds a module or a dataloader. workers=True gives
+    # each dataloader worker a distinct, derived seed.
+    L.seed_everything(int(cfg.training.get("seed", 42)), workers=True)
+
     # Ensure the datamodule follows the signal-only path by default.
     cfg.training.model.name = "ParTauDETR"
     cfg.training.model.task = "set2set"
@@ -294,7 +429,6 @@ def train(cfg: DictConfig):
     ]
 
     trainer = L.Trainer(
-        max_epochs=cfg.training.trainer.max_epochs,
         callbacks=callbacks,
         logger=loggers,
         accelerator=check_accelerator(cfg),
@@ -307,9 +441,24 @@ def train(cfg: DictConfig):
         **_optional_trainer_kwargs(cfg),
     )
 
+    started = time.perf_counter()
     try:
         trainer.fit(model=model, datamodule=datamodule)
     finally:
+        # Written in `finally` so a run killed by the wall clock still records
+        # the best score it reached, which is the quantity the scaling study
+        # needs. Must precede experiment.end(), which clears _experiment.
+        try:
+            write_run_metrics(
+                cfg,
+                trainer,
+                datamodule,
+                loggers,
+                time.perf_counter() - started,
+                os.path.join(cfg.output_dir, "metrics.json"),
+            )
+        except Exception as exc:  # pragma: no cover - never mask a training error
+            warnings.warn(f"Could not write metrics.json: {exc}")
         # CometLogger.finalize() only flushes; an OfflineExperiment writes its
         # uploadable .zip on end(). Without this an offline run leaves nothing
         # behind, so end the experiment even if training raised.

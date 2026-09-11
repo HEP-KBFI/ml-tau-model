@@ -4,8 +4,20 @@ training:
     model:
         name: MultiParTau # MultiParTau | SingleParTau
         task: is_tau # SingleParTau only: is_tau | charge | decay_mode | kinematics
+    # Seeds model init, dropout and shuffling. dataset.selection_seed picks
+    # WHICH jets are used; this one picks how they are trained on. A scaling
+    # study wants both varied together per repeat.
+    seed: 42
+
     trainer:
         max_epochs: 250
+        # Fixed optimizer-step budget. null -> bounded by max_epochs only.
+        # Set this for scaling studies: with max_epochs fixed instead, a 1e5-jet
+        # run gets ~2k updates and a 1e7-jet run ~200k, so the curve measures
+        # compute rather than data. When set, max_epochs is forced to -1 so the
+        # step budget is the only limit, and OneCycleLR anneals over exactly
+        # this many steps (estimated_stepping_batches caps at max_steps).
+        max_steps: null
         # "gpu" fails loudly if no CUDA device is visible. "auto" silently falls
         # back to CPU, which looks like a working-but-inexplicably-slow run.
         accelerator: gpu
@@ -16,11 +28,13 @@ training:
         # Validation runs at epoch end by default. With a multi-hour epoch that
         # means no val_losses/* metrics and no ModelCheckpoint(monitor=
         # "val_losses/loss") for hours. Validate every N training steps instead.
-        # null -> end of epoch only.
-        val_check_interval: 500
-        # Cap each validation pass: the full val split is ~12.5% of the dataset,
-        # which would cost several hundred steps every time. null -> all of it.
-        limit_val_batches: 50
+        # null -> validate once at the end of each training epoch, on the
+        # full validation split. This relies on ParticleTransformerDETRDataset
+        # returning an EXACT __len__; an over-estimate makes Lightning skip
+        # end-of-epoch validation silently.
+        val_check_interval: null
+        # null -> use every validation batch.
+        limit_val_batches: null
         # A couple of sanity batches before training surfaces a broken val path
         # in seconds rather than after the first epoch.
         num_sanity_val_steps: 2
@@ -43,8 +57,11 @@ training:
         # Keep this a couple below #SBATCH --cpus-per-task in train-gpu-DETR.sh:
         # the main process also needs cores for the CPU-side Hungarian matching
         # and the pin_memory thread. Clamped automatically to the real cpuset.
-        num_dataloader_workers: 10
-        prefetch_factor: 2
+        # The run is GPU-bound, so this only needs to cover the ~6-core bursts
+        # when workers build chunks concurrently. Note each worker holds
+        # mixing_reads chunks, so raising this raises host RAM linearly.
+        num_dataloader_workers: 6
+        prefetch_factor: 10
 
         # Keep one pyarrow handle per file per worker so the Parquet footer is
         # parsed once instead of on every read. With ~34k row groups per file
@@ -57,10 +74,13 @@ training:
         # becomes millions of jets and the worker runs out of memory.
         row_groups_per_read: 100
 
-        # Reads held in memory at once. >1 is what puts signal and background in
-        # the same batch, at proportionally more worker RAM. Do not set to 1: a
-        # single read is one file, hence one class.
-        mixing_reads: 2
+        # Reads held in memory at once. A read covers one file and therefore
+        # one class, so this is what puts signal and background in the same
+        # batch. At 2 about half of all chunks are still single-class, which
+        # makes the tagging gradient alternate and the BatchNorm statistics in
+        # PairEmbed oscillate between two regimes; 4 brings that to ~12%.
+        # Costs proportionally more worker RAM.
+        mixing_reads: 4
 
     input_scaling:
         enabled: false

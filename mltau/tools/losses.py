@@ -4,6 +4,23 @@ import torch.nn.functional as F
 from torchvision.ops import sigmoid_focal_loss
 
 
+
+def weighted_mean(values: torch.Tensor, weights: torch.Tensor) -> torch.Tensor:
+    """
+    Mean of `values` weighted by `weights`: sum(w*v) / sum(w).
+
+    NOT mean(w*v). The latter's magnitude scales with the mean of the weights,
+    i.e. with the class composition of the batch, so the reported loss moves
+    even when the model does not -- a batch of only background and a batch of
+    only signal differ by the weight ratio alone. cls_weight is built so that
+    signal and background contribute equally within each theta-p bin, which is
+    a statement about the weighted mean; mean(w*v) does not implement it.
+    """
+    if values.numel() == 0:
+        return values.new_zeros(())
+    return (values * weights).sum() / (weights.sum() + 1e-8)
+
+
 class FocalLoss(nn.Module):
     """Multi-class Focal Loss"""
 
@@ -85,7 +102,7 @@ class TauLoss(nn.Module):
     def compute_tagging_loss(self, predictions, targets, weights):
         """CrossEntropy loss for background vs signal classification."""
         loss = self.tag_loss_fn(predictions, targets.long())
-        return (loss * weights).mean()
+        return weighted_mean(loss, weights)
 
     def compute_charge_loss(self, predictions, targets, weights):
         """BCE loss for charge classification (+1 vs -1)."""
@@ -93,7 +110,7 @@ class TauLoss(nn.Module):
         # (targets == 1) maps +1 -> 1 and -1 -> 0.
         binary_targets = (targets == 1).float()
         loss = self.charge_loss_fn(predictions, binary_targets)
-        return (loss * weights).mean()
+        return weighted_mean(loss, weights)
 
     def compute_decay_mode_loss(self, predictions, targets, weights):
         """CrossEntropy loss for decay mode classification."""
@@ -102,7 +119,7 @@ class TauLoss(nn.Module):
             loss = self.dm_loss_fn(predictions, targets.float())
         else:
             loss = self.dm_loss_fn(predictions, targets.long())
-        return (loss * weights).mean()
+        return weighted_mean(loss, weights)
 
     def _compute_kinematics_loss_per_sample(self, predictions, targets):
         """Internal helper to compute per-sample Huber loss for (log pt, deta, phi_chord, log m)."""
@@ -135,10 +152,10 @@ class TauLoss(nn.Module):
         )
 
         components = {
-            k: (v * weights).mean() for k, v in components_per_sample.items()
+            k: weighted_mean(v, weights) for k, v in components_per_sample.items()
         }
 
-        return (per_sample_loss * weights).mean(), components
+        return weighted_mean(per_sample_loss, weights), components
 
     def compute_multi_task_losses(self, predictions_dict, targets_dict, sample_weights):
         """Helper for MultiParTau to compute all 4 task losses at once with masking."""
@@ -232,4 +249,4 @@ class TauLoss(nn.Module):
             )
 
         # Multiply each jet's combined loss by its weight, then average
-        return (combined_per_jet * weights).mean()
+        return weighted_mean(combined_per_jet, weights)

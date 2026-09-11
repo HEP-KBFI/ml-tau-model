@@ -85,6 +85,7 @@ class ParticleTransformerDETRDataset(ParticleTransformerDataset):
         row_groups_per_read: int = 1,
         mixing_reads: int = 1,
         cache_parquet_handles: bool = True,
+        num_workers: int = 0,
     ):
         """
         Args:
@@ -98,9 +99,9 @@ class ParticleTransformerDETRDataset(ParticleTransformerDataset):
                 Coalescing divides the number of footer parses by this factor.
             mixing_reads: number of reads held in memory at once. Values > 1 mix
                 signal and background into the same batch, at the cost of
-                proportionally more worker memory. Note that `__len__` then
-                becomes an upper bound on the batch count (fewer trailing
-                partial batches), which is the safe direction for OneCycleLR.
+                proportionally more worker memory. A read covers one file and
+                therefore one class, so with mixing_reads=2 about half of all
+                chunks are still single-class; 4 brings that to ~12%.
         """
         super().__init__(row_groups=row_groups, cfg=cfg, batch_size=batch_size)
         self.shuffle = shuffle
@@ -108,6 +109,8 @@ class ParticleTransformerDETRDataset(ParticleTransformerDataset):
         # Filled lazily inside the worker; see _parquet_handle.
         self._handles = None
         self.mixing_reads = max(1, int(mixing_reads))
+        # Needed for an exact __len__: batches are counted per worker shard.
+        self.num_workers = max(0, int(num_workers))
         self.read_units = self._build_read_units(
             row_groups, max(1, int(row_groups_per_read))
         )
@@ -151,12 +154,30 @@ class ParticleTransformerDETRDataset(ParticleTransformerDataset):
         return units
 
     def __len__(self):
-        # Upper bound: a batch never spans two reads, so each read contributes
-        # its own trailing partial batch. See ParticleTransformerDataset.__len__.
-        return sum(
-            math.ceil(num_rows / self.batch_size)
-            for _, _, num_rows in self.read_units
-        )
+        """
+        Exact number of batches this dataset yields.
+
+        `__iter__` carries leftover rows across chunks, so a worker emits
+        ceil(rows_in_its_shard / batch_size) batches regardless of how the
+        reads happen to be grouped or shuffled. Sharding is strided and
+        therefore fixed, so this is deterministic.
+
+        Exactness matters beyond cosmetics. With `val_check_interval` unset,
+        Lightning sets val_check_batch = len(dataloader) and triggers
+        end-of-epoch validation via `(batch_idx + 1) % val_check_batch == 0`,
+        overwriting its own is_last_batch default. An over-estimate here means
+        that condition never fires and validation is silently skipped forever.
+        """
+        num_workers = max(1, self.num_workers)
+        total = 0
+        for worker in range(num_workers):
+            rows = sum(
+                num_rows
+                for _, _, num_rows in self.read_units[worker::num_workers]
+            )
+            if rows:
+                total += math.ceil(rows / self.batch_size)
+        return total
 
     @staticmethod
     def _pad_jagged(arr, max_len: int, fill=0.0, dtype=None):
@@ -593,17 +614,31 @@ class ParticleTransformerDETRDataset(ParticleTransformerDataset):
         # therefore yields runs of pure-signal followed by runs of pure-background
         # batches. Draining several reads at once and permuting across them
         # restores a mixed class composition per batch.
+        #
+        # Rows left over from a chunk are carried into the next one instead of
+        # being emitted as a short batch. That keeps every batch full except the
+        # last of the shard, which is what makes __len__ exact, and it lets a
+        # batch straddle two chunks so the class mixing improves slightly.
+        carry = None
         for start_read in range(0, len(reads_to_process), self.mixing_reads):
             chunk = reads_to_process[start_read : start_read + self.mixing_reads]
             tensors = self._concat_tensors([self._load_read_unit(u) for u in chunk])
+            if carry is not None:
+                tensors = self._concat_tensors([carry, tensors])
+                carry = None
             n_rows = tensors[0].shape[0]
 
             if self.shuffle:
                 tensors = self._take(tensors, torch.randperm(n_rows))
 
-            for start in range(0, n_rows, self.batch_size):
-                end = min(start + self.batch_size, n_rows)
-                yield self._take(tensors, slice(start, end))
+            n_full = (n_rows // self.batch_size) * self.batch_size
+            for start in range(0, n_full, self.batch_size):
+                yield self._take(tensors, slice(start, start + self.batch_size))
+            if n_full < n_rows:
+                carry = self._take(tensors, slice(n_full, n_rows))
+
+        if carry is not None and carry[0].shape[0] > 0:
+            yield carry
 
 
 def resolve_num_workers(requested: int) -> int:
@@ -665,6 +700,15 @@ class ParTauDETRDataModule(ParTDataModule):
             cache_handles = self.cfg.training.dataloader.get(
                 "cache_parquet_handles", True
             )
+            # The dataset needs the count actually used by the DataLoader, so
+            # __len__ matches how the shards are really split.
+            n_workers = (
+                0
+                if self.debug_run
+                else resolve_num_workers(
+                    self.cfg.training.dataloader.num_dataloader_workers
+                )
+            )
             self.train_dataset = ParticleTransformerDETRDataset(
                 row_groups=train_row_groups,
                 cfg=self.cfg,
@@ -673,6 +717,7 @@ class ParTauDETRDataModule(ParTDataModule):
                 row_groups_per_read=row_groups_per_read,
                 mixing_reads=mixing_reads,
                 cache_parquet_handles=cache_handles,
+                num_workers=n_workers,
             )
             self.val_dataset = ParticleTransformerDETRDataset(
                 row_groups=val_row_groups,
@@ -682,18 +727,13 @@ class ParTauDETRDataModule(ParTDataModule):
                 row_groups_per_read=row_groups_per_read,
                 mixing_reads=mixing_reads,
                 cache_parquet_handles=cache_handles,
+                num_workers=n_workers,
             )
             self.train_loader = DataLoader(
                 self.train_dataset,
                 batch_size=None,
                 persistent_workers=False if self.debug_run else True,
-                num_workers=(
-                    0
-                    if self.debug_run
-                    else resolve_num_workers(
-                        self.cfg.training.dataloader.num_dataloader_workers
-                    )
-                ),
+                num_workers=n_workers,
                 multiprocessing_context=(
                     "forkserver"
                     if self.cfg.training.dataloader.num_dataloader_workers > 1
@@ -710,13 +750,7 @@ class ParTauDETRDataModule(ParTDataModule):
                 self.val_dataset,
                 batch_size=None,
                 persistent_workers=False if self.debug_run else True,
-                num_workers=(
-                    0
-                    if self.debug_run
-                    else resolve_num_workers(
-                        self.cfg.training.dataloader.num_dataloader_workers
-                    )
-                ),
+                num_workers=n_workers,
                 multiprocessing_context=(
                     "forkserver"
                     if self.cfg.training.dataloader.num_dataloader_workers > 1

@@ -26,6 +26,9 @@ logging:
         # GPU memory, power, temperature (via pynvml), plus CPU and host info.
         # log_env_gpu/cpu are force-disabled by comet_ml unless log_env_details
         # is also true, so keep them consistent.
+        # Tags applied to the experiment, e.g. ["scaling"]. Lets a 36-run study
+        # be filtered out of the shared ml-tau project.
+        tags: []
         log_env_details: true
         log_env_gpu: true
         log_env_cpu: true
@@ -83,7 +86,11 @@ model:
 
     tau_loss:
         l_m: 0.2 # mass-term weight in the kinematics loss
-        label_smoothing: 0.1
+        # Smoothing floors the tagging loss at ~0.199 (minimised at p=0.95) and
+        # actively penalises confident predictions, while the other heads are
+        # unsmoothed and can reach 0. That inflates tau_id's share of the total
+        # and works against a figure of merit like misID at fixed efficiency.
+        label_smoothing: 0.0
 
 defaults:
     - _self_
