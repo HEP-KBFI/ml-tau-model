@@ -61,6 +61,7 @@ class ParticleTransformerDETRDataset(ParticleTransformerDataset):
         "gen_jet_tau_vis_daughter_pdgs",
         "gen_jet_tau_vis_daughter_charges",
         "gen_jet_tau_decaymode",
+        "gen_jet_tau_charge",
         "cls_weight",
     ]
 
@@ -595,6 +596,12 @@ class ParticleTransformerDETRDataset(ParticleTransformerDataset):
             # -1 -> no genuine tau (background), >= 0 -> genuine tau (signal).
             "is_tau": torch.from_numpy(
                 (ak.to_numpy(data.gen_jet_tau_decaymode) != -1).astype(np.int64)
+            ),
+            "gen_jet_tau_charge": torch.from_numpy(
+                ak.to_numpy(data.gen_jet_tau_charge).astype(np.int64)
+            ),
+            "gen_jet_tau_decaymode": torch.from_numpy(
+                ak.to_numpy(data.gen_jet_tau_decaymode).astype(np.int64)
             ),
         }
 

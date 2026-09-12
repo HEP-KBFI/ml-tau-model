@@ -43,7 +43,7 @@ def evaluate_ParTauDETR(data_path, checkpoint_path, cfg):
     reco_jet_p4s = batch[6]
 
     with torch.no_grad():
-        outputs, targets, _weights = model.forward(batch)
+        outputs, targets, _weights, _, _ = model.forward(batch)
 
     true_p4, target_charge, target_meson_class = get_true_particles(
         targets, reco_jet_p4s

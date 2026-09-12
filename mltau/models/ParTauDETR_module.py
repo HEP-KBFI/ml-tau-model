@@ -1,3 +1,4 @@
+import math
 from typing import Any
 
 import lightning as L
@@ -288,6 +289,9 @@ class SetCriterion(nn.Module):
         loss_meson_class_weight: float = 1.0,
         loss_consistency_weight: float = 0.0,
         loss_charge_count_weight: float = 0.0,
+        loss_parent_kinematics_weight: float = 0.0,
+        loss_parent_charge_weight: float = 0.0,
+        loss_parent_decay_mode_weight: float = 0.0,
         no_object_class_index: int = 1,
         object_class_index: int = 0,
         eos_coef: float = 0.1,
@@ -303,6 +307,9 @@ class SetCriterion(nn.Module):
         self.loss_meson_class_weight = loss_meson_class_weight
         self.loss_consistency_weight = loss_consistency_weight
         self.loss_charge_count_weight = loss_charge_count_weight
+        self.loss_parent_kinematics_weight = loss_parent_kinematics_weight
+        self.loss_parent_charge_weight = loss_parent_charge_weight
+        self.loss_parent_decay_mode_weight = loss_parent_decay_mode_weight
         self.no_object_class_index = no_object_class_index
         self.object_class_index = object_class_index
         self.eos_coef = eos_coef
@@ -328,6 +335,38 @@ class SetCriterion(nn.Module):
             return values.mean()
         return (values * weights).sum() / (weights.sum() + 1e-8)
 
+    @staticmethod
+    def _decode_kinematics(
+        kinematics: torch.Tensor,
+        reference_pt: torch.Tensor,
+        reference_eta: torch.Tensor,
+        reference_phi: torch.Tensor,
+        reference_energy: torch.Tensor,
+    ) -> torch.Tensor:
+        reference_mass = torch.sqrt(
+            torch.clamp(
+                reference_energy**2
+                - (reference_pt * torch.cosh(reference_eta)) ** 2,
+                min=1e-12,
+            )
+        )
+        pt = torch.exp(kinematics[:, 0].clamp(-5.0, 5.0)) * reference_pt
+        max_abs_eta = math.acosh(math.sqrt(torch.finfo(kinematics.dtype).max))
+        eta = (kinematics[:, 1] + reference_eta).clamp(
+            -max_abs_eta, max_abs_eta
+        )
+        phi = reference_phi + torch.atan2(kinematics[:, 2], kinematics[:, 3])
+        mass = torch.exp(kinematics[:, 4].clamp(-5.0, 5.0)) * reference_mass
+        return torch.stack(
+            [
+                pt * torch.cos(phi),
+                pt * torch.sin(phi),
+                pt * torch.sinh(eta),
+                torch.sqrt((pt * torch.cosh(eta)) ** 2 + mass**2),
+            ],
+            dim=-1,
+        )
+
     def forward(
         self,
         outputs: dict,
@@ -335,6 +374,10 @@ class SetCriterion(nn.Module):
         target_charge_cls: torch.Tensor,
         target_meson_class: torch.Tensor,
         target_mask: torch.Tensor,
+        target_parent_charge: torch.Tensor,
+        target_parent_decay_mode: torch.Tensor,
+        target_parent_p4: dict[str, torch.Tensor],
+        kinematics_reference_p4: dict[str, torch.Tensor],
         target_is_tau: torch.Tensor | None = None,
         jet_weights: torch.Tensor | None = None,
     ) -> dict[str, torch.Tensor]:
@@ -478,6 +521,9 @@ class SetCriterion(nn.Module):
         # ---- Auxiliary penalties ----
         loss_consistency = pred_logits.new_zeros(())
         loss_charge_count = pred_logits.new_zeros(())
+        loss_parent_kinematics = pred_logits.new_zeros(())
+        loss_parent_charge = pred_logits.new_zeros(())
+        loss_parent_decay_mode = pred_logits.new_zeros(())
 
         if self.loss_consistency_weight > 0:
             p_charge = F.softmax(pred_charge_logits, dim=-1)  # [B, Q, 3]
@@ -507,6 +553,134 @@ class SetCriterion(nn.Module):
             loss_charge_count = (excess * sig_w).sum() / (sig_w.sum() + 1e-8)
             total_loss = total_loss + self.loss_charge_count_weight * loss_charge_count
 
+        if jet_weights is not None:
+            parent_weights = jet_weights.to(dtype=pred_logits.dtype, device=device)
+        else:
+            parent_weights = pred_logits.new_ones(batch_size)
+        parent_weights = parent_weights * signal_mask.to(parent_weights.dtype)
+
+        if self.loss_parent_kinematics_weight > 0:
+            reference_pt = kinematics_reference_p4["pt"].to(dtype=pred_kinematics.dtype, device=device)[pair_b]
+            reference_eta = kinematics_reference_p4["eta"].to(dtype=pred_kinematics.dtype, device=device)[pair_b]
+            reference_phi = kinematics_reference_p4["phi"].to(dtype=pred_kinematics.dtype, device=device)[pair_b]
+            reference_energy = kinematics_reference_p4["energy"].to(dtype=pred_kinematics.dtype, device=device)[pair_b]
+            pred_p4 = self._decode_kinematics(
+                pred_kinematics[pair_b, pair_q],
+                reference_pt,
+                reference_eta,
+                reference_phi,
+                reference_energy,
+            )
+            pred_parent_p4 = pred_p4.new_zeros((batch_size, 4)).index_add(0, pair_b, pred_p4)
+            pred_px, pred_py, pred_pz, pred_energy = pred_parent_p4.unbind(dim=-1)
+            pred_pt = torch.sqrt((pred_px**2 + pred_py**2).clamp_min(1e-12))
+            pred_eta = torch.asinh(pred_pz / pred_pt.clamp_min(1e-6))
+            pred_phi = torch.atan2(pred_py, pred_px)
+            pred_mass = torch.sqrt(torch.clamp(pred_energy**2 - pred_px**2 - pred_py**2 - pred_pz**2, min=1e-12))
+
+            true_pt = target_parent_p4["pt"].to(dtype=pred_pt.dtype, device=device)
+            true_eta = target_parent_p4["eta"].to(dtype=pred_eta.dtype, device=device)
+            true_phi = target_parent_p4["phi"].to(dtype=pred_phi.dtype, device=device)
+            true_energy = target_parent_p4["energy"].to(dtype=pred_energy.dtype, device=device)
+            true_mass = torch.sqrt(torch.clamp(true_energy**2 - (true_pt * torch.cosh(true_eta)) ** 2, min=1e-12))
+            delta_phi = pred_phi - true_phi
+            pred_parent_kinematics = torch.stack(
+                [
+                    torch.log(pred_pt.clamp_min(1e-6) / true_pt.clamp_min(1e-6)).clamp(-5.0, 5.0),
+                    pred_eta - true_eta,
+                    torch.sin(delta_phi),
+                    torch.cos(delta_phi),
+                    torch.log(pred_mass.clamp_min(1e-6) / true_mass.clamp_min(1e-6)).clamp(-5.0, 5.0),
+                ],
+                dim=-1,
+            )
+            target_parent_kinematics = torch.zeros_like(pred_parent_kinematics)
+            target_parent_kinematics[:, 3] = 1.0
+            loss_parent_kinematics, _ = self.tau_loss.compute_kinematics_loss(
+                pred_parent_kinematics,
+                target_parent_kinematics,
+                parent_weights,
+            )
+            total_loss = total_loss + self.loss_parent_kinematics_weight * loss_parent_kinematics
+
+        if self.loss_parent_charge_weight > 0:
+            matched_query_mask = torch.zeros(
+                (batch_size, num_queries), dtype=torch.bool, device=device
+            )
+            matched_query_mask[pair_b, pair_q] = True
+            charge_probabilities = F.softmax(pred_charge_logits, dim=-1)
+            unmatched_charge = charge_probabilities.new_tensor([0.0, 1.0, 0.0])
+            charge_probabilities = torch.where(
+                matched_query_mask.unsqueeze(-1),
+                charge_probabilities,
+                unmatched_charge,
+            )
+
+            parent_charge_probabilities = charge_probabilities.new_zeros(
+                (batch_size, 2 * num_queries + 1)
+            )
+            parent_charge_probabilities[:, num_queries] = 1.0
+            for query_index in range(num_queries):
+                probability = charge_probabilities[:, query_index]
+                parent_charge_probabilities = (
+                    F.pad(parent_charge_probabilities[:, 1:], (0, 1)) * probability[:, 0, None]
+                    + parent_charge_probabilities * probability[:, 1, None]
+                    + F.pad(parent_charge_probabilities[:, :-1], (1, 0)) * probability[:, 2, None]
+                )
+
+            charge_loss = F.cross_entropy(
+                parent_charge_probabilities.clamp_min(1e-8).log(),
+                target_parent_charge.to(device=device, dtype=torch.long) + num_queries,
+                reduction="none",
+            )
+            loss_parent_charge = self._weighted_mean(charge_loss, parent_weights)
+            total_loss = total_loss + self.loss_parent_charge_weight * loss_parent_charge
+
+        if self.loss_parent_decay_mode_weight > 0:
+            matched_query_mask = torch.zeros(
+                (batch_size, num_queries), dtype=torch.bool, device=device
+            )
+            matched_query_mask[pair_b, pair_q] = True
+            neutral_probability = F.softmax(pred_charge_logits, dim=-1)[..., 1]
+            neutral_probability = neutral_probability * matched_query_mask
+
+            neutral_count_probabilities = neutral_probability.new_zeros(
+                (batch_size, num_queries + 1)
+            )
+            neutral_count_probabilities[:, 0] = 1.0
+            for query_index in range(num_queries):
+                probability = neutral_probability[:, query_index, None]
+                neutral_count_probabilities = (
+                    neutral_count_probabilities * (1 - probability)
+                    + F.pad(neutral_count_probabilities[:, :-1], (1, 0)) * probability
+                )
+
+            num_constituents = matched_query_mask.sum(dim=-1, keepdim=True)
+            num_neutral = torch.arange(num_queries + 1, device=device).unsqueeze(0)
+            num_charged = num_constituents - num_neutral
+            decay_mode_stride = 5
+            decay_modes = decay_mode_stride * (num_charged - 1) + num_neutral
+            invalid_decay_mode_index = decay_mode_stride * num_queries + 1
+            decay_mode_indices = torch.where(
+                num_charged > 0,
+                decay_modes + decay_mode_stride,
+                invalid_decay_mode_index,
+            )
+            decay_mode_probabilities = neutral_count_probabilities.new_zeros(
+                (batch_size, 5 * num_queries + 2)
+            ).scatter_add(
+                1,
+                decay_mode_indices,
+                neutral_count_probabilities,
+            )
+            decay_mode_loss = F.cross_entropy(
+                decay_mode_probabilities.clamp_min(1e-8).log(),
+                target_parent_decay_mode.to(device=device, dtype=torch.long) + decay_mode_stride,
+                reduction="none",
+            )
+            loss_parent_decay_mode = self._weighted_mean(decay_mode_loss, parent_weights)
+            total_loss = total_loss + self.loss_parent_decay_mode_weight * loss_parent_decay_mode
+
         return {
             "loss": total_loss,
             "loss_objectness": loss_objectness,
@@ -520,6 +694,9 @@ class SetCriterion(nn.Module):
             "loss_meson_class": loss_meson_class,
             "loss_consistency": loss_consistency,
             "loss_charge_count": loss_charge_count,
+            "loss_parent_kinematics": loss_parent_kinematics,
+            "loss_parent_charge": loss_parent_charge,
+            "loss_parent_decay_mode": loss_parent_decay_mode,
             "num_matched": pred_logits.new_tensor(float(num_matched)),
             "num_charge_supervised": num_charge_supervised.to(pred_logits.dtype),
             "num_meson_class_supervised": num_meson_class_supervised.to(
@@ -660,6 +837,9 @@ class ParTauDETRModule(L.LightningModule):
             loss_meson_class_weight=float(detr_cfg.loss.weight_meson_class),
             loss_consistency_weight=float(detr_cfg.loss.weight_consistency),
             loss_charge_count_weight=float(detr_cfg.loss.weight_charge_count),
+            loss_parent_kinematics_weight=float(detr_cfg.loss.weight_parent_kinematics),
+            loss_parent_charge_weight=float(detr_cfg.loss.weight_parent_charge),
+            loss_parent_decay_mode_weight=float(detr_cfg.loss.weight_parent_decay_mode),
             no_object_class_index=1,
             object_class_index=0,
             eos_coef=float(detr_cfg.loss.eos_coef),
@@ -684,7 +864,7 @@ class ParTauDETRModule(L.LightningModule):
 
     def _extract_set_targets(
         self, targets: dict
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         required = [
             "particles_kinematics",
             "particles_charge_ohe",
@@ -766,6 +946,8 @@ class ParTauDETRModule(L.LightningModule):
             target_meson_class,
             target_mask,
             target_is_tau,
+            targets["gen_jet_tau_charge"].long(),
+            targets["gen_jet_tau_decaymode"].long(),
         )
 
     def forward(self, batch):
@@ -775,16 +957,24 @@ class ParTauDETRModule(L.LightningModule):
             cand_kinematics_pxpypze=inputs.cand_kinematics_pxpypze,
             cand_mask=inputs.cand_mask,
         )
-        return outputs, inputs.target, inputs.weight
+        return (
+            outputs,
+            inputs.target,
+            inputs.weight,
+            inputs.gen_jet_tau_p4s,
+            inputs.reco_jet_p4s,
+        )
 
     def training_step(self, batch, _batch_idx):
-        outputs, targets, weights = self.forward(batch)
+        outputs, targets, weights, gen_jet_tau_p4, kinematics_reference_p4 = self.forward(batch)
         (
             target_kinematics,
             target_charge_cls,
             target_meson_class,
             target_mask,
             target_is_tau,
+            target_parent_charge,
+            target_parent_decay_mode,
         ) = self._extract_set_targets(targets)
 
         losses = self.criterion(
@@ -793,6 +983,10 @@ class ParTauDETRModule(L.LightningModule):
             target_charge_cls=target_charge_cls,
             target_meson_class=target_meson_class,
             target_mask=target_mask,
+            target_parent_charge=target_parent_charge,
+            target_parent_decay_mode=target_parent_decay_mode,
+            target_parent_p4=gen_jet_tau_p4,
+            kinematics_reference_p4=kinematics_reference_p4,
             target_is_tau=target_is_tau,
             jet_weights=weights,
         )
@@ -861,17 +1055,37 @@ class ParTauDETRModule(L.LightningModule):
             on_step=False,
             on_epoch=True,
         )
+        self.log(
+            "train_losses/parent_kinematics",
+            losses["loss_parent_kinematics"],
+            on_step=False,
+            on_epoch=True,
+        )
+        self.log(
+            "train_losses/parent_charge",
+            losses["loss_parent_charge"],
+            on_step=False,
+            on_epoch=True,
+        )
+        self.log(
+            "train_losses/parent_decay_mode",
+            losses["loss_parent_decay_mode"],
+            on_step=False,
+            on_epoch=True,
+        )
 
         return losses["loss"]
 
     def validation_step(self, batch, _batch_idx):
-        outputs, targets, weights = self.forward(batch)
+        outputs, targets, weights, gen_jet_tau_p4, kinematics_reference_p4 = self.forward(batch)
         (
             target_kinematics,
             target_charge_cls,
             target_meson_class,
             target_mask,
             target_is_tau,
+            target_parent_charge,
+            target_parent_decay_mode,
         ) = self._extract_set_targets(targets)
 
         losses = self.criterion(
@@ -880,6 +1094,10 @@ class ParTauDETRModule(L.LightningModule):
             target_charge_cls=target_charge_cls,
             target_meson_class=target_meson_class,
             target_mask=target_mask,
+            target_parent_charge=target_parent_charge,
+            target_parent_decay_mode=target_parent_decay_mode,
+            target_parent_p4=gen_jet_tau_p4,
+            kinematics_reference_p4=kinematics_reference_p4,
             target_is_tau=target_is_tau,
             jet_weights=weights,
         )
@@ -948,11 +1166,29 @@ class ParTauDETRModule(L.LightningModule):
             on_step=False,
             on_epoch=True,
         )
+        self.log(
+            "val_losses/parent_kinematics",
+            losses["loss_parent_kinematics"],
+            on_step=False,
+            on_epoch=True,
+        )
+        self.log(
+            "val_losses/parent_charge",
+            losses["loss_parent_charge"],
+            on_step=False,
+            on_epoch=True,
+        )
+        self.log(
+            "val_losses/parent_decay_mode",
+            losses["loss_parent_decay_mode"],
+            on_step=False,
+            on_epoch=True,
+        )
 
         return losses["loss"]
 
     def predict_step(self, batch, _batch_idx):
-        outputs, _, _ = self.forward(batch)
+        outputs, _, _, _, _ = self.forward(batch)
 
         object_scores = torch.softmax(outputs["pred_logits"], dim=-1)[..., 0]
         pred_mask = object_scores > self.score_threshold

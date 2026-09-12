@@ -348,7 +348,7 @@ def model_inference(checkpoint_path, data_path, cfg):
     reco_jet_p4s = batch[6]
 
     with torch.no_grad():
-        outputs, targets, _weights = model.forward(batch)
+        outputs, targets, _weights, _, _ = model.forward(batch)
     return outputs, targets, _weights, reco_jet_p4s, data
 
 
