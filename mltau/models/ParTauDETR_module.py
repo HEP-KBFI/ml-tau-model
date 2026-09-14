@@ -608,7 +608,7 @@ class SetCriterion(nn.Module):
                 (batch_size, num_queries), dtype=torch.bool, device=device
             )
             matched_query_mask[pair_b, pair_q] = True
-            charge_probabilities = F.softmax(pred_charge_logits, dim=-1)
+            charge_probabilities = F.softmax(pred_charge_logits.float(), dim=-1)
             unmatched_charge = charge_probabilities.new_tensor([0.0, 1.0, 0.0])
             charge_probabilities = torch.where(
                 matched_query_mask.unsqueeze(-1),
@@ -644,7 +644,7 @@ class SetCriterion(nn.Module):
                 (batch_size, num_queries), dtype=torch.bool, device=device
             )
             matched_query_mask[pair_b, pair_q] = True
-            neutral_probability = F.softmax(pred_charge_logits, dim=-1)[..., 1]
+            neutral_probability = F.softmax(pred_charge_logits.float(), dim=-1)[..., 1]
             neutral_probability = neutral_probability * matched_query_mask
 
             neutral_count_probabilities = neutral_probability.new_zeros(
