@@ -630,8 +630,11 @@ class SetCriterion(nn.Module):
 
             charge_loss = F.cross_entropy(
                 parent_charge_probabilities.clamp_min(1e-8).log(),
-                target_parent_charge.to(device=device, dtype=torch.long) + num_queries,
+                (target_parent_charge.to(device=device, dtype=torch.long) + num_queries).masked_fill(
+                    ~signal_mask, self.ignore_index
+                ),
                 reduction="none",
+                ignore_index=self.ignore_index,
             )
             loss_parent_charge = self._weighted_mean(charge_loss, parent_weights)
             total_loss = total_loss + self.loss_parent_charge_weight * loss_parent_charge
@@ -675,8 +678,11 @@ class SetCriterion(nn.Module):
             )
             decay_mode_loss = F.cross_entropy(
                 decay_mode_probabilities.clamp_min(1e-8).log(),
-                target_parent_decay_mode.to(device=device, dtype=torch.long) + decay_mode_stride,
+                (target_parent_decay_mode.to(device=device, dtype=torch.long) + decay_mode_stride).masked_fill(
+                    ~signal_mask, self.ignore_index
+                ),
                 reduction="none",
+                ignore_index=self.ignore_index,
             )
             loss_parent_decay_mode = self._weighted_mean(decay_mode_loss, parent_weights)
             total_loss = total_loss + self.loss_parent_decay_mode_weight * loss_parent_decay_mode
