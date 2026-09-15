@@ -1,6 +1,7 @@
 import glob
 import math
 import os
+import warnings
 from collections.abc import Sequence
 
 import awkward as ak
@@ -16,6 +17,122 @@ from mltau.tools.io import general as ig  # RowGroupDataset
 
 np.random.seed(42)
 
+# Four-vectors reach us under several different field namings depending on how
+# the ntuple was written: vector's Momentum4D storage uses (rho, eta, phi, t),
+# other producers use (pt, eta, phi, energy), and some write a Cartesian
+# (px, py, pz, energy) record instead. Awkward's `arr["pt"]` looks up a FIELD,
+# not vector's `pt` property, so the wrong naming raises FieldNotFoundError
+# rather than being resolved by the behaviour.
+#
+# ParT_dataloader used to hardcode rho/t and ParTauDETR_dataloader pt/energy, so
+# whichever layout the data had, one of them broke. Go through p4_field instead.
+P4_FIELD_ALIASES = {
+    "pt": ("pt", "rho"),
+    "eta": ("eta",),
+    "phi": ("phi",),
+    "energy": ("energy", "t", "E", "e"),
+    "mass": ("mass", "m", "tau"),
+}
+
+
+def has_p4_field(record_array, quantity: str) -> bool:
+    """True if `quantity` is stored outright under one of its aliases.
+
+    Only asks about stored fields, so it stays a cheap question about the
+    layout: a Cartesian record has no `pt` field even though p4_field can hand
+    one back.
+    """
+    fields = record_array.fields
+    return any(alias in fields for alias in P4_FIELD_ALIASES[quantity])
+
+
+def p4_field(record_array, quantity: str):
+    """Read `quantity` from a p4 record, whatever layout it was written in.
+
+    A stored field wins, because reading one is free and exact. Otherwise the
+    record is in a basis that does not carry `quantity` at all -- Cartesian
+    (px, py, pz, energy) has none of pt/eta/phi, and a (pt, eta, phi, mass)
+    record has no energy -- so hand it to vector via `reinitialize_p4`, which
+    picks whichever complete basis is present and derives the rest.
+    """
+    aliases = P4_FIELD_ALIASES[quantity]
+    fields = record_array.fields
+    for alias in aliases:
+        if alias in fields:
+            return record_array[alias]
+
+    try:
+        return getattr(g.reinitialize_p4(record_array), quantity)
+    except Exception as exc:
+        raise KeyError(
+            f"no field for {quantity!r} in p4 record: tried {list(aliases)} and "
+            f"deriving it from the stored basis; record has {fields}"
+        ) from exc
+
+
+def sample_name(path: str) -> str:
+    """
+    Sample label from a `{sample}_train*.parquet` / `{sample}_test*.parquet` path.
+
+    Module level rather than a DataModule method because the dataset needs the
+    same rule: a read covers one file and therefore one sample, and the batch
+    composition is built on knowing which.
+    """
+    base = os.path.basename(path)
+    for split in ("_train", "_test"):
+        if split in base:
+            return base.split(split)[0]
+    return os.path.splitext(base)[0]
+
+
+def loader_kwargs(num_workers: int, prefetch_factor, debug_run: bool) -> dict:
+    """
+    DataLoader arguments that are only valid for a given worker count.
+
+    With num_workers=0 PyTorch rejects both `persistent_workers=True` and
+    `prefetch_factor`, so passing them unconditionally made
+    `num_dataloader_workers=0` raise. That is the one configuration that
+    isolates worker startup from everything else, so it has to work -- it is
+    the first thing to try when a job hangs before the first batch.
+
+    `multiprocessing_context` is decided from the RESOLVED worker count, not the
+    configured one: a request of 6 clamped to 1 by the cpuset should not still
+    select forkserver.
+    """
+    kwargs = {"num_workers": int(num_workers), "pin_memory": True}
+    if num_workers > 0:
+        kwargs["persistent_workers"] = not debug_run
+        kwargs["prefetch_factor"] = None if debug_run else prefetch_factor
+        if num_workers > 1:
+            kwargs["multiprocessing_context"] = "forkserver"
+    return kwargs
+
+
+def resolve_num_workers(requested: int) -> int:
+    """
+    Clamp the worker count to the CPUs this process may actually use.
+
+    `os.sched_getaffinity` reflects the Slurm cpuset, so this catches a job that
+    asked for one cpu but configured several workers -- they would otherwise
+    timeshare a single core and stall the first batch for minutes.
+    """
+    requested = int(requested)
+    try:
+        available = len(os.sched_getaffinity(0))
+    except AttributeError:  # pragma: no cover - non-Linux
+        available = os.cpu_count() or 1
+    # Leave one core for the main process that feeds the GPU.
+    usable = max(1, available - 1) if available > 1 else 1
+    if requested > usable:
+        warnings.warn(
+            f"training.dataloader.num_dataloader_workers={requested} but only "
+            f"{available} cpu(s) are available to this process; using {usable}. "
+            "Request more cpus (e.g. #SBATCH --cpus-per-task=8) to use more "
+            "workers.",
+            stacklevel=2,
+        )
+        return usable
+    return requested
 
 class ParticleTransformerDataset(IterableDataset):
     def __init__(
@@ -26,7 +143,26 @@ class ParticleTransformerDataset(IterableDataset):
         self.batch_size = batch_size
         self.row_groups = row_groups
         self.num_rows = sum([rg.num_rows for rg in self.row_groups])
-        print(f"There are {'{:,}'.format(self.num_rows)} jets in the dataset.")
+        if self.row_groups:
+            print(
+                f"There are {'{:,}'.format(self.num_rows)} jets in the dataset.",
+                flush=True,
+            )
+
+    @classmethod
+    def for_arrays(cls, cfg: DictConfig):
+        """
+        Dataset bound to `cfg` alone, for running `build_tensors` on arrays that
+        are already in memory.
+
+        Inference reads its parquet file itself and needs only the
+        tensor-building half of the dataset, so there are no row groups to plan
+        reads over. Constructing that with `row_groups=[]` used to make the
+        dataset announce "There are 0 jets in the dataset" about a file it had
+        just read in full, which reads like data loss and is why the counts are
+        now printed only when there is actually something to read.
+        """
+        return cls(row_groups=[], cfg=cfg, batch_size=1)
 
     def __len__(self):
         # A batch never spans two row groups, so every row group contributes its
@@ -54,10 +190,10 @@ class ParticleTransformerDataset(IterableDataset):
         # Candidate p4 components: stored as (rho=pt, eta, phi, t=energy)
         # All other candidate fields — one padded extraction each
         # ------------------------------------------------------------------
-        cand_pt = pad_cand(data.reco_cand_p4s["rho"])  # [N, max_cands]
-        cand_eta = pad_cand(data.reco_cand_p4s["eta"])
-        cand_phi = pad_cand(data.reco_cand_p4s["phi"])
-        cand_en = pad_cand(data.reco_cand_p4s["t"])  # energy
+        cand_pt = pad_cand(p4_field(data.reco_cand_p4s, "pt"))  # [N, max_cands]
+        cand_eta = pad_cand(p4_field(data.reco_cand_p4s, "eta"))
+        cand_phi = pad_cand(p4_field(data.reco_cand_p4s, "phi"))
+        cand_en = pad_cand(p4_field(data.reco_cand_p4s, "energy"))  # energy
         cand_charge = pad_cand(data.reco_cand_charges)
         cand_pdg_abs = pad_cand(abs(data.reco_cand_pdgs))
         cand_dz = pad_cand(data.reco_cand_dz)
@@ -70,20 +206,20 @@ class ParticleTransformerDataset(IterableDataset):
         mask_np = np.arange(max_cands)[None, :] < lengths[:, None]
 
         # Scalar jet p4s — read raw fields directly, no reinitialize_p4
-        jet_pt = ak.to_numpy(data.reco_jet_p4["rho"]).astype(np.float32)  # [N]
-        jet_eta = ak.to_numpy(data.reco_jet_p4["eta"]).astype(np.float32)
-        jet_phi = ak.to_numpy(data.reco_jet_p4["phi"]).astype(np.float32)
-        jet_en = ak.to_numpy(data.reco_jet_p4["t"]).astype(np.float32)
+        jet_pt = ak.to_numpy(p4_field(data.reco_jet_p4, "pt")).astype(np.float32)  # [N]
+        jet_eta = ak.to_numpy(p4_field(data.reco_jet_p4, "eta")).astype(np.float32)
+        jet_phi = ak.to_numpy(p4_field(data.reco_jet_p4, "phi")).astype(np.float32)
+        jet_en = ak.to_numpy(p4_field(data.reco_jet_p4, "energy")).astype(np.float32)
 
-        _pt_gen = ak.to_numpy(data.gen_jet_tau_p4["rho"]).astype(np.float32)
-        _eta_gen = ak.to_numpy(data.gen_jet_tau_p4["eta"]).astype(np.float32)
-        _phi_gen = ak.to_numpy(data.gen_jet_tau_p4["phi"]).astype(np.float32)
-        _energy_gen = ak.to_numpy(data.gen_jet_tau_p4["t"]).astype(np.float32)
+        _pt_gen = ak.to_numpy(p4_field(data.gen_jet_tau_p4, "pt")).astype(np.float32)
+        _eta_gen = ak.to_numpy(p4_field(data.gen_jet_tau_p4, "eta")).astype(np.float32)
+        _phi_gen = ak.to_numpy(p4_field(data.gen_jet_tau_p4, "phi")).astype(np.float32)
+        _energy_gen = ak.to_numpy(p4_field(data.gen_jet_tau_p4, "energy")).astype(np.float32)
 
-        _pt_gen_jet = ak.to_numpy(data.gen_jet_p4["rho"]).astype(np.float32)
-        _eta_gen_jet = ak.to_numpy(data.gen_jet_p4["eta"]).astype(np.float32)
-        _phi_gen_jet = ak.to_numpy(data.gen_jet_p4["phi"]).astype(np.float32)
-        _energy_gen_jet = ak.to_numpy(data.gen_jet_p4["t"]).astype(np.float32)
+        _pt_gen_jet = ak.to_numpy(p4_field(data.gen_jet_p4, "pt")).astype(np.float32)
+        _eta_gen_jet = ak.to_numpy(p4_field(data.gen_jet_p4, "eta")).astype(np.float32)
+        _phi_gen_jet = ak.to_numpy(p4_field(data.gen_jet_p4, "phi")).astype(np.float32)
+        _energy_gen_jet = ak.to_numpy(p4_field(data.gen_jet_p4, "energy")).astype(np.float32)
 
         # ------------------------------------------------------------------
         # Compute 17 ParticleTransformer features in numpy (zero awkward)
@@ -316,14 +452,7 @@ class ParTDataModule(LightningDataModule):
         self.save_hyperparameters()
         super().__init__()
 
-    @staticmethod
-    def _sample_name(path: str) -> str:
-        """Sample label from a `{sample}_train*.parquet` / `{sample}_test*.parquet` path."""
-        base = os.path.basename(path)
-        for split in ("_train", "_test"):
-            if split in base:
-                return base.split(split)[0]
-        return os.path.splitext(base)[0]
+    _sample_name = staticmethod(sample_name)
 
     def _select_row_groups(
         self, row_groups: list, rng: np.random.Generator
@@ -369,17 +498,69 @@ class ParTDataModule(LightningDataModule):
                 note = f"limit {int(limit):,}"
             print(
                 f"[dataset] {sample}: {n_jets:,} / {available:,} jets "
-                f"({len(kept):,} / {len(groups):,} row groups, {note})"
+                f"({len(kept):,} / {len(groups):,} row groups, {note})",
+                flush=True,
             )
             selected.extend(kept)
         return selected
 
+    def _resolve_input_paths(self, pattern: str, dataset_type: str) -> list:
+        """
+        Glob `pattern` and fail loudly if it matches nothing.
+
+        An empty match previously produced a dataset of 0 jets and training
+        continued, so the only symptom was "There are 0 jets in the dataset"
+        followed by a job that appeared to hang. The three usual causes are a
+        data_dir that is not bind-mounted into the container, filenames that do
+        not contain "_train"/"_test", and files sitting one directory deeper.
+        """
+        paths = sorted(glob.glob(pattern))
+        if paths:
+            # Logged on success too: a silently wrong data_dir is otherwise only
+            # visible as a surprising jet count much further down.
+            print(
+                f"[dataset] {dataset_type}: {len(paths):,} file(s) matched "
+                f"{pattern}",
+                flush=True,
+            )
+            return paths
+
+        data_dir = os.path.dirname(pattern)
+        lines = [
+            f"No {dataset_type} files matched: {pattern}",
+            f"  dataset.data_dir      : {self.cfg.dataset.data_dir}",
+            f"  directory exists      : {os.path.isdir(data_dir)}",
+        ]
+        if os.path.isdir(data_dir):
+            everything = sorted(os.listdir(data_dir))
+            parquet = [f for f in everything if f.endswith(".parquet")]
+            subdirs = [f for f in everything if os.path.isdir(os.path.join(data_dir, f))]
+            lines += [
+                f"  entries in directory  : {len(everything)}",
+                f"  .parquet files there  : {len(parquet)}",
+                f"  first few names       : {everything[:8]}",
+                f"  subdirectories        : {subdirs[:8]}",
+                "",
+                "Files are matched as '{sample}_" + dataset_type + "*.parquet' with "
+                f"sample='{self.sample}', so a name must contain '_{dataset_type}'.",
+                "The sample label is the part before '_" + dataset_type + "', and it is "
+                "what dataset.max_jets_per_sample keys on.",
+            ]
+        else:
+            lines += [
+                "",
+                "The directory is not visible from inside the container. Check that "
+                "it is covered by a -B bind mount in run-lumi.sh / run.sh.",
+            ]
+        raise FileNotFoundError("\n".join(lines))
+
     def get_dataset_rowgroups(self, dataset_type: str):
         if dataset_type == "test":
             test_paths_wcp = os.path.join(
-                self.cfg.dataset.data_dir, f"{self.sample}_test*.parquet"
+                os.path.expanduser(os.path.expandvars(self.cfg.dataset.data_dir)),
+                f"{self.sample}_test*.parquet",
             )
-            test_paths = sorted(glob.glob(test_paths_wcp))
+            test_paths = self._resolve_input_paths(test_paths_wcp, "test")
             test_rowgroups = ig.get_row_groups(input_paths=test_paths)
             # max_jets_per_sample is deliberately NOT applied here: truncating the
             # evaluation set would silently change every reported metric.
@@ -399,9 +580,10 @@ class ParTDataModule(LightningDataModule):
                 for dataset in ["train", "val"]
             }
             train_paths_wcp = os.path.join(
-                self.cfg.dataset.data_dir, f"{self.sample}_train*.parquet"
+                os.path.expanduser(os.path.expandvars(self.cfg.dataset.data_dir)),
+                f"{self.sample}_train*.parquet",
             )
-            train_paths = sorted(glob.glob(train_paths_wcp))
+            train_paths = self._resolve_input_paths(train_paths_wcp, "train")
             # A dedicated generator rather than the global numpy state, so the
             # train/val split and the per-sample subsampling cannot be perturbed
             # by unrelated random draws elsewhere in the process.
@@ -434,49 +616,26 @@ class ParTDataModule(LightningDataModule):
             self.val_dataset = ParticleTransformerDataset(
                 row_groups=val_row_groups, cfg=self.cfg, batch_size=batch_size
             )
-            # batch_size=None: dataset yields pre-batched slices, skip collation entirely
-            self.train_loader = DataLoader(
-                self.train_dataset,
-                batch_size=None,
-                persistent_workers=False if self.debug_run else True,
-                num_workers=(
-                    0
-                    if self.debug_run
-                    else self.cfg.training.dataloader.num_dataloader_workers
-                ),
-                multiprocessing_context=(
-                    "forkserver"
-                    if self.cfg.training.dataloader.num_dataloader_workers > 1
-                    else None
-                ),
-                prefetch_factor=(
-                    None
-                    if self.debug_run
-                    else self.cfg.training.dataloader.prefetch_factor
-                ),
-                pin_memory=True,
+            # batch_size=None: dataset yields pre-batched slices, skip collation
+            # entirely. The loader arguments go through loader_kwargs because
+            # several of them are only legal for num_workers > 0: passing
+            # prefetch_factor or persistent_workers with 0 workers raises, and 0
+            # workers is the configuration to reach for when a job hangs before
+            # the first batch.
+            n_workers = (
+                0
+                if self.debug_run
+                else resolve_num_workers(
+                    self.cfg.training.dataloader.num_dataloader_workers
+                )
             )
-            self.val_loader = DataLoader(
-                self.val_dataset,
-                batch_size=None,
-                persistent_workers=False if self.debug_run else True,
-                num_workers=(
-                    0
-                    if self.debug_run
-                    else self.cfg.training.dataloader.num_dataloader_workers
-                ),
-                multiprocessing_context=(
-                    "forkserver"
-                    if self.cfg.training.dataloader.num_dataloader_workers > 1
-                    else None
-                ),
-                prefetch_factor=(
-                    None
-                    if self.debug_run
-                    else self.cfg.training.dataloader.prefetch_factor
-                ),
-                pin_memory=True,
+            kwargs = loader_kwargs(
+                n_workers,
+                self.cfg.training.dataloader.prefetch_factor,
+                self.debug_run,
             )
+            self.train_loader = DataLoader(self.train_dataset, batch_size=None, **kwargs)
+            self.val_loader = DataLoader(self.val_dataset, batch_size=None, **kwargs)
         elif stage == "test" or stage == "predict":
             test_row_groups = self.get_dataset_rowgroups(dataset_type="test")
             self.test_dataset = ParticleTransformerDataset(
@@ -485,14 +644,13 @@ class ParTDataModule(LightningDataModule):
             self.test_loader = DataLoader(
                 self.test_dataset,
                 batch_size=None,
-                persistent_workers=True,
-                num_workers=self.cfg.training.dataloader.num_dataloader_workers,
-                prefetch_factor=(
-                    self.cfg.training.dataloader.prefetch_factor
-                    if self.cfg.training.dataloader.num_dataloader_workers > 0
-                    else None
+                **loader_kwargs(
+                    resolve_num_workers(
+                        self.cfg.training.dataloader.num_dataloader_workers
+                    ),
+                    self.cfg.training.dataloader.prefetch_factor,
+                    self.debug_run,
                 ),
-                pin_memory=True,
             )
         else:
             raise ValueError(f"Unexpected stage: {stage}")

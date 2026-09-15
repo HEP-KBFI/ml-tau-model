@@ -9,16 +9,22 @@ except ImportError as exc:  # pragma: no cover
     comet_ml = None
     _COMET_IMPORT_ERROR = exc
 
+import faulthandler
 import inspect
 import json
 import os
+import signal
 import time
 import warnings
 
 import hydra
 import lightning as L
 import torch
-from lightning.pytorch.callbacks import ModelCheckpoint, TQDMProgressBar
+from lightning.pytorch.callbacks import (
+    LearningRateMonitor,
+    ModelCheckpoint,
+    TQDMProgressBar,
+)
 from lightning.pytorch.loggers import TensorBoardLogger
 from omegaconf import DictConfig, OmegaConf
 
@@ -359,8 +365,49 @@ def write_run_metrics(cfg, trainer, datamodule, loggers, wall_seconds, path):
     return summary
 
 
+def check_output_dir(cfg: DictConfig) -> str:
+    """
+    Fail early and legibly if output_dir is not writable.
+
+    The configured default is an absolute path on one particular machine, so on
+    any other it surfaces as a bare `OSError: Read-only file system: '/home/...'`
+    from os.makedirs, with nothing connecting it to a config key or to a missing
+    command-line override.
+    """
+    output_dir = os.path.expanduser(os.path.expandvars(str(cfg.output_dir)))
+    probe = output_dir
+    while probe and not os.path.exists(probe):
+        parent = os.path.dirname(probe)
+        if parent == probe:
+            break
+        probe = parent
+
+    if not os.access(probe, os.W_OK):
+        raise PermissionError(
+            f"output_dir is not writable: {output_dir}\n"
+            f"  nearest existing parent : {probe}\n"
+            f"  writable                : False\n"
+            "\n"
+            "output_dir defaults to an absolute path baked into "
+            "main_ParTauDETR.yaml, which is only correct on the machine it was "
+            "written for. Pass one explicitly, e.g.\n"
+            "  sbatch train-gpu-lumi.sh output_dir=/scratch/<project>/<run_name>\n"
+            "Note that `sbatch ... train-gpu-lumi.sh` with no trailing arguments "
+            "passes no Hydra overrides at all; the log line "
+            "'overrides: []' is the giveaway."
+        )
+    return output_dir
+
+
 @hydra.main(config_path="../config", config_name="main_ParTauDETR", version_base=None)
 def train(cfg: DictConfig):
+    # `kill -USR1 <pid>` dumps the Python stack of every thread to stderr without
+    # killing the process. A hung job otherwise gives no way to tell whether it
+    # is blocked in the Parquet scan, waiting on a dataloader worker, or inside
+    # a HIP call.
+    if hasattr(signal, "SIGUSR1"):
+        faulthandler.register(signal.SIGUSR1, all_threads=True)
+
     # Seed before anything builds a module or a dataloader. workers=True gives
     # each dataloader worker a distinct, derived seed.
     L.seed_everything(int(cfg.training.get("seed", 42)), workers=True)
@@ -382,6 +429,8 @@ def train(cfg: DictConfig):
 
     model = ParTauDETR_module.ParTauDETRModule(cfg=cfg)
 
+    check_output_dir(cfg)
+
     models_dir = os.path.join(cfg.output_dir, "models")
     tb_log_dir = os.path.join(cfg.output_dir, "tensorboard")
     comet_dir = os.path.join(cfg.output_dir, "comet")
@@ -399,6 +448,10 @@ def train(cfg: DictConfig):
 
     callbacks = [
         TQDMProgressBar(refresh_rate=10),
+        # Log the LR next to the losses. OneCycleLR steps per batch, so an
+        # unexplained change in the losses can only be attributed to (or cleared
+        # of) the schedule if the LR curve is visible alongside them.
+        LearningRateMonitor(logging_interval="step"),
         # Best by validation loss. Evaluated at the end of a validation pass,
         # which is the only time val_losses/* exist in callback_metrics.
         ModelCheckpoint(

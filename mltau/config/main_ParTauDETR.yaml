@@ -72,6 +72,25 @@ model:
             cost_kinematics_l1: 2.0
             cost_charge: 1.0
             cost_pdg_ce: 1.0
+            # Per-component weights of the kinematics matching cost, over
+            # [log_pt_ratio, delta_eta, sin_dphi, cos_dphi, log_mass_ratio].
+            # Roughly 1/sigma, so each component contributes comparably instead
+            # of pt and mass deciding ~95% of every assignment. Measured on
+            # z_train: sigma = [0.875, 0.077, 0.071, 0.028, 1.064].
+            # sin_dphi and cos_dphi MUST share a weight: together they encode the
+            # angle, and the chord distance between two (sin, cos) pairs is only
+            # a proper angular metric when both components count equally.
+            # Down-weighting cos would break the periodicity the pair exists to
+            # provide. Its contribution is naturally small for collimated
+            # daughters (cos ~ 1 - dphi^2/2, so |dcos| is second order) and grows
+            # exactly when it should, for daughters far from the jet axis.
+            # log_mass_ratio is deliberately weighted well below 1/sigma, unlike
+            # the others: only 4.8% of its variance comes from the daughter's
+            # identity (the rest is the jet mass, shared by every query in the
+            # jet), so it carries almost nothing for deciding WHICH daughter a
+            # query should take. This is the one place where the matching cost
+            # and the regression loss should not use the same weights.
+            kinematics_component_weights: [1.0, 20.0, 20.0, 20.0, 0.2]
         loss:
             weight_objectness: 1.0
             weight_tau_id: 1.0
@@ -91,6 +110,34 @@ model:
         # unsmoothed and can reach 0. That inflates tau_id's share of the total
         # and works against a figure of merit like misID at fixed efficiency.
         label_smoothing: 0.0
+        # Residual scales for the kinematics regression loss, one per
+        # component, in that component's own units. Each residual is divided by
+        # its scale before the Huber, so every component enters the loss as
+        # "error in units of the spread of its own target" and the weights below
+        # can all be 1.
+        #
+        # Measured on the daughter targets of z_train (47k daughters):
+        #   log_pt_ratio  sigma 0.875
+        #   delta_eta     sigma 0.077
+        #   sin_dphi      sigma 0.071   (the chord is ~|dphi| for collimated daughters)
+        #   log_mass_ratio sigma 1.064
+        # Recompute these if the target parameterisation or the sample changes;
+        # they are properties of the data, not tuning knobs.
+        kinematics_scales:
+            log_pt: 0.88
+            delta_eta: 0.077
+            phi_chord: 0.080
+            log_mass: 1.06
+        # With the residuals scaled, equal weights give each component an equal
+        # share. log_mass is the one worth reconsidering rather than reweighting:
+        # only 4.8% of the variance of log(m_dau/m_jet) comes from the daughter's
+        # identity, the other 95% is the jet mass, which every query in the jet
+        # would be re-deriving. See the note in the loss docstring.
+        kinematics_weights:
+            log_pt: 1.0
+            delta_eta: 1.0
+            phi_chord: 1.0
+            log_mass: 1.0
 
 defaults:
     - _self_

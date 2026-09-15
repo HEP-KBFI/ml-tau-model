@@ -69,6 +69,12 @@ def _load_and_split(pt_paths: list[str], train_frac: float) -> tuple:
     def _cat(tensors):
         return torch.cat(tensors, dim=0)
 
+    # The .pt files store the candidate axes as [N, max_cands, features], the
+    # transpose of what ParT_dataloader.build_tensors returns, so they are
+    # flipped back here to the [N, features, max_cands] the encoder's
+    # BatchNorm1d expects. Anything regenerating these files has to keep that
+    # layout: saving build_tensors output verbatim fails at the first batch
+    # with "running_mean should contain <max_cands> elements".
     cf = _cat([p[0].transpose(1, 2) for p in parts])
     ck = _cat([p[1].transpose(1, 2) for p in parts])
     tgt = {k: _cat([p[2][k] for p in parts]) for k in parts[0][2]}

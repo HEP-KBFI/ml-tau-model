@@ -140,10 +140,28 @@ class HungarianMatcher(nn.Module):
         cost_pdg_ce: float = 1.0,
         object_class_index: int = 0,
         ignore_index: int = -100,
+        kinematics_component_weights: list[float] | None = None,
     ):
         super().__init__()
         self.cost_objectness = cost_objectness
         self.cost_kinematics_l1 = cost_kinematics_l1
+        # Per-component weights for the kinematics matching cost, over
+        # [log_pt_ratio, delta_eta, sin_dphi, cos_dphi, log_mass_ratio].
+        #
+        # An unweighted L1 is dominated by whichever component has the largest
+        # dynamic range. The log ratios have sigma ~1 while the angular offsets
+        # of collimated tau daughters have sigma ~0.05, so pt and mass together
+        # decided ~95% of every assignment and direction contributed ~5%. Two
+        # daughters of similar pt could then be swapped at almost no cost, and
+        # the whole error of that swap landed on the angular targets -- which is
+        # why pt looked accurate (it is what the matcher optimised) while phi
+        # did not.
+        if kinematics_component_weights is None:
+            kinematics_component_weights = [1.0, 1.0, 1.0, 1.0, 1.0]
+        self.register_buffer(
+            "kinematics_component_weights",
+            torch.tensor([float(w) for w in kinematics_component_weights]),
+        )
         self.cost_charge_ce = cost_charge_ce
         self.cost_pdg_ce = cost_pdg_ce
         self.object_class_index = object_class_index
@@ -192,12 +210,20 @@ class HungarianMatcher(nn.Module):
         obj_cost = -F.log_softmax(pred_logits.float(), dim=-1)[
             ..., self.object_class_index
         ]  # [B, Q]
-        # L1 distance by explicit broadcast: torch.cdist(p=1) has no fast kernel.
-        kin_cost = (
-            (pred_kinematics.float().unsqueeze(2) - target_kinematics.float().unsqueeze(1))
-            .abs()
-            .sum(-1)
-        )  # [B, Q, T]
+        # Weighted L1 by explicit broadcast: torch.cdist(p=1) has no fast kernel
+        # and could not apply per-component weights anyway.
+        component_diff = (
+            pred_kinematics.float().unsqueeze(2)
+            - target_kinematics.float().unsqueeze(1)
+        ).abs()  # [B, Q, T, K]
+        weights = self.kinematics_component_weights.to(component_diff.dtype)
+        if weights.numel() != component_diff.size(-1):
+            raise ValueError(
+                f"matcher.kinematics_component_weights has {weights.numel()} "
+                f"entries but the kinematics target has "
+                f"{component_diff.size(-1)} components."
+            )
+        kin_cost = (component_diff * weights).sum(-1)  # [B, Q, T]
         charge_cost = _classification_cost_matrix(
             pred_charge_logits, target_charge_cls, self.ignore_index
         )
@@ -562,6 +588,12 @@ class ParTauDETRModule(L.LightningModule):
         self.tau_loss = TauLoss(
             l_m=float(arch.tau_loss.l_m),
             label_smoothing=float(arch.tau_loss.label_smoothing),
+            kinematics_weights={
+                k: float(v) for k, v in arch.tau_loss.kinematics_weights.items()
+            },
+            kinematics_scales={
+                k: float(v) for k, v in arch.tau_loss.kinematics_scales.items()
+            },
         )
         self.num_kinematics_components = int(arch.num_kinematics_components)
 
@@ -616,6 +648,9 @@ class ParTauDETRModule(L.LightningModule):
             cost_pdg_ce=float(detr_cfg.matcher.cost_pdg_ce),
             object_class_index=0,
             ignore_index=self.ignore_index,
+            kinematics_component_weights=list(
+                detr_cfg.matcher.kinematics_component_weights
+            ),
         )
 
         self.criterion = SetCriterion(

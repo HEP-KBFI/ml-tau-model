@@ -341,7 +341,8 @@ def model_inference(checkpoint_path, data_path, cfg):
     model.to(DEVICE)
     model.eval()
     data = ak.from_parquet(data_path)
-    ds = ParticleTransformerDETRDataset(row_groups=[], cfg=cfg, batch_size=1)
+    print(f"Read {len(data):,} jets from {data_path}.", flush=True)
+    ds = ParticleTransformerDETRDataset.for_arrays(cfg)
     batch = ds.build_tensors(data)
 
     reco_jet_p4s = batch[6]

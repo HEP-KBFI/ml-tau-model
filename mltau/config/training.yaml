@@ -74,12 +74,12 @@ training:
         # becomes millions of jets and the worker runs out of memory.
         row_groups_per_read: 100
 
-        # Reads held in memory at once. A read covers one file and therefore
-        # one class, so this is what puts signal and background in the same
-        # batch. At 2 about half of all chunks are still single-class, which
-        # makes the tagging gradient alternate and the BatchNorm statistics in
-        # PairEmbed oscillate between two regimes; 4 brings that to ~12%.
-        # Costs proportionally more worker RAM.
+        # Reads held in memory at once, now split evenly across the samples:
+        # each sample keeps mixing_reads / n_samples reads buffered and every
+        # batch draws from all of them, so class mixing is guaranteed rather
+        # than left to which reads happened to land together. This value is
+        # therefore only a memory/diversity knob; it no longer decides whether a
+        # batch sees both classes. Costs proportionally more worker RAM.
         mixing_reads: 4
 
     input_scaling:

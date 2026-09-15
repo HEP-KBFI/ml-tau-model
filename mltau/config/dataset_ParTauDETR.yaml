@@ -2,7 +2,8 @@ dataset:
     max_cands: 20
     num_features: 17
     max_tau_daughters: 8
-    data_dir: /scratch/persistent/laurits/ml-tau/20260908_DETR_repacked/
+    # data_dir: /scratch/project_465001293/20260908_DETR_repacked/
+    data_dir: /scratch/persistent/laurits/ml-tau/0914_ParTauDETR_dataset/
 
     # PDG classes for daughter one-hot encoding (order defines class index).
     # Single source of truth: the dataloader builds particles_pdg_ohe from this,

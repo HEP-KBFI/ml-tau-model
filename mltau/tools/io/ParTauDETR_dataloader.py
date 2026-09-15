@@ -11,7 +11,15 @@ from torch.utils.data import DataLoader
 
 from mltau.tools.io import general as ig
 
-from mltau.tools.io.ParT_dataloader import ParTDataModule, ParticleTransformerDataset
+from mltau.tools.io.ParT_dataloader import (
+    ParTDataModule,
+    ParticleTransformerDataset,
+    has_p4_field,
+    loader_kwargs,
+    p4_field,
+    resolve_num_workers,
+    sample_name,
+)
 
 
 class ParticleTransformerDETRDataset(ParticleTransformerDataset):
@@ -86,11 +94,15 @@ class ParticleTransformerDETRDataset(ParticleTransformerDataset):
         mixing_reads: int = 1,
         cache_parquet_handles: bool = True,
         num_workers: int = 0,
+        stratify_samples: bool = True,
     ):
         """
         Args:
             shuffle: reshuffle the read order and the jets inside each loaded
                 chunk on every epoch.
+            stratify_samples: draw every batch from all samples at once instead
+                of concatenating whole reads and leaving the class mix to the
+                draw. Turn it off only where the emission ORDER matters.
             row_groups_per_read: number of consecutive row groups pulled in a
                 single `ak.from_parquet` call. Each such call re-opens the file
                 and re-parses the whole Parquet footer (every row group x every
@@ -111,13 +123,54 @@ class ParticleTransformerDETRDataset(ParticleTransformerDataset):
         self.mixing_reads = max(1, int(mixing_reads))
         # Needed for an exact __len__: batches are counted per worker shard.
         self.num_workers = max(0, int(num_workers))
+        self.stratify_samples = bool(stratify_samples)
         self.read_units = self._build_read_units(
             row_groups, max(1, int(row_groups_per_read))
         )
-        print(
-            f"Grouped {len(row_groups):,} row groups into "
-            f"{len(self.read_units):,} parquet read(s)."
-        )
+        # A read covers one file and therefore one sample, so this grouping is
+        # what both the worker sharding and the batch composition are built on.
+        self.reads_by_sample: dict[str, list] = {}
+        for unit in self.read_units:
+            self.reads_by_sample.setdefault(sample_name(unit[0]), []).append(unit)
+        if row_groups:
+            print(
+                f"Grouped {len(row_groups):,} row groups into "
+                f"{len(self.read_units):,} parquet read(s) over "
+                + ", ".join(
+                    f"{name}={len(units):,} read(s)"
+                    for name, units in sorted(self.reads_by_sample.items())
+                )
+                + (
+                    "; batches stratified across samples."
+                    if self.stratify_samples and len(self.reads_by_sample) > 1
+                    else "."
+                ),
+                flush=True,
+            )
+            self._warn_if_shards_lose_a_sample()
+
+    def _warn_if_shards_lose_a_sample(self) -> None:
+        """
+        Stratification is per worker, so every worker needs every sample.
+
+        Reads are strided within each sample, so a sample with fewer reads than
+        there are workers cannot reach all of them, and the workers that miss it
+        fall back to emitting single-class batches -- silently undoing exactly
+        what stratification is for.
+        """
+        workers = max(1, self.num_workers)
+        if not (self.stratify_samples and len(self.reads_by_sample) > 1 and workers > 1):
+            return
+        short = {n: len(u) for n, u in self.reads_by_sample.items() if len(u) < workers}
+        if short:
+            warnings.warn(
+                f"{short} read(s) available for sample(s) {sorted(short)} but "
+                f"{workers} dataloader workers: those samples cannot reach every "
+                "worker, so some workers will emit single-class batches. Lower "
+                "training.dataloader.row_groups_per_read (more, smaller reads) or "
+                "num_dataloader_workers.",
+                stacklevel=2,
+            )
 
     @staticmethod
     def _build_read_units(
@@ -153,14 +206,38 @@ class ParticleTransformerDETRDataset(ParticleTransformerDataset):
                 )
         return units
 
+    def _shard_reads(self, worker_id: int, num_workers: int) -> list:
+        """
+        The reads one worker is responsible for.
+
+        Strided WITHIN each sample rather than over the flat list. Striding the
+        flat list would already balance the row counts, but it cannot promise
+        that a worker receives any read of a given sample -- and a worker that
+        holds only background can only ever emit background batches, which is
+        exactly what stratification exists to prevent. Per-sample striding gives
+        every worker the same class mix as the dataset, to within one read.
+
+        Contiguous slicing is still avoided: with ceil() the last worker gets a
+        short or empty shard while the others do a full share, so the epoch is
+        paced by the slowest.
+        """
+        if num_workers <= 1:
+            return list(self.read_units)
+        shard: list = []
+        for name in sorted(self.reads_by_sample):
+            shard.extend(self.reads_by_sample[name][worker_id::num_workers])
+        return shard
+
     def __len__(self):
         """
         Exact number of batches this dataset yields.
 
-        `__iter__` carries leftover rows across chunks, so a worker emits
-        ceil(rows_in_its_shard / batch_size) batches regardless of how the
-        reads happen to be grouped or shuffled. Sharding is strided and
-        therefore fixed, so this is deterministic.
+        Every read in a worker's shard is consumed exactly once and every batch
+        is full except the shard's last, so a worker emits
+        ceil(rows_in_its_shard / batch_size) batches. That holds for both the
+        stratified and the plain path -- they differ in how jets are ordered,
+        not in how many there are -- and sharding is deterministic, so this is
+        exact rather than an estimate.
 
         Exactness matters beyond cosmetics. With `val_check_interval` unset,
         Lightning sets val_check_batch = len(dataloader) and triggers
@@ -171,13 +248,40 @@ class ParticleTransformerDETRDataset(ParticleTransformerDataset):
         num_workers = max(1, self.num_workers)
         total = 0
         for worker in range(num_workers):
-            rows = sum(
-                num_rows
-                for _, _, num_rows in self.read_units[worker::num_workers]
-            )
+            rows = sum(num_rows for _, _, num_rows in self._shard_reads(worker, num_workers))
             if rows:
                 total += math.ceil(rows / self.batch_size)
         return total
+
+    @staticmethod
+    def _allocate(batch_size: int, remaining: dict[str, int]) -> dict[str, int]:
+        """
+        Split one batch across samples in proportion to what each has left.
+
+        Proportional to the REMAINING rows, not to the dataset totals, so the
+        mix stays representative as samples drain at different rates and the
+        last batches are not suddenly single-class. Largest-remainder rounding
+        makes the parts sum exactly to the batch size; a sample is never asked
+        for more than it still holds.
+        """
+        left = sum(remaining.values())
+        target = min(batch_size, left)
+        exact = {n: target * r / left for n, r in remaining.items() if r > 0}
+        out = {n: min(int(v), remaining[n]) for n, v in exact.items()}
+        short = target - sum(out.values())
+        order = sorted(exact, key=lambda n: exact[n] - int(exact[n]), reverse=True)
+        while short > 0:
+            progressed = False
+            for name in order:
+                if short == 0:
+                    break
+                if out[name] < remaining[name]:
+                    out[name] += 1
+                    short -= 1
+                    progressed = True
+            if not progressed:  # every sample is exhausted; nothing left to give
+                break
+        return {n: k for n, k in out.items() if k > 0}
 
     @staticmethod
     def _pad_jagged(arr, max_len: int, fill=0.0, dtype=None):
@@ -228,10 +332,10 @@ class ParticleTransformerDETRDataset(ParticleTransformerDataset):
             return self._pad_jagged(arr, max_cands, fill=fill, dtype=np.float32)
 
         # Candidate-level quantities
-        cand_pt = pad_cand(data.reco_cand_p4s["pt"])
-        cand_eta = pad_cand(data.reco_cand_p4s["eta"])
-        cand_phi = pad_cand(data.reco_cand_p4s["phi"])
-        cand_en = pad_cand(data.reco_cand_p4s["energy"])
+        cand_pt = pad_cand(p4_field(data.reco_cand_p4s, "pt"))
+        cand_eta = pad_cand(p4_field(data.reco_cand_p4s, "eta"))
+        cand_phi = pad_cand(p4_field(data.reco_cand_p4s, "phi"))
+        cand_en = pad_cand(p4_field(data.reco_cand_p4s, "energy"))
         cand_charge = pad_cand(data.reco_cand_charges)
         cand_pdg_abs = pad_cand(abs(data.reco_cand_pdgs))
         cand_dz = pad_cand(data.reco_cand_dz)
@@ -243,20 +347,20 @@ class ParticleTransformerDETRDataset(ParticleTransformerDataset):
         mask_np = np.arange(max_cands)[None, :] < lengths[:, None]
 
         # Jet-level p4 for feature engineering and bookkeeping
-        jet_pt = ak.to_numpy(data.reco_jet_p4["pt"]).astype(np.float32)
-        jet_eta = ak.to_numpy(data.reco_jet_p4["eta"]).astype(np.float32)
-        jet_phi = ak.to_numpy(data.reco_jet_p4["phi"]).astype(np.float32)
-        jet_en = ak.to_numpy(data.reco_jet_p4["energy"]).astype(np.float32)
+        jet_pt = ak.to_numpy(p4_field(data.reco_jet_p4, "pt")).astype(np.float32)
+        jet_eta = ak.to_numpy(p4_field(data.reco_jet_p4, "eta")).astype(np.float32)
+        jet_phi = ak.to_numpy(p4_field(data.reco_jet_p4, "phi")).astype(np.float32)
+        jet_en = ak.to_numpy(p4_field(data.reco_jet_p4, "energy")).astype(np.float32)
 
-        gen_tau_pt = ak.to_numpy(data.gen_jet_tau_p4["pt"]).astype(np.float32)
-        gen_tau_eta = ak.to_numpy(data.gen_jet_tau_p4["eta"]).astype(np.float32)
-        gen_tau_phi = ak.to_numpy(data.gen_jet_tau_p4["phi"]).astype(np.float32)
-        gen_tau_energy = ak.to_numpy(data.gen_jet_tau_p4["energy"]).astype(np.float32)
+        gen_tau_pt = ak.to_numpy(p4_field(data.gen_jet_tau_p4, "pt")).astype(np.float32)
+        gen_tau_eta = ak.to_numpy(p4_field(data.gen_jet_tau_p4, "eta")).astype(np.float32)
+        gen_tau_phi = ak.to_numpy(p4_field(data.gen_jet_tau_p4, "phi")).astype(np.float32)
+        gen_tau_energy = ak.to_numpy(p4_field(data.gen_jet_tau_p4, "energy")).astype(np.float32)
 
-        gen_jet_pt = ak.to_numpy(data.gen_jet_p4["pt"]).astype(np.float32)
-        gen_jet_eta = ak.to_numpy(data.gen_jet_p4["eta"]).astype(np.float32)
-        gen_jet_phi = ak.to_numpy(data.gen_jet_p4["phi"]).astype(np.float32)
-        gen_jet_energy = ak.to_numpy(data.gen_jet_p4["energy"]).astype(np.float32)
+        gen_jet_pt = ak.to_numpy(p4_field(data.gen_jet_p4, "pt")).astype(np.float32)
+        gen_jet_eta = ak.to_numpy(p4_field(data.gen_jet_p4, "eta")).astype(np.float32)
+        gen_jet_phi = ak.to_numpy(p4_field(data.gen_jet_p4, "phi")).astype(np.float32)
+        gen_jet_energy = ak.to_numpy(p4_field(data.gen_jet_p4, "energy")).astype(np.float32)
 
         # 17 ParticleTransformer features
         jpt = jet_pt[:, None]
@@ -335,45 +439,39 @@ class ParticleTransformerDETRDataset(ParticleTransformerDataset):
         # instead of raising KeyError in _get_record_field.
         if max_tau_daughters > 0 and len(daughter_p4.fields) > 0:
             dau_pt = self._pad_jagged(
-                self._get_record_field(daughter_p4, ["pt", "rho"]),
+                p4_field(daughter_p4, "pt"),
                 max_tau_daughters,
                 fill=0.0,
                 dtype=np.float32,
             )
             dau_eta = self._pad_jagged(
-                self._get_record_field(daughter_p4, ["eta"]),
+                p4_field(daughter_p4, "eta"),
                 max_tau_daughters,
                 fill=0.0,
                 dtype=np.float32,
             )
             dau_phi = self._pad_jagged(
-                self._get_record_field(daughter_p4, ["phi"]),
+                p4_field(daughter_p4, "phi"),
                 max_tau_daughters,
                 fill=0.0,
                 dtype=np.float32,
             )
 
-            if any(name in daughter_p4.fields for name in ["t", "energy", "E", "e"]):
+            # p4_field derives energy from any complete basis, including a
+            # (pt, eta, phi, mass) record. What it cannot do is invent a fourth
+            # coordinate, so a record carrying neither energy nor mass is the
+            # one case left to handle here: treat those daughters as massless.
+            if has_p4_field(daughter_p4, "energy") or has_p4_field(
+                daughter_p4, "mass"
+            ):
                 dau_energy = self._pad_jagged(
-                    self._get_record_field(daughter_p4, ["t", "energy", "E", "e"]),
+                    p4_field(daughter_p4, "energy"),
                     max_tau_daughters,
                     fill=0.0,
                     dtype=np.float32,
                 )
             else:
-                # If only mass is present, reconstruct energy from pt, eta, mass.
-                if any(name in daughter_p4.fields for name in ["mass", "m"]):
-                    dau_mass = self._pad_jagged(
-                        self._get_record_field(daughter_p4, ["mass", "m"]),
-                        max_tau_daughters,
-                        fill=0.0,
-                        dtype=np.float32,
-                    )
-                else:
-                    dau_mass = np.zeros_like(dau_pt, dtype=np.float32)
-                dau_energy = np.sqrt(
-                    np.maximum((dau_pt * np.cosh(dau_eta)) ** 2 + dau_mass**2, 0.0)
-                )
+                dau_energy = dau_pt * np.cosh(dau_eta)
 
             daughter_charge = self._pad_jagged(
                 daughter_charge_jag,
@@ -598,27 +696,105 @@ class ParticleTransformerDETRDataset(ParticleTransformerDataset):
     def __iter__(self):
         worker_info = torch.utils.data.get_worker_info()
         if worker_info is None:
-            reads_to_process = list(self.read_units)
+            reads_to_process = self._shard_reads(0, 1)
         else:
-            # Strided instead of contiguous sharding: contiguous slicing with
-            # ceil() hands the last worker a short (or empty) shard while the
-            # first ones do a full share, so the epoch is paced by the slowest.
-            reads_to_process = list(
-                self.read_units[worker_info.id :: worker_info.num_workers]
-            )
+            reads_to_process = self._shard_reads(worker_info.id, worker_info.num_workers)
 
+        samples = {sample_name(unit[0]) for unit in reads_to_process}
+        if self.stratify_samples and len(samples) > 1:
+            yield from self._iter_stratified(reads_to_process)
+        else:
+            yield from self._iter_chunked(reads_to_process)
+
+    def _iter_stratified(self, reads_to_process):
+        """
+        Emit batches composed from every sample at once.
+
+        A read covers one file and therefore one class, so concatenating whole
+        reads and shuffling inside the result only mixes classes when the reads
+        that happened to land together came from different files. With an
+        unbalanced file count that frequently fails: for a fraction f of reads
+        in one class, a chunk of k reads is single-class with probability
+        f^k + (1-f)^k, which at f=7/8 and k=4 is about 59%. The consequence is
+        runs of tens of consecutive batches carrying one label, during which the
+        tagging head simply drifts towards that label -- its loss falls to ~0
+        inside a run, spikes on the flip, and the epoch mean carries no signal.
+
+        Here each sample instead keeps its own buffer and every batch takes a
+        share of each, proportional to what that sample has left. Both classes
+        are then present in every batch by construction, whatever the file
+        ratio, and the epoch composition is untouched: each read is still
+        consumed exactly once, so `__len__` is unchanged.
+
+        The memory budget is unchanged too. `mixing_reads` reads stay resident
+        in total, now split across the samples rather than possibly all being
+        the same class.
+        """
+        rng = np.random.default_rng()
+        queues: dict[str, list] = {}
+        for unit in reads_to_process:
+            queues.setdefault(sample_name(unit[0]), []).append(unit)
+        if self.shuffle:
+            for units in queues.values():
+                rng.shuffle(units)
+
+        reads_per_refill = max(1, self.mixing_reads // len(queues))
+        remaining = {name: sum(u[2] for u in units) for name, units in queues.items()}
+        buffers: dict[str, list] = {}  # sample -> [tensors, cursor]
+
+        def refill(name: str) -> bool:
+            block = queues[name][:reads_per_refill]
+            del queues[name][:reads_per_refill]
+            if not block:
+                return False
+            tensors = self._concat_tensors([self._load_read_unit(u) for u in block])
+            if self.shuffle:
+                tensors = self._take(tensors, torch.randperm(tensors[0].shape[0]))
+            # Rebinding drops the previous buffer, so one chunk per sample is
+            # resident at a time.
+            buffers[name] = [tensors, 0]
+            return True
+
+        while sum(remaining.values()) > 0:
+            parts = []
+            for name, wanted in self._allocate(self.batch_size, remaining).items():
+                while wanted > 0:
+                    buffer = buffers.get(name)
+                    if buffer is None or buffer[1] >= buffer[0][0].shape[0]:
+                        if not refill(name):
+                            # Queue empty before the row count said so: stop
+                            # asking this sample rather than spinning.
+                            remaining[name] = 0
+                            break
+                        buffer = buffers[name]
+                    tensors, cursor = buffer
+                    take = min(wanted, tensors[0].shape[0] - cursor)
+                    parts.append(self._take(tensors, slice(cursor, cursor + take)))
+                    buffer[1] = cursor + take
+                    remaining[name] -= take
+                    wanted -= take
+            if not parts:
+                break
+            batch = self._concat_tensors(parts)
+            if self.shuffle:
+                # Only cosmetic -- every consumer is permutation invariant --
+                # but it keeps a truncated batch from being one class.
+                batch = self._take(batch, torch.randperm(batch[0].shape[0]))
+            yield batch
+
+    def _iter_chunked(self, reads_to_process):
+        """
+        Emit batches by concatenating whole reads, preserving read order.
+
+        Used when there is only one sample to draw from, and for the test and
+        predict splits where the emission order is meaningful.
+        """
         if self.shuffle:
             np.random.default_rng().shuffle(reads_to_process)
 
-        # A read covers one file, hence one class. Emitting one read at a time
-        # therefore yields runs of pure-signal followed by runs of pure-background
-        # batches. Draining several reads at once and permuting across them
-        # restores a mixed class composition per batch.
-        #
         # Rows left over from a chunk are carried into the next one instead of
         # being emitted as a short batch. That keeps every batch full except the
-        # last of the shard, which is what makes __len__ exact, and it lets a
-        # batch straddle two chunks so the class mixing improves slightly.
+        # last of the shard, which is what makes __len__ exact.
         carry = None
         for start_read in range(0, len(reads_to_process), self.mixing_reads):
             chunk = reads_to_process[start_read : start_read + self.mixing_reads]
@@ -639,33 +815,6 @@ class ParticleTransformerDETRDataset(ParticleTransformerDataset):
 
         if carry is not None and carry[0].shape[0] > 0:
             yield carry
-
-
-def resolve_num_workers(requested: int) -> int:
-    """
-    Clamp the worker count to the CPUs this process may actually use.
-
-    `os.sched_getaffinity` reflects the Slurm cpuset, so this catches a job that
-    asked for one cpu but configured several workers -- they would otherwise
-    timeshare a single core and stall the first batch for minutes.
-    """
-    requested = int(requested)
-    try:
-        available = len(os.sched_getaffinity(0))
-    except AttributeError:  # pragma: no cover - non-Linux
-        available = os.cpu_count() or 1
-    # Leave one core for the main process that feeds the GPU.
-    usable = max(1, available - 1) if available > 1 else 1
-    if requested > usable:
-        warnings.warn(
-            f"training.dataloader.num_dataloader_workers={requested} but only "
-            f"{available} cpu(s) are available to this process; using {usable}. "
-            "Request more cpus (e.g. #SBATCH --cpus-per-task=8) to use more "
-            "workers.",
-            stacklevel=2,
-        )
-        return usable
-    return requested
 
 
 class ParTauDETRDataModule(ParTDataModule):
@@ -732,36 +881,20 @@ class ParTauDETRDataModule(ParTDataModule):
             self.train_loader = DataLoader(
                 self.train_dataset,
                 batch_size=None,
-                persistent_workers=False if self.debug_run else True,
-                num_workers=n_workers,
-                multiprocessing_context=(
-                    "forkserver"
-                    if self.cfg.training.dataloader.num_dataloader_workers > 1
-                    else None
+                **loader_kwargs(
+                    n_workers,
+                    self.cfg.training.dataloader.prefetch_factor,
+                    self.debug_run,
                 ),
-                prefetch_factor=(
-                    None
-                    if self.debug_run
-                    else self.cfg.training.dataloader.prefetch_factor
-                ),
-                pin_memory=True,
             )
             self.val_loader = DataLoader(
                 self.val_dataset,
                 batch_size=None,
-                persistent_workers=False if self.debug_run else True,
-                num_workers=n_workers,
-                multiprocessing_context=(
-                    "forkserver"
-                    if self.cfg.training.dataloader.num_dataloader_workers > 1
-                    else None
+                **loader_kwargs(
+                    n_workers,
+                    self.cfg.training.dataloader.prefetch_factor,
+                    self.debug_run,
                 ),
-                prefetch_factor=(
-                    None
-                    if self.debug_run
-                    else self.cfg.training.dataloader.prefetch_factor
-                ),
-                pin_memory=True,
             )
         elif stage == "test" or stage == "predict":
             test_row_groups = self.get_dataset_rowgroups(dataset_type="test")
@@ -772,6 +905,9 @@ class ParTauDETRDataModule(ParTDataModule):
                 cfg=self.cfg,
                 batch_size=batch_size,
                 shuffle=False,
+                # Evaluation reads the emission order as meaningful, and a
+                # gradient-free pass has nothing to gain from stratifying.
+                stratify_samples=False,
                 row_groups_per_read=self.cfg.training.dataloader.get(
                     "row_groups_per_read", 1
                 ),
@@ -779,16 +915,13 @@ class ParTauDETRDataModule(ParTDataModule):
             self.test_loader = DataLoader(
                 self.test_dataset,
                 batch_size=None,
-                persistent_workers=True,
-                num_workers=resolve_num_workers(
-                    self.cfg.training.dataloader.num_dataloader_workers
+                **loader_kwargs(
+                    resolve_num_workers(
+                        self.cfg.training.dataloader.num_dataloader_workers
+                    ),
+                    self.cfg.training.dataloader.prefetch_factor,
+                    False,
                 ),
-                prefetch_factor=(
-                    self.cfg.training.dataloader.prefetch_factor
-                    if self.cfg.training.dataloader.num_dataloader_workers > 0
-                    else None
-                ),
-                pin_memory=True,
             )
         else:
             raise ValueError(f"Unexpected stage: {stage}")

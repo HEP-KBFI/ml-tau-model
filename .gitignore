@@ -223,3 +223,4 @@ lightning_logs/
 
 # Python sources mirrored out of the Apptainer image for editor LSPs.
 .container-python/
+

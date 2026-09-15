@@ -22,6 +22,7 @@ def reinitialize_p4(p4_obj: ak.Array):
         "z": "pz",
         "t": "energy",
         "e": "energy",
+        "E": "energy",
         "tau": "mass",
         "m": "mass",
     }
