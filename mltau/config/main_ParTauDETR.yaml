@@ -105,10 +105,10 @@ model:
             weight_charge: 1.0
             weight_meson_class: 1.0
             weight_consistency: 0.1
-            weight_charge_count: 0.0
-            weight_parent_kinematics: 1.0
-            weight_parent_charge: 1.0
-            weight_parent_decay_mode: 1.0
+            weight_charge_count: 0.1
+            weight_parent_kinematics: 0.0
+            weight_parent_charge: 0.0
+            weight_parent_decay_mode: 0.0
             eos_coef: 0.1
         inference:
             score_threshold: 0.85
