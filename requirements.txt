@@ -13,3 +13,4 @@ matplotlib
 boost-histogram
 mplhep
 numba
+lightning
