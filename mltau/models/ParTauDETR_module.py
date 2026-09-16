@@ -525,7 +525,9 @@ class SetCriterion(nn.Module):
         loss_parent_charge = pred_logits.new_zeros(())
         loss_parent_decay_mode = pred_logits.new_zeros(())
 
-        if self.loss_consistency_weight > 0:
+        with torch.set_grad_enabled(
+            torch.is_grad_enabled() and self.loss_consistency_weight > 0
+        ):
             p_charge = F.softmax(pred_charge_logits, dim=-1)  # [B, Q, 3]
             p_meson_class = F.softmax(pred_meson_class_logits, dim=-1)
             p_joint = p_charge[..., :, None] * p_meson_class[..., None, :]
@@ -536,9 +538,12 @@ class SetCriterion(nn.Module):
             loss_consistency = (invalid_prob * sig_w[:, None]).sum() / (
                 sig_w.sum() * num_queries + 1e-8
             )
+        if self.loss_consistency_weight > 0:
             total_loss = total_loss + self.loss_consistency_weight * loss_consistency
 
-        if self.loss_charge_count_weight > 0:
+        with torch.set_grad_enabled(
+            torch.is_grad_enabled() and self.loss_charge_count_weight > 0
+        ):
             p_object = F.softmax(pred_logits, dim=-1)[..., 0]  # [B, Q]
             pred_charge_cls = pred_charge_logits.argmax(dim=-1)  # [B, Q]
             is_charged_pred = (pred_charge_cls != 1).float()  # class 1 = charge 0
@@ -551,6 +556,7 @@ class SetCriterion(nn.Module):
             excess = F.relu(expected_charged - n_charged_true)
             sig_w = signal_mask.to(dtype=excess.dtype)
             loss_charge_count = (excess * sig_w).sum() / (sig_w.sum() + 1e-8)
+        if self.loss_charge_count_weight > 0:
             total_loss = total_loss + self.loss_charge_count_weight * loss_charge_count
 
         if jet_weights is not None:
@@ -559,7 +565,9 @@ class SetCriterion(nn.Module):
             parent_weights = pred_logits.new_ones(batch_size)
         parent_weights = parent_weights * signal_mask.to(parent_weights.dtype)
 
-        if self.loss_parent_kinematics_weight > 0:
+        with torch.set_grad_enabled(
+            torch.is_grad_enabled() and self.loss_parent_kinematics_weight > 0
+        ):
             reference_pt = kinematics_reference_p4["pt"].to(dtype=pred_kinematics.dtype, device=device)[pair_b]
             reference_eta = kinematics_reference_p4["eta"].to(dtype=pred_kinematics.dtype, device=device)[pair_b]
             reference_phi = kinematics_reference_p4["phi"].to(dtype=pred_kinematics.dtype, device=device)[pair_b]
@@ -601,9 +609,12 @@ class SetCriterion(nn.Module):
                 target_parent_kinematics,
                 parent_weights,
             )
+        if self.loss_parent_kinematics_weight > 0:
             total_loss = total_loss + self.loss_parent_kinematics_weight * loss_parent_kinematics
 
-        if self.loss_parent_charge_weight > 0:
+        with torch.set_grad_enabled(
+            torch.is_grad_enabled() and self.loss_parent_charge_weight > 0
+        ):
             matched_query_mask = torch.zeros(
                 (batch_size, num_queries), dtype=torch.bool, device=device
             )
@@ -637,9 +648,12 @@ class SetCriterion(nn.Module):
                 ignore_index=self.ignore_index,
             )
             loss_parent_charge = self._weighted_mean(charge_loss, parent_weights)
+        if self.loss_parent_charge_weight > 0:
             total_loss = total_loss + self.loss_parent_charge_weight * loss_parent_charge
 
-        if self.loss_parent_decay_mode_weight > 0:
+        with torch.set_grad_enabled(
+            torch.is_grad_enabled() and self.loss_parent_decay_mode_weight > 0
+        ):
             matched_query_mask = torch.zeros(
                 (batch_size, num_queries), dtype=torch.bool, device=device
             )
@@ -685,6 +699,7 @@ class SetCriterion(nn.Module):
                 ignore_index=self.ignore_index,
             )
             loss_parent_decay_mode = self._weighted_mean(decay_mode_loss, parent_weights)
+        if self.loss_parent_decay_mode_weight > 0:
             total_loss = total_loss + self.loss_parent_decay_mode_weight * loss_parent_decay_mode
 
         return {
