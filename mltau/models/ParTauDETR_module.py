@@ -723,7 +723,7 @@ class ParTauDETRModule(L.LightningModule):
     Expected target keys from dataloader:
       - particles_kinematics: [B, T, K]
       - particles_charge_ohe: [B, T, 3]
-            - particles_meson_class_ohe: [B, T, C]
+      - particles_meson_class_ohe: [B, T, C]
       - particles_mask: [B, T]
     """
 

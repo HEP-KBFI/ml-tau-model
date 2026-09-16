@@ -340,8 +340,9 @@ def model_inference(checkpoint_path, data_path, cfg):
     )
     model.to(DEVICE)
     model.eval()
-    data = ak.from_parquet(data_path)
-    print(f"Read {len(data):,} jets from {data_path}.", flush=True)
+    data_paths = [data_path] if isinstance(data_path, (str, bytes)) else data_path
+    data = ak.concatenate([ak.from_parquet(path) for path in data_paths])
+    print(f"Read {len(data):,} jets from {len(data_paths)} parquet files.", flush=True)
     ds = ParticleTransformerDETRDataset.for_arrays(cfg)
     batch = ds.build_tensors(data)
 
