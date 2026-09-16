@@ -14,6 +14,7 @@ from torch.utils.data import DataLoader, IterableDataset
 from mltau.tools import features as f
 from mltau.tools import general as g
 from mltau.tools.io import general as ig  # RowGroupDataset
+from mltau.tools.io import input_scaling as scaling
 
 np.random.seed(42)
 
@@ -143,11 +144,24 @@ class ParticleTransformerDataset(IterableDataset):
         self.batch_size = batch_size
         self.row_groups = row_groups
         self.num_rows = sum([rg.num_rows for rg in self.row_groups])
+        # Set by the DataModule, or by for_arrays, when training.input_scaling
+        # is enabled. Applied inside build_tensors, which is the single place
+        # these tensors are constructed, so every consumer -- training,
+        # evaluation, notebooks -- standardises identically without having to
+        # remember to ask.
+        self.input_scaler = None
         if self.row_groups:
             print(
                 f"There are {'{:,}'.format(self.num_rows)} jets in the dataset.",
                 flush=True,
             )
+
+    def set_input_scaler(self, scaler) -> None:
+        """Attach a `tensors -> tensors` callable, or None to disable scaling."""
+        self.input_scaler = scaler
+
+    def _scaled(self, tensors):
+        return tensors if self.input_scaler is None else self.input_scaler(tensors)
 
     @classmethod
     def for_arrays(cls, cfg: DictConfig):
@@ -162,7 +176,11 @@ class ParticleTransformerDataset(IterableDataset):
         just read in full, which reads like data loss and is why the counts are
         now printed only when there is actually something to read.
         """
-        return cls(row_groups=[], cfg=cfg, batch_size=1)
+        dataset = cls(row_groups=[], cfg=cfg, batch_size=1)
+        # Inference must standardise exactly as training did; reading the scaler
+        # here means a caller cannot forget to.
+        dataset.set_input_scaler(scaling.make_input_scaler(cfg))
+        return dataset
 
     def __len__(self):
         # A batch never spans two row groups, so every row group contributes its
@@ -339,7 +357,7 @@ class ParticleTransformerDataset(IterableDataset):
             )
         )
 
-        return (
+        return self._scaled((
             torch.from_numpy(cand_features_np),
             torch.from_numpy(cand_kinematics_np),
             {
@@ -368,7 +386,7 @@ class ParticleTransformerDataset(IterableDataset):
                 "phi": torch.from_numpy(_phi_gen_jet),
                 "energy": torch.from_numpy(_energy_gen_jet),
             },
-        )
+        ))
 
     def __iter__(self):
         worker_info = torch.utils.data.get_worker_info()
@@ -601,6 +619,60 @@ class ParTDataModule(LightningDataModule):
         else:
             return []
 
+    def make_fit_dataset(self, row_groups):
+        """
+        Dataset the scaler-fitting pass reads through.
+
+        A subclass overrides this to fit through the dataset it actually trains
+        with, so the fit sees the same features and needs the same columns. The
+        row groups arrive already shuffled across samples by
+        get_dataset_rowgroups, so the bounded subsample the fit stops at is a
+        random draw over both classes rather than the head of one file.
+        """
+        return ParticleTransformerDataset(
+            row_groups=list(row_groups),
+            cfg=self.cfg,
+            batch_size=self.cfg.training.dataloader.batch_size,
+        )
+
+    def resolve_input_scaler(self, row_groups, stage: str):
+        """
+        Return the `tensors -> tensors` scaler for this run, fitting it if needed.
+
+        An existing .npz is reused rather than refitted, so a resumed run, the
+        validation split and later evaluation all standardise with the SAME
+        constants -- refitting per run would silently shift the inputs a trained
+        checkpoint expects. Fitting only ever happens for the fit stage; test and
+        predict require the file to already exist.
+
+        The fit reads the training row groups itself, through an ordinary
+        single-process dataset, and stops after `training.input_scaling.fit_jets`
+        jets.
+        """
+        if not scaling.scaling_enabled(self.cfg):
+            return None
+
+        path = scaling.scaler_path(self.cfg)
+        if not os.path.exists(path):
+            if stage != "fit":
+                raise RuntimeError(
+                    f"Input scaling is enabled but no scaler exists at {path}. "
+                    "Run training first, or point training.input_scaling.scaler_path "
+                    "at the scaler that was fitted for this checkpoint."
+                )
+            fit_jets = int(
+                self.cfg.training.input_scaling.get("fit_jets", 500_000)
+            )
+            print(
+                f"[input scaling] No scaler at {path}; fitting on up to "
+                f"{fit_jets:,} training jets.",
+                flush=True,
+            )
+            scaling.fit_scaler(
+                iter(self.make_fit_dataset(row_groups)), self.cfg, max_jets=fit_jets
+            )
+        return scaling.make_input_scaler(self.cfg)
+
     def setup(self, stage: str) -> None:
         # For debug runs, use smaller but reasonable batch size for speed
         batch_size = (
@@ -616,6 +688,9 @@ class ParTDataModule(LightningDataModule):
             self.val_dataset = ParticleTransformerDataset(
                 row_groups=val_row_groups, cfg=self.cfg, batch_size=batch_size
             )
+            scaler = self.resolve_input_scaler(train_row_groups, "fit")
+            self.train_dataset.set_input_scaler(scaler)
+            self.val_dataset.set_input_scaler(scaler)
             # batch_size=None: dataset yields pre-batched slices, skip collation
             # entirely. The loader arguments go through loader_kwargs because
             # several of them are only legal for num_workers > 0: passing
@@ -640,6 +715,9 @@ class ParTDataModule(LightningDataModule):
             test_row_groups = self.get_dataset_rowgroups(dataset_type="test")
             self.test_dataset = ParticleTransformerDataset(
                 row_groups=test_row_groups, cfg=self.cfg, batch_size=batch_size
+            )
+            self.test_dataset.set_input_scaler(
+                self.resolve_input_scaler(test_row_groups, stage)
             )
             self.test_loader = DataLoader(
                 self.test_dataset,

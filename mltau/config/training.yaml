@@ -83,6 +83,17 @@ training:
         mixing_reads: 4
 
     input_scaling:
+        # Standardise the continuous candidate features to zero mean and unit
+        # variance. The scaler is fitted ONCE, on the training split, saved to
+        # scaler_path, and reused from there by validation, test and evaluation:
+        # a checkpoint is only valid for the constants it was trained with, so
+        # refitting per run would silently move its inputs. Delete the .npz to
+        # force a refit.
         enabled: false
         scaler_path: ${output_dir}/scaler/cand_feature_scaler.npz
+        # Jets read for the fit. A per-feature mean and std converge long before
+        # the full split, and this pass costs wall clock before training starts.
+        fit_jets: 500000
+        # Only the continuous features: 7 is charge and 8-12 are the PID
+        # one-hots, which are already 0/1 and must not be shifted.
         continuous_feature_indices: [0, 1, 2, 3, 4, 5, 6, 13, 14, 15, 16]

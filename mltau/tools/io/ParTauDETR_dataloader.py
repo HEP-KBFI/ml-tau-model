@@ -588,7 +588,7 @@ class ParticleTransformerDETRDataset(ParticleTransformerDataset):
             ),
         }
 
-        return (
+        return self._scaled((
             torch.from_numpy(cand_features_np),
             torch.from_numpy(cand_kinematics_np),
             targets,
@@ -612,7 +612,7 @@ class ParticleTransformerDETRDataset(ParticleTransformerDataset):
                 "phi": torch.from_numpy(gen_jet_phi),
                 "energy": torch.from_numpy(gen_jet_energy),
             },
-        )
+        ))
 
     def _parquet_handle(self, filename: str):
         """
@@ -834,6 +834,33 @@ class ParTauDETRDataModule(ParTDataModule):
         if cfg.model.detr.tau_id_head:
             self.sample = "*"
 
+    def make_fit_dataset(self, row_groups):
+        """
+        Fit the scaler through the DETR dataset, stratified.
+
+        Two reasons not to inherit the base implementation. It builds the ParT
+        tensors, which read a column (gen_jet_tau_charge) this path does not
+        require, so a DETR-only production would fail the fit. And a DETR read
+        covers one file, hence one class: stopping after `fit_jets` jets without
+        stratifying could take the whole subsample from background alone, which
+        would bias every feature mean the fit produces.
+        """
+        return ParticleTransformerDETRDataset(
+            row_groups=list(row_groups),
+            cfg=self.cfg,
+            batch_size=self.cfg.training.dataloader.batch_size,
+            shuffle=False,  # deterministic subsample for a reproducible scaler
+            row_groups_per_read=self.cfg.training.dataloader.get(
+                "row_groups_per_read", 1
+            ),
+            mixing_reads=self.cfg.training.dataloader.get("mixing_reads", 1),
+            cache_parquet_handles=self.cfg.training.dataloader.get(
+                "cache_parquet_handles", True
+            ),
+            num_workers=0,
+            stratify_samples=True,
+        )
+
     def setup(self, stage: str) -> None:
         batch_size = (
             self.cfg.training.dataloader.batch_size if not self.debug_run else 512
@@ -878,6 +905,9 @@ class ParTauDETRDataModule(ParTDataModule):
                 cache_parquet_handles=cache_handles,
                 num_workers=n_workers,
             )
+            scaler = self.resolve_input_scaler(train_row_groups, "fit")
+            self.train_dataset.set_input_scaler(scaler)
+            self.val_dataset.set_input_scaler(scaler)
             self.train_loader = DataLoader(
                 self.train_dataset,
                 batch_size=None,
@@ -911,6 +941,9 @@ class ParTauDETRDataModule(ParTDataModule):
                 row_groups_per_read=self.cfg.training.dataloader.get(
                     "row_groups_per_read", 1
                 ),
+            )
+            self.test_dataset.set_input_scaler(
+                self.resolve_input_scaler(test_row_groups, stage)
             )
             self.test_loader = DataLoader(
                 self.test_dataset,

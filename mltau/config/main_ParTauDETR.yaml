@@ -22,6 +22,13 @@ logging:
         online: true
         log_code: false
         log_graph: false
+        # comet_ml monkey-patches Tensor.backward() and logs the value it is
+        # called on as a bare metric named "loss" -- every 10th backward, on its
+        # own step counter, so it matches neither train_losses/loss (an epoch
+        # mean) nor val_losses/loss, and it reads as a third, unexplained curve
+        # in the Metrics tab. Everything this repository wants logged is logged
+        # explicitly, so leave this off.
+        auto_metric_logging: false
         # System metrics -> Comet's "System Metrics" tab: GPU utilisation %,
         # GPU memory, power, temperature (via pynvml), plus CPU and host info.
         # log_env_gpu/cpu are force-disabled by comet_ml unless log_env_details

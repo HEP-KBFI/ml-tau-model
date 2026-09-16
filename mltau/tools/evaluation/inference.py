@@ -38,10 +38,9 @@ from tqdm.auto import tqdm
 
 from mltau.tools.general import reinitialize_p4, one_hot_decoding
 from mltau.tools.io.general import BatchInputs
-from mltau.tools.io.preprocessed_ParTau_dataloader import (
-    ParticleTransformerDataset,
-    apply_saved_input_scaling_from_cfg,
-)
+from mltau.tools.io import general as ig
+from mltau.tools.io.ParT_dataloader import ParticleTransformerDataset
+from mltau.tools.io.input_scaling import make_input_scaler
 
 # def softmax(x):
 #     # x shape: (N, 6)
@@ -182,19 +181,6 @@ def postprocess_predictions(
     return ret
 
 
-def load_tensors(path):
-    tensors = torch.load(path, weights_only=True)
-    cf = tensors[0].transpose(1, 2)
-    ck = tensors[1].transpose(1, 2)
-    tgt = {k: tensors[2][k] for k in tensors[2]}
-    msk = tensors[3]
-    wt = tensors[4]
-    gt = {k: tensors[5][k] for k in tensors[5]}
-    rc = {k: tensors[6][k] for k in tensors[6]}
-    gj = {k: tensors[7][k] for k in tensors[7]}
-    return cf, ck, tgt, msk, wt, gt, rc, gj
-
-
 def create_predictions_files(
     best_model, cfg: DictConfig, model_name: str, test_only: bool = True
 ):
@@ -206,14 +192,10 @@ def create_predictions_files(
     if model_name == "SingleParTau" and cfg.training.model.task != "is_tau":
         sample_pattern = "z"
 
-    paths_to_process = glob.glob(
-        os.path.join(cfg.dataset.data_dir, f"{sample_pattern}_{split}.pt")
-    )
+    pattern = os.path.join(cfg.dataset.data_dir, f"{sample_pattern}_{split}*.parquet")
+    paths_to_process = sorted(glob.glob(pattern))
     if not paths_to_process:
-        print(
-            "[WARNING] No input files matched for prediction creation:",
-            os.path.join(cfg.dataset.data_dir, f"{sample_pattern}_{split}.pt"),
-        )
+        print("[WARNING] No input files matched for prediction creation:", pattern)
         return
     print("[INFO] Prediction inputs:")
     for input_path in paths_to_process:
@@ -225,18 +207,17 @@ def create_predictions_files(
 def create_predictions_file(
     best_model, input_path: str, model_name: str, cfg: DictConfig
 ):
-    # Load your .pt file and build the dataset
-    tensors = load_tensors(input_path)
-    # Add scaling calls
-    print("[DEBUG] Active scaler:", cfg.training.input_scaling.scaler_path)
-    tensors = apply_saved_input_scaling_from_cfg(tensors, cfg)
+    # Read the parquet directly: the dataset builds the tensors per row group in
+    # file order, so predictions line up with the input rows.
     dataset = ParticleTransformerDataset(
-        tensors,
+        row_groups=ig.get_row_groups(input_paths=[input_path]),
+        cfg=cfg,
         batch_size=cfg.training.dataloader.batch_size,
-        shuffle=False,
     )
-    # Create DataLoader
     dataloader = DataLoader(dataset, batch_size=None)
+    # Read once, apply per batch: the scaler is a per-feature affine map, so this
+    # matches what scaling a whole split at once used to do.
+    scale_inputs = make_input_scaler(cfg)
 
     # --- Postprocess and save as {sample}_test.parquet ---
 
@@ -271,6 +252,7 @@ def create_predictions_file(
     progress_desc = f"{model_name} inference on {os.path.basename(input_path)}"
     with tqdm(dataloader, desc=progress_desc, unit="batch") as progress:
         for i, batch in enumerate(progress):
+            batch = scale_inputs(batch)
             batch_on_device = _move_to_device(batch, device)
             if i == 0:  # only first batch
                 cf_batch = batch[0]  # cand_features
@@ -360,7 +342,7 @@ def create_predictions_file(
         depth_limit=1,
     )
 
-    output_file = input_path.split("/")[-1].replace(".pt", ".parquet")
+    output_file = os.path.basename(input_path)
     output_dir = os.path.join(cfg.output_dir, "predictions")
     os.makedirs(output_dir, exist_ok=True)
     output_path = os.path.join(output_dir, output_file)

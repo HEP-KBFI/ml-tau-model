@@ -1,3 +1,13 @@
+import os
+
+# comet_ml installs its framework monkey-patches at IMPORT time, gated on this
+# variable, so it has to be set before the import below -- not after. Lightning's
+# CometLogger sets the same variable in its constructor, which is too late once
+# comet_ml has been imported at module scope, as it is here. Without this, the
+# pytorch patch wraps Tensor.backward() and logs a bare "loss" metric on its own
+# step counter alongside the curves this repository logs deliberately.
+os.environ.setdefault("COMET_DISABLE_AUTO_LOGGING", "1")
+
 # comet_ml monkey-patches the frameworks it auto-instruments, so it has to be
 # imported before torch/lightning to log correctly. Guarded so that this script
 # still runs on an environment without comet installed.
@@ -12,7 +22,6 @@ except ImportError as exc:  # pragma: no cover
 import faulthandler
 import inspect
 import json
-import os
 import signal
 import time
 import warnings
@@ -81,6 +90,9 @@ def build_comet_logger(cfg: DictConfig, save_dir: str):
         "log_env_details": bool(comet_cfg.log_env_details),
         "log_env_gpu": bool(comet_cfg.log_env_gpu),
         "log_env_cpu": bool(comet_cfg.log_env_cpu),
+        # Belt and braces with COMET_DISABLE_AUTO_LOGGING above: that stops the
+        # patches being installed, this stops them logging if they were.
+        "auto_metric_logging": bool(comet_cfg.get("auto_metric_logging", False)),
     }
 
     if "online" in accepted:
