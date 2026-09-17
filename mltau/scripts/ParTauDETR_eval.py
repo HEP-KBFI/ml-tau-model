@@ -1,11 +1,14 @@
 import awkward as ak
 import numpy as np
 import torch
-import vector
 from scipy.optimize import linear_sum_assignment
 
 from mltau.models.ParTauDETR_module import ParTauDETRModule
 from mltau.tools.general import reinitialize_p4
+from mltau.tools.evaluation.decode_ParTauDETR import (
+    p4_from_components,
+    sum_p4_components,
+)
 from mltau.tools.io.ParTauDETR_dataloader import ParticleTransformerDETRDataset
 from mltau.tools.partau_detr import decode_kinematics
 
@@ -130,16 +133,7 @@ def get_predicted_particles(outputs, reco_jet_p4s, obj_cls_trsh: float = 0.5):
         reco_jet_p4s["phi"],
         reco_jet_p4s["energy"],
     )
-    pred_p4 = vector.awk(
-        ak.zip(
-            {
-                "px": pred_p4_tensor[..., 0],
-                "py": pred_p4_tensor[..., 1],
-                "pz": pred_p4_tensor[..., 2],
-                "energy": pred_p4_tensor[..., 3],
-            }
-        )
-    )
+    pred_p4 = p4_from_components(pred_p4_tensor)
 
     pred_p4 = ak.drop_none(ak.mask(pred_p4, pred_mask))
     pred_charge = ak.drop_none(ak.mask(pred_charge, pred_mask))
@@ -165,16 +159,7 @@ def get_true_particles(targets, reco_jet_p4s):
         reco_jet_p4s["phi"],
         reco_jet_p4s["energy"],
     )
-    true_p4 = vector.awk(
-        ak.zip(
-            {
-                "px": true_p4_tensor[..., 0],
-                "py": true_p4_tensor[..., 1],
-                "pz": true_p4_tensor[..., 2],
-                "energy": true_p4_tensor[..., 3],
-            }
-        )
-    )
+    true_p4 = p4_from_components(true_p4_tensor)
     true_p4 = ak.drop_none(ak.mask(true_p4, target_mask))
     return true_p4, target_charge, target_meson_class
 
@@ -262,20 +247,6 @@ def match_particles(
 
 
 
-def p4_from_components(p4):
-    total = vector.awk(
-        ak.zip(
-            {
-                "px": ak.sum(p4.px, axis=1),
-                "py": ak.sum(p4.py, axis=1),
-                "pz": ak.sum(p4.pz, axis=1),
-                "energy": ak.sum(p4.energy, axis=1),
-            }
-        )
-    )
-    return total
-
-
 def compare_true_pred(
     pred_meson_class: ak.Array,
     target_meson_class: ak.Array,
@@ -286,10 +257,10 @@ def compare_true_pred(
     data: ak.Array,
     matches: ak.Array,
 ):
-    total_pred_p4 = p4_from_components(pred_p4)
-    reduced_pred_p4 = p4_from_components(pred_p4[matches.pred_idx])
-    total_true_p4 = p4_from_components(true_p4)
-    reduced_true_p4 = p4_from_components(true_p4[matches.true_idx])
+    total_pred_p4 = sum_p4_components(pred_p4)
+    reduced_pred_p4 = sum_p4_components(pred_p4[matches.pred_idx])
+    total_true_p4 = sum_p4_components(true_p4)
+    reduced_true_p4 = sum_p4_components(true_p4[matches.true_idx])
 
     for i in range(20):
         print("--------------------------------------")

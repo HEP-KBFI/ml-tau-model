@@ -23,7 +23,22 @@ DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 #     cfg = compose(config_name="main_ParTauDETR")
 
 
-def p4_from_components(p4):
+def p4_from_components(components: torch.Tensor) -> ak.Array:
+    """Create Awkward four-vectors from Cartesian Torch components."""
+    return vector.awk(
+        ak.zip(
+            {
+                "px": components[..., 0],
+                "py": components[..., 1],
+                "pz": components[..., 2],
+                "energy": components[..., 3],
+            }
+        )
+    )
+
+
+def sum_p4_components(p4: ak.Array) -> ak.Array:
+    """Sum each event's daughter four-vectors."""
     total = vector.awk(
         ak.zip(
             {
@@ -57,16 +72,7 @@ def get_predicted_particles(outputs, reco_jet_p4s, obj_cls_trsh: float = 0.5):
         reco_jet_p4s["phi"],
         reco_jet_p4s["energy"],
     )
-    pred_p4 = vector.awk(
-        ak.zip(
-            {
-                "px": pred_p4_tensor[..., 0],
-                "py": pred_p4_tensor[..., 1],
-                "pz": pred_p4_tensor[..., 2],
-                "energy": pred_p4_tensor[..., 3],
-            }
-        )
-    )
+    pred_p4 = p4_from_components(pred_p4_tensor)
 
     pred_p4 = ak.drop_none(ak.mask(pred_p4, pred_mask))
     pred_charge = ak.drop_none(ak.mask(pred_charge, pred_mask))
@@ -92,16 +98,7 @@ def get_true_particles(targets, reco_jet_p4s):
         reco_jet_p4s["phi"],
         reco_jet_p4s["energy"],
     )
-    true_p4 = vector.awk(
-        ak.zip(
-            {
-                "px": true_p4_tensor[..., 0],
-                "py": true_p4_tensor[..., 1],
-                "pz": true_p4_tensor[..., 2],
-                "energy": true_p4_tensor[..., 3],
-            }
-        )
-    )
+    true_p4 = p4_from_components(true_p4_tensor)
     true_p4 = ak.drop_none(ak.mask(true_p4, target_mask))
     return true_p4, target_charge, target_meson_class
 
@@ -199,10 +196,10 @@ def verbose_true_pred_comparison(
     matches: ak.Array,
     n_events: int = 20,
 ):
-    total_pred_p4 = p4_from_components(pred_p4)
-    reduced_pred_p4 = p4_from_components(pred_p4[matches.pred_idx])
-    total_true_p4 = p4_from_components(true_p4)
-    reduced_true_p4 = p4_from_components(true_p4[matches.true_idx])
+    total_pred_p4 = sum_p4_components(pred_p4)
+    reduced_pred_p4 = sum_p4_components(pred_p4[matches.pred_idx])
+    total_true_p4 = sum_p4_components(true_p4)
+    reduced_true_p4 = sum_p4_components(true_p4[matches.true_idx])
 
     for i in range(n_events):
         print("--------------------------------------")
