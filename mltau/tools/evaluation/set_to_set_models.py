@@ -1,6 +1,7 @@
 import awkward as ak
 
 from mltau.tools.general import reinitialize_p4
+from mltau.tools.meson_classes import get_meson_classes
 
 # Both lists hold hadrons only.  A daughter that is in neither -- a photon, a
 # conversion electron, anything else -- is not on the prong/pi0 grid at all, so
@@ -59,18 +60,44 @@ def get_decay_mode(n_charged, n_neutral, n_non_hadrons=None):
     return decay_mode
 
 
-def construct_jet_level_predictions(pred_daughters, true_daughters):
-    n_charged, n_neutral = count_ch_neutral(pred_daughters.pdg)
-    pred_tau_decay_mode = get_decay_mode(
-        n_charged, n_neutral, count_non_hadrons(pred_daughters.pdg)
+def count_ch_neutral_meson_classes(meson_class, tau_daughter_pdg_ids):
+    """Count charged and neutral daughters from configured class charges."""
+    charged_indices = []
+    neutral_indices = []
+    for index, daughter_class in enumerate(get_meson_classes(tau_daughter_pdg_ids)):
+        charges = set(daughter_class.charges)
+        if charges == {0}:
+            neutral_indices.append(index)
+        elif 0 not in charges:
+            charged_indices.append(index)
+        else:
+            raise ValueError(
+                f"Meson class '{daughter_class.name}' mixes neutral and charged particles."
+            )
+
+    charged_mask = meson_class == charged_indices[0]
+    for index in charged_indices[1:]:
+        charged_mask = charged_mask | (meson_class == index)
+    neutral_mask = meson_class == neutral_indices[0]
+    for index in neutral_indices[1:]:
+        neutral_mask = neutral_mask | (meson_class == index)
+    return ak.sum(charged_mask, axis=1), ak.sum(neutral_mask, axis=1)
+
+
+def construct_jet_level_predictions(
+    pred_daughters, true_daughters, tau_daughter_pdg_ids
+):
+    n_charged, n_neutral = count_ch_neutral_meson_classes(
+        pred_daughters.meson_class, tau_daughter_pdg_ids
     )
+    pred_tau_decay_mode = get_decay_mode(n_charged, n_neutral)
     pred_tau_p4 = reinitialize_p4(ak.sum(pred_daughters.p4, axis=1))
     pred_tau_charge = ak.sum(pred_daughters.charge, axis=1)
 
-    n_charged_true, n_neutral_true = count_ch_neutral(true_daughters.pdg)
-    true_tau_decay_mode_exp = get_decay_mode(
-        n_charged_true, n_neutral_true, count_non_hadrons(true_daughters.pdg)
+    n_charged_true, n_neutral_true = count_ch_neutral_meson_classes(
+        true_daughters.meson_class, tau_daughter_pdg_ids
     )
+    true_tau_decay_mode_exp = get_decay_mode(n_charged_true, n_neutral_true)
     return ak.Array(
         {
             "tau_decaymode": pred_tau_decay_mode,
@@ -81,7 +108,9 @@ def construct_jet_level_predictions(pred_daughters, true_daughters):
     )
 
 
-def construct_prediction_file_content(data, pred_daughters, true_daughters):
+def construct_prediction_file_content(
+    data, pred_daughters, true_daughters, tau_daughter_pdg_ids
+):
     fields_of_interest = [
         "reco_jet_p4",
         "gen_jet_p4",
@@ -106,7 +135,7 @@ def construct_prediction_file_content(data, pred_daughters, true_daughters):
         }
     )
     pred_tau_jet_level_data = construct_jet_level_predictions(
-        pred_daughters, true_daughters
+        pred_daughters, true_daughters, tau_daughter_pdg_ids
     )
     combined_data = ak.zip(
         {

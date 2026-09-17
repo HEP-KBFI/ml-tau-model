@@ -1,4 +1,3 @@
-import math
 from typing import Any
 
 import lightning as L
@@ -12,6 +11,7 @@ from mltau.models.ParTauDETR import ParTauDETR
 from mltau.tools.io.general import BatchInputs
 from mltau.tools.losses import TauLoss
 from mltau.tools.meson_classes import MesonClass, get_meson_classes
+from mltau.tools.partau_detr import decode_kinematics
 
 try:  # scipy's LAPJVsp solver is ~10x faster than the pure-python fallback below
     from scipy.optimize import linear_sum_assignment as _scipy_lsa
@@ -335,38 +335,6 @@ class SetCriterion(nn.Module):
             return values.mean()
         return (values * weights).sum() / (weights.sum() + 1e-8)
 
-    @staticmethod
-    def _decode_kinematics(
-        kinematics: torch.Tensor,
-        reference_pt: torch.Tensor,
-        reference_eta: torch.Tensor,
-        reference_phi: torch.Tensor,
-        reference_energy: torch.Tensor,
-    ) -> torch.Tensor:
-        reference_mass = torch.sqrt(
-            torch.clamp(
-                reference_energy**2
-                - (reference_pt * torch.cosh(reference_eta)) ** 2,
-                min=1e-12,
-            )
-        )
-        pt = torch.exp(kinematics[:, 0].clamp(-5.0, 5.0)) * reference_pt
-        max_abs_eta = math.acosh(math.sqrt(torch.finfo(kinematics.dtype).max))
-        eta = (kinematics[:, 1] + reference_eta).clamp(
-            -max_abs_eta, max_abs_eta
-        )
-        phi = reference_phi + torch.atan2(kinematics[:, 2], kinematics[:, 3])
-        mass = torch.exp(kinematics[:, 4].clamp(-5.0, 5.0)) * reference_mass
-        return torch.stack(
-            [
-                pt * torch.cos(phi),
-                pt * torch.sin(phi),
-                pt * torch.sinh(eta),
-                torch.sqrt((pt * torch.cosh(eta)) ** 2 + mass**2),
-            ],
-            dim=-1,
-        )
-
     def forward(
         self,
         outputs: dict,
@@ -572,12 +540,13 @@ class SetCriterion(nn.Module):
             reference_eta = kinematics_reference_p4["eta"].to(dtype=pred_kinematics.dtype, device=device)[pair_b]
             reference_phi = kinematics_reference_p4["phi"].to(dtype=pred_kinematics.dtype, device=device)[pair_b]
             reference_energy = kinematics_reference_p4["energy"].to(dtype=pred_kinematics.dtype, device=device)[pair_b]
-            pred_p4 = self._decode_kinematics(
+            pred_p4 = decode_kinematics(
                 pred_kinematics[pair_b, pair_q],
                 reference_pt,
                 reference_eta,
                 reference_phi,
                 reference_energy,
+                clamp_log_ratios=True,
             )
             pred_parent_p4 = pred_p4.new_zeros((batch_size, 4)).index_add(0, pair_b, pred_p4)
             pred_px, pred_py, pred_pz, pred_energy = pred_parent_p4.unbind(dim=-1)

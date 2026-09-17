@@ -7,6 +7,7 @@ from scipy.optimize import linear_sum_assignment
 from mltau.models.ParTauDETR_module import ParTauDETRModule
 from mltau.tools.general import reinitialize_p4
 from mltau.tools.io.ParTauDETR_dataloader import ParticleTransformerDETRDataset
+from mltau.tools.partau_detr import decode_kinematics
 
 # from hydra import compose, initialize
 # from omegaconf import OmegaConf
@@ -122,12 +123,22 @@ def get_predicted_particles(outputs, reco_jet_p4s, obj_cls_trsh: float = 0.5):
 
     pred_meson_class = outputs["pred_meson_class_logits"].argmax(dim=-1)
 
-    pred_p4 = decode_kinematics(
-        kin=outputs["pred_kinematics"],
-        reco_pt=reco_jet_p4s["pt"],
-        reco_eta=reco_jet_p4s["eta"],
-        reco_phi=reco_jet_p4s["phi"],
-        reco_energy=reco_jet_p4s["energy"],
+    pred_p4_tensor = decode_kinematics(
+        outputs["pred_kinematics"],
+        reco_jet_p4s["pt"],
+        reco_jet_p4s["eta"],
+        reco_jet_p4s["phi"],
+        reco_jet_p4s["energy"],
+    )
+    pred_p4 = vector.awk(
+        ak.zip(
+            {
+                "px": pred_p4_tensor[..., 0],
+                "py": pred_p4_tensor[..., 1],
+                "pz": pred_p4_tensor[..., 2],
+                "energy": pred_p4_tensor[..., 3],
+            }
+        )
     )
 
     pred_p4 = ak.drop_none(ak.mask(pred_p4, pred_mask))
@@ -147,12 +158,22 @@ def get_true_particles(targets, reco_jet_p4s):
     target_meson_class = targets["particles_meson_class_ohe"].argmax(dim=-1)
     target_meson_class = ak.drop_none(ak.mask(target_meson_class, target_mask))
 
-    true_p4 = decode_kinematics(
-        kin=targets["particles_kinematics"],
-        reco_pt=reco_jet_p4s["pt"],
-        reco_eta=reco_jet_p4s["eta"],
-        reco_phi=reco_jet_p4s["phi"],
-        reco_energy=reco_jet_p4s["energy"],
+    true_p4_tensor = decode_kinematics(
+        targets["particles_kinematics"],
+        reco_jet_p4s["pt"],
+        reco_jet_p4s["eta"],
+        reco_jet_p4s["phi"],
+        reco_jet_p4s["energy"],
+    )
+    true_p4 = vector.awk(
+        ak.zip(
+            {
+                "px": true_p4_tensor[..., 0],
+                "py": true_p4_tensor[..., 1],
+                "pz": true_p4_tensor[..., 2],
+                "energy": true_p4_tensor[..., 3],
+            }
+        )
     )
     true_p4 = ak.drop_none(ak.mask(true_p4, target_mask))
     return true_p4, target_charge, target_meson_class
@@ -239,56 +260,6 @@ def match_particles(
     )
 
 
-def decode_kinematics(
-    kin: torch.Tensor,
-    reco_pt: torch.Tensor,
-    reco_eta: torch.Tensor,
-    reco_phi: torch.Tensor,
-    reco_energy: torch.Tensor,
-) -> ak.Array:
-    """
-    Convert 5D kinematics target/predictions back to easy to understand p4.
-
-    Input kin order:
-      [log(pt_dau/pt_jet), delta_eta, sin(delta_phi), cos(delta_phi), log(m_dau/m_jet)]
-    """
-    eps = 1e-6
-
-    pt_jet = reco_pt[:, None]
-    eta_jet = reco_eta[:, None]
-    phi_jet = reco_phi[:, None]
-
-    mass_jet = torch.sqrt(
-        torch.clamp(reco_energy**2 - (reco_pt * torch.cosh(reco_eta)) ** 2, min=0.0)
-    )
-    mass_jet = torch.clamp(mass_jet, min=eps)[:, None]
-
-    log_pt_ratio = kin[..., 0]
-    delta_eta = kin[..., 1]
-    sin_dphi = kin[..., 2]
-    cos_dphi = kin[..., 3]
-    log_mass_ratio = kin[..., 4]
-
-    pt = torch.exp(log_pt_ratio) * pt_jet
-    eta = delta_eta + eta_jet
-    dphi = torch.atan2(sin_dphi, cos_dphi)
-
-    phi = phi_jet + dphi
-    phi = torch.atan2(torch.sin(phi), torch.cos(phi))
-
-    mass = torch.exp(log_mass_ratio) * mass_jet
-
-    pred_p4 = vector.awk(
-        ak.zip(
-            {
-                "pt": pt,
-                "eta": eta,
-                "phi": phi,
-                "mass": mass,
-            }
-        )
-    )
-    return pred_p4
 
 
 def p4_from_components(p4):
