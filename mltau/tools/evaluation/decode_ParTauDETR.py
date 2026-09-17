@@ -24,7 +24,7 @@ DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 
 
 def p4_from_components(components: torch.Tensor) -> ak.Array:
-    """Create Awkward four-vectors from Cartesian Torch components."""
+    """Convert 4-momentum from PyTorch tensor to Awkward array."""
     return vector.awk(
         ak.zip(
             {
@@ -38,7 +38,7 @@ def p4_from_components(components: torch.Tensor) -> ak.Array:
 
 
 def sum_p4_components(p4: ak.Array) -> ak.Array:
-    """Sum each event's daughter four-vectors."""
+    """Sum of 4-momenta in Cartesian coordinates."""
     total = vector.awk(
         ak.zip(
             {
