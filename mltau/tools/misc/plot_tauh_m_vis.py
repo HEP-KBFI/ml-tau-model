@@ -1,5 +1,4 @@
 import awkward as ak
-import boost_histogram as bh
 import matplotlib.pyplot as plt
 import mplhep as hep
 import numpy as np
@@ -9,14 +8,6 @@ from mltau.tools import general as g
 INPUT_PATH = (
     "/scratch/persistent/laurits/ml-tau/20260818_tauDaughterDataset/z_test.parquet"
 )
-
-
-def to_bh(data, bins, cumulative=False):
-    h1 = bh.Histogram(bh.axis.Variable(bins))
-    h1.fill(data)
-    if cumulative:
-        h1[:] = np.sum(h1.values()) - np.cumsum(h1)
-    return h1
 
 
 data = ak.from_parquet(INPUT_PATH)

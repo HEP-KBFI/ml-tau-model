@@ -2,14 +2,27 @@ dataset:
     max_cands: 20
     num_features: 17
     max_tau_daughters: 8
-    data_dir: /scratch/project_465001293/0914_ParTauDETR_dataset/
-    # data_dir: /scratch/persistent/laurits/ml-tau/0914_ParTauDETR_dataset/
+     # Negative value disables the pT cut
+     # NB! When enabling the cut, the charge, DM and 4-momentum that is
+     # obtained by aggregating generator-level constituents passing the pT
+     # cut might differ from the charge, DM and 4-momentum of the visible
+     # generator-level tau that's stored in the dataset. The correct solution
+     # would be to rederive the target charge, DM and 4-momentum of the visible
+     # generator-level tau after the pT cut. Note that this is only an issue if
+     # the pT cut is enabled and weight_parent_* weights are positive.
+    tau_daughter_pt_cut: -1.0
+    data_dir: /scratch/persistent/karl/ml-tau/0915_ParTauDETR_dataset/
 
-    # PDG classes for daughter one-hot encoding (order defines class index).
-    # Single source of truth: the dataloader builds particles_pdg_ohe from this,
-    # ParTauDETRModule sizes its PDG head from len(...), and predict_step decodes
-    # class indices back to PDG ids through it.
-    tau_daughter_pdg_ids: [211, 111, 321, 311, 310, 130, 11, 13, 22, 2212, 2112, 221, 323, 223]
+    # Meson classes for daughter one-hot encoding. Mapping order defines class
+    # indices and charges defines valid charge-head combinations. All unlisted
+    # decay products are discarded before target padding/truncation.
+    tau_daughter_pdg_ids:
+        charged:
+            pdg_ids: [211, 321]
+            charges: [-1, 1]
+        neutral:
+            pdg_ids: [111, 221, 311, 130, 310] # includes only 221 -> 22 22
+            charges: [0]
 
     # Cap how many jets each sample contributes to train+val. Keys are the
     # filename prefixes before "_train" (e.g. z_train_0003.parquet -> "z").

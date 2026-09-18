@@ -10,6 +10,10 @@ from omegaconf import DictConfig
 from torch.utils.data import DataLoader
 
 from mltau.tools.io import general as ig
+from mltau.tools.meson_classes import (
+    get_meson_class_groups,
+    pdg_to_meson_class_indices,
+)
 
 from mltau.tools.io.ParT_dataloader import (
     ParTDataModule,
@@ -36,8 +40,7 @@ class ParticleTransformerDETRDataset(ParticleTransformerDataset):
       - particles_kinematics: [N, T, 5] =
           [log(pt_dau/pt_jet), delta_eta(dau-jet), sin(delta_phi), cos(delta_phi), log(m_dau/m_jet)]
       - particles_charge_ohe: [N, T, 3] one-hot for charges [-1, 0, +1]
-      - particles_pdg_ohe: [N, T, N_PDG] one-hot over
-          cfg.dataset.tau_daughter_pdg_ids
+      - particles_meson_class_ohe: [N, T, C] one-hot over configured meson classes
 
     where T = cfg.dataset.max_tau_daughters if provided, otherwise inferred from
     the currently loaded row-group.
@@ -58,6 +61,7 @@ class ParticleTransformerDETRDataset(ParticleTransformerDataset):
         "gen_jet_tau_vis_daughter_pdgs",
         "gen_jet_tau_vis_daughter_charges",
         "gen_jet_tau_decaymode",
+        "gen_jet_tau_charge",
         "cls_weight",
     ]
 
@@ -68,21 +72,9 @@ class ParticleTransformerDETRDataset(ParticleTransformerDataset):
     CHARGE_TO_CLASS = {q: i for i, q in enumerate(CHARGE_CLASS_VALUES)}
 
     @property
-    def pdg_class_ids(self) -> list[int]:
-        """
-        PDG ids defining the one-hot target classes, in class-index order.
-
-        Read from `cfg.dataset.tau_daughter_pdg_ids`, which is the same key
-        ParTauDETRModule uses to size its PDG head and to build the lookup table
-        in predict_step. Keeping one source of truth means the targets, the head
-        width and the decoded predictions cannot silently disagree.
-        """
-        return [int(x) for x in self.cfg.dataset.tau_daughter_pdg_ids]
-
-    @property
-    def pdg_to_class(self) -> dict[int, int]:
-        """abs(PDG) -> class index. Sign is carried by the charge target."""
-        return {pdg: i for i, pdg in enumerate(self.pdg_class_ids)}
+    def pdg_class_groups(self) -> tuple[tuple[int, ...], ...]:
+        """Absolute PDG IDs grouped in configured class order."""
+        return get_meson_class_groups(self.cfg.dataset.tau_daughter_pdg_ids)
 
     def __init__(
         self,
@@ -313,13 +305,10 @@ class ParticleTransformerDETRDataset(ParticleTransformerDataset):
             out[q == val] = idx
         return out
 
-    def _pdg_to_class_indices(self, raw_pdg: np.ndarray) -> np.ndarray:
-        # Map by absolute PDG so that sign is represented by charge target.
-        out = np.full(raw_pdg.shape, -1, dtype=np.int64)
-        p_abs = np.abs(raw_pdg.astype(np.int64))
-        for pdg, idx in self.pdg_to_class.items():
-            out[p_abs == pdg] = idx
-        return out
+    def _pdg_to_meson_class_indices(self, raw_pdg: np.ndarray) -> np.ndarray:
+        return pdg_to_meson_class_indices(
+            raw_pdg, self.cfg.dataset.tau_daughter_pdg_ids
+        )
 
     def build_tensors(self, data: ak.Array):
         # -------------------------
@@ -426,9 +415,29 @@ class ParticleTransformerDETRDataset(ParticleTransformerDataset):
         # -------------------------
         # DETR set targets
         # -------------------------
-        daughter_p4 = data.gen_jet_tau_vis_daughter_p4s
         daughter_pdg_jag = data.gen_jet_tau_vis_daughter_pdgs
+        daughter_p4 = data.gen_jet_tau_vis_daughter_p4s
         daughter_charge_jag = data.gen_jet_tau_vis_daughter_charges
+
+        daughter_pt_cut = float(self.cfg.dataset.get("tau_daughter_pt_cut", -1.0))
+        if daughter_pt_cut >= 0.0 and len(daughter_p4.fields) > 0:
+            daughter_pt = self._get_record_field(daughter_p4, ["pt", "rho"])
+            passes_pt_cut = daughter_pt >= daughter_pt_cut
+            daughter_p4 = daughter_p4[passes_pt_cut]
+            daughter_pdg_jag = daughter_pdg_jag[passes_pt_cut]
+            daughter_charge_jag = daughter_charge_jag[passes_pt_cut]
+
+        daughter_pdg_abs = abs(daughter_pdg_jag)
+        supported_ids = [
+            pdg_id for pdg_ids in self.pdg_class_groups for pdg_id in pdg_ids
+        ]
+        supported_pdg = daughter_pdg_abs == supported_ids[0]
+        for pdg_id in supported_ids[1:]:
+            supported_pdg = supported_pdg | (daughter_pdg_abs == pdg_id)
+
+        daughter_p4 = daughter_p4[supported_pdg]
+        daughter_pdg_jag = daughter_pdg_jag[supported_pdg]
+        daughter_charge_jag = daughter_charge_jag[supported_pdg]
 
         daughter_counts = ak.to_numpy(ak.num(daughter_pdg_jag)).astype(np.int64)
         max_tau_daughters = self._get_max_tau_daughters(daughter_counts)
@@ -555,36 +564,44 @@ class ParticleTransformerDETRDataset(ParticleTransformerDataset):
             daughter_pdg = np.zeros((n_jets, n_slots), dtype=np.int64)
 
         charge_cls = self._charges_to_class_indices(daughter_charge)
-        pdg_cls = self._pdg_to_class_indices(daughter_pdg)
+        meson_class = self._pdg_to_meson_class_indices(daughter_pdg)
 
         # Prepare one-hot targets; unknown classes stay all-zero.
         n_charge = len(self.CHARGE_CLASS_VALUES)
-        n_pdg = len(self.pdg_class_ids)
+        n_meson_classes = len(self.pdg_class_groups)
         charge_ohe = np.zeros((*charge_cls.shape, n_charge), dtype=np.float32)
-        pdg_ohe = np.zeros((*pdg_cls.shape, n_pdg), dtype=np.float32)
+        meson_class_ohe = np.zeros(
+            (*meson_class.shape, n_meson_classes), dtype=np.float32
+        )
 
         valid_charge = charge_cls >= 0
-        valid_pdg = pdg_cls >= 0
+        valid_meson_class = meson_class >= 0
         if np.any(valid_charge):
             rows, cols = np.where(valid_charge)
             charge_ohe[rows, cols, charge_cls[rows, cols]] = 1.0
-        if np.any(valid_pdg):
-            rows, cols = np.where(valid_pdg)
-            pdg_ohe[rows, cols, pdg_cls[rows, cols]] = 1.0
+        if np.any(valid_meson_class):
+            rows, cols = np.where(valid_meson_class)
+            meson_class_ohe[rows, cols, meson_class[rows, cols]] = 1.0
 
         # Zero out padded daughters in one-hot tensors too.
         charge_ohe *= daughter_mask_np[..., None]
-        pdg_ohe *= daughter_mask_np[..., None]
+        meson_class_ohe *= daughter_mask_np[..., None]
 
         targets = {
             "particles_mask": torch.from_numpy(daughter_mask_np).bool(),
             "particles_kinematics": torch.from_numpy(daughter_kinematics_np).float(),
             "particles_charge_ohe": torch.from_numpy(charge_ohe).float(),
-            "particles_pdg_ohe": torch.from_numpy(pdg_ohe).float(),
+            "particles_meson_class_ohe": torch.from_numpy(meson_class_ohe).float(),
             # Jet-level tau-tagging label, following ParticleTransformerDataset:
             # -1 -> no genuine tau (background), >= 0 -> genuine tau (signal).
             "is_tau": torch.from_numpy(
                 (ak.to_numpy(data.gen_jet_tau_decaymode) != -1).astype(np.int64)
+            ),
+            "gen_jet_tau_charge": torch.from_numpy(
+                ak.to_numpy(data.gen_jet_tau_charge).astype(np.int64)
+            ),
+            "gen_jet_tau_decaymode": torch.from_numpy(
+                ak.to_numpy(data.gen_jet_tau_decaymode).astype(np.int64)
             ),
         }
 
