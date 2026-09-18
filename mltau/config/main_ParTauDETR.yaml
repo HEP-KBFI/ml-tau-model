@@ -46,7 +46,13 @@ logging:
         workspace: null
 
 model:
-    num_queries: 5 # up to 3 charged (Nch = 3) and 2 neutral (Nneu = 2) mesons => max DM = 12
+    # 8 = dataset.max_tau_daughters for now; to be reduced (pull request 30
+    # proposed 5: three charged + two neutral mesons) once
+    # `mltau/scripts/check_query_budget.py` has measured the daughter
+    # multiplicity of the production. The matcher hands out min(num_queries,
+    # n_targets) pairs, so a tau with more daughters than queries keeps targets
+    # no query can reach: change this and max_tau_daughters together.
+    num_queries: 8
     num_charge_classes: 3
     num_kinematics_components: 5
     # The PDG head width is derived from dataset.tau_daughter_pdg_ids, which is
@@ -81,23 +87,36 @@ model:
             cost_meson_class_ce: 1.0
             # Per-component weights of the kinematics matching cost, over
             # [log_pt_ratio, delta_eta, sin_dphi, cos_dphi, log_mass_ratio].
-            # Roughly 1/sigma, so each component contributes comparably instead
-            # of pt and mass deciding ~95% of every assignment. Measured on
-            # z_train: sigma = [0.875, 0.077, 0.071, 0.028, 1.064].
-            # sin_dphi and cos_dphi MUST share a weight: together they encode the
-            # angle, and the chord distance between two (sin, cos) pairs is only
-            # a proper angular metric when both components count equally.
-            # Down-weighting cos would break the periodicity the pair exists to
-            # provide. Its contribution is naturally small for collimated
-            # daughters (cos ~ 1 - dphi^2/2, so |dcos| is second order) and grows
-            # exactly when it should, for daughters far from the jet axis.
-            # log_mass_ratio is deliberately weighted well below 1/sigma, unlike
-            # the others: only 4.8% of its variance comes from the daughter's
-            # identity (the rest is the jet mass, shared by every query in the
-            # jet), so it carries almost nothing for deciding WHICH daughter a
-            # query should take. This is the one place where the matching cost
-            # and the regression loss should not use the same weights.
-            kinematics_component_weights: [1.0, 20.0, 20.0, 20.0, 0.2]
+            # These decide WHICH daughter a query is trained towards, so what
+            # matters is not that every component counts equally but that the
+            # assignment stays stable while the model is still wrong. Tau
+            # daughters are collimated (measured on z_train: sigma =
+            # [0.875, 0.077, 0.071, 0.028, 1.064]), so while the angular error is
+            # of order sigma, position cannot tell two daughters apart and pt
+            # and identity -- learned first -- have to carry the decision.
+            # Angles at 1/sigma (20) drowned them out: on synthetic daughters
+            # with 1-sigma noise the intended assignment was recovered 71% of
+            # the time and 46% of assignments changed between two noise draws,
+            # against 93% / 11% for the first model's unweighted cost. With 5
+            # and the clipped class cost below: 94% / 10% early, 99.4% / 0.9%
+            # late. sin_dphi and cos_dphi MUST share a weight (together they
+            # encode the angle). log_mass_ratio stays low: only ~5% of its
+            # variance is the daughter's own, the rest is the jet mass shared by
+            # every query in the jet, so it says little about WHICH daughter.
+            kinematics_component_weights: [1.0, 5.0, 5.0, 5.0, 0.2]
+            # How the charge and PDG terms enter the MATCHING cost (not the
+            # loss). "clipped_nll" is -log p(true class) clamped at
+            # classification_cost_clip: sharp enough that identity decides a tie
+            # in position (a wrong class at p = 0.01 costs 4.6, a soft p = 0.6
+            # costs 0.5), but bounded, so a confidently wrong query cannot pay an
+            # arbitrarily large cost and flip a jet's assignment late in
+            # training -- the unbounded "nll" did exactly that (its share of the
+            # cost grew 26% -> 62% as predictions sharpened). "prob" is DETR's
+            # 1 - p, bounded in [0, 1] but too weak here: the class terms lose to
+            # angular noise early on (the 71% above). Configurable so the three
+            # can be compared.
+            classification_cost: clipped_nll
+            classification_cost_clip: 5.0
         loss:
             weight_objectness: 1.0
             weight_tau_id: 1.0
@@ -112,6 +131,10 @@ model:
             eos_coef: 0.1
         inference:
             score_threshold: 0.85
+            # p(tau) from the tauID head above which a jet's predicted daughters
+            # are kept in predict_step. Objectness is trained on signal jets
+            # only, so whether a jet has daughters at all is the tagger's call.
+            tau_id_threshold: 0.5
 
     tau_loss:
         l_m: 0.2 # mass-term weight in the kinematics loss

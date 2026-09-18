@@ -1,4 +1,39 @@
 output_dir: /home/laurits/tmp/DETR_training
+# Loss configuration shared by MultiParTau and SingleParTau (ParTauDETR has the
+# same block under model.tau_loss in main_ParTauDETR.yaml). See TauLoss.from_config.
+tau_loss:
+    l_m: 0.2 # legacy mass weight; only used when kinematics_weights is absent
+    label_smoothing: 0.1
+    # Residual scales for the kinematics regression loss, one per component, in
+    # that component's own units. Each residual is divided by its scale before
+    # the Huber, so every component enters as "error in units of the spread of
+    # its own target", the Huber knee sits at one spread, and the weights below
+    # are comparable. They are properties of the DATA, not tuning knobs, and
+    # the tau-level targets here are NOT the daughter-level ones of the DETR:
+    # delta_eta / delta_phi of the visible tau relative to the reco jet are an
+    # order of magnitude narrower than a daughter's. Measure them on the
+    # training sample (signal jets; a few minutes on the login node):
+    #
+    #   ./run.sh python3 mltau/scripts/measure_kinematics_scales.py --model ParT
+    #
+    # and paste the printed block here. While this is null the loss runs in its
+    # legacy unscaled form (Huber in raw units, linear phi chord) and warns at
+    # start-up.
+    kinematics_scales: null
+    # kinematics_scales:
+    #     log_pt: <sigma of log(pt_vis / pt_jet)>
+    #     delta_eta: <sigma of eta_vis - eta_jet>
+    #     phi_chord: <sigma of delta phi>
+    #     log_mass: <sigma of log(m_vis / m_jet)>
+    # Per-component weights. With measured scales equal weights give each
+    # component an equal share; 0.2 on the mass keeps the historical emphasis
+    # until there is a reason to change it.
+    kinematics_weights:
+        log_pt: 1.0
+        delta_eta: 1.0
+        phi_chord: 1.0
+        log_mass: 0.2
+
 defaults:
     - _self_
     - metrics/metrics

@@ -32,7 +32,8 @@ class ParTauModule(L.LightningModule):
             use_amp=False,
             metric="theta-phi",
         )
-        self.tau_loss = TauLoss(l_m=0.2, label_smoothing=0.1)
+        # Loss configuration comes from cfg.tau_loss; see TauLoss.from_config.
+        self.tau_loss = TauLoss.from_config(cfg.get("tau_loss"), owner="SingleParTau")
 
     def _loss_key(self):
         task_name = "tau_id" if self.task == "is_tau" else self.task

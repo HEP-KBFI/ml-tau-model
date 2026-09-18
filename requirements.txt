@@ -14,3 +14,4 @@ boost-histogram
 mplhep
 numba
 lightning
+particle  # PDG property lookups used by ml-tau-data's decay-mode classifier

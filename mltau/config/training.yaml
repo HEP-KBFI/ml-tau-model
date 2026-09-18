@@ -82,6 +82,39 @@ training:
         # batch sees both classes. Costs proportionally more worker RAM.
         mixing_reads: 4
 
+    # Objectness threshold calibration. The value in
+    # model.detr.inference.score_threshold is the starting point and the
+    # fallback; before every validation it is rescanned for the best mean
+    # per-jet F1 of matched daughters, the same figure of merit the inference
+    # notebook scans. Done on recent TRAIN batches, buffered during training so
+    # it costs no extra forward passes -- and on train rather than validation,
+    # because choosing the operating point on the split you then report would
+    # flatter every number downstream of it.
+    threshold_scan:
+        enabled: true
+        jets: 100000
+        low: 0.5
+        high: 0.9
+        points: 9
+
+    # Jets kept per validation epoch for the jet-level figures (charge and decay
+    # mode confusion matrices, tau kinematics residuals, tagging ROC). Only
+    # per-jet scalars are retained, and the distributions converge long before a
+    # full multi-million-jet validation split.
+    jet_level_eval_jets: 200000
+
+    # Forward-only throughput of the trained model, measured after fit() and
+    # written into metrics.json. A scaling study needs it alongside the loss:
+    # a bigger model is only worth it per unit of inference cost.
+    inference_benchmark:
+        enabled: true
+        # Batches timed after the warm-up ones. 20 x batch_size jets is plenty
+        # for a stable mean and costs seconds.
+        batches: 20
+        # Discarded: the first forward pays for kernel compilation and allocator
+        # warm-up, which would otherwise dominate the mean at this batch count.
+        warmup: 3
+
     input_scaling:
         # Standardise the continuous candidate features to zero mean and unit
         # variance. The scaler is fitted ONCE, on the training split, saved to

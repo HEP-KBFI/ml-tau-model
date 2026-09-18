@@ -52,13 +52,67 @@ def sum_p4_components(p4: ak.Array) -> ak.Array:
     return total
 
 
-def get_predicted_particles(outputs, reco_jet_p4s, obj_cls_trsh: float = 0.5):
+def _to_numpy(tensor) -> np.ndarray:
+    """Dense numpy view of a torch tensor, wherever it lives."""
+    return tensor.detach().cpu().numpy()
+
+
+def _flat_view(arr: ak.Array) -> tuple[np.ndarray, np.ndarray]:
+    """
+    Flat buffer plus per-event offsets for a jagged array.
+
+    Leaving awkward ONCE is the whole point. Iterating a jagged array in Python
+    costs ~2.5 ms per event here, because every element access rebuilds a
+    record and every `np.asarray(evt.eta)` goes back through vector's behaviour
+    dispatch; the same arithmetic on numpy slices costs ~30 us. That is the
+    difference between a 21-point threshold scan taking an hour and a half and
+    taking a minute.
+    """
+    counts = ak.to_numpy(ak.num(arr))
+    offsets = np.concatenate([[0], np.cumsum(counts)]).astype(np.int64)
+    return ak.to_numpy(ak.flatten(arr)), offsets
+
+
+def _assign(
+    p_eta, p_phi, p_ch, p_cls, t_eta, t_phi, t_ch, t_cls, max_dr, mismatch_penalty
+) -> tuple[np.ndarray, np.ndarray]:
+    """
+    Hungarian match for ONE event. All arguments are small 1-D numpy arrays.
+
+    Returns within-event indices, so the result still indexes the caller's
+    per-event lists.
+    """
+    if p_eta.size == 0 or t_eta.size == 0:
+        empty = np.empty(0, dtype=np.int64)
+        return empty, empty
+
+    deta = np.abs(p_eta[:, None] - t_eta[None, :])
+    dphi = np.abs(p_phi[:, None] - t_phi[None, :])
+    dphi = np.minimum(dphi, 2 * np.pi - dphi)
+    dr = np.sqrt(deta**2 + dphi**2)  # [n_pred, n_true]
+
+    ch_mismatch = (p_ch[:, None] != t_ch[None, :]).astype(np.float64)
+    cls_mismatch = (p_cls[:, None] != t_cls[None, :]).astype(np.float64)
+
+    pred_idx, true_idx = linear_sum_assignment(
+        dr + mismatch_penalty * (ch_mismatch + cls_mismatch)
+    )
+    valid = dr[pred_idx, true_idx] <= max_dr
+    return pred_idx[valid].astype(np.int64), true_idx[valid].astype(np.int64)
+
+
+def _predicted_components(outputs, reco_jet_p4s):
+    """
+    Dense [N, Q] predictions, before any objectness threshold is applied.
+
+    Split out because none of it depends on the threshold: a scan would
+    otherwise redo the softmaxes, the argmaxes and the kinematics decode once
+    per point.
+    """
     object_probs = torch.softmax(outputs["pred_logits"], dim=-1)
     pred_scores = object_probs[..., 0]
-    pred_mask = pred_scores >= obj_cls_trsh
 
     pred_charge_probs = torch.softmax(outputs["pred_charge_logits"], dim=-1)
-
     pred_charge_cls = pred_charge_probs.argmax(dim=-1)
     charge_lut = outputs["pred_charge_logits"].new_tensor([-1, 0, 1], dtype=torch.long)
     pred_charge = charge_lut[pred_charge_cls]
@@ -73,6 +127,41 @@ def get_predicted_particles(outputs, reco_jet_p4s, obj_cls_trsh: float = 0.5):
         reco_jet_p4s["energy"],
     )
     pred_p4 = p4_from_components(pred_p4_tensor)
+    return pred_scores, pred_p4, pred_charge, pred_meson_class
+
+
+def tau_scores(outputs):
+    """p(tau) per jet from the tauID head, or None if the model has no head."""
+    if "is_tau" not in outputs:
+        return None
+    return torch.softmax(outputs["is_tau"].float(), dim=-1)[..., 1]
+
+
+def get_predicted_particles(
+    outputs,
+    reco_jet_p4s,
+    obj_cls_trsh: float = 0.5,
+    tau_scores=None,
+    tau_threshold: float | None = None,
+):
+    """
+    Predicted daughters per jet: the queries whose objectness passes
+    `obj_cls_trsh`, optionally only on jets the tauID head accepts.
+
+    Whether a jet is a tau at all is the tauID head's decision. Objectness is
+    trained on signal jets only, so on a background jet its scores are
+    untrained and the selection they give is meaningless. Pass `tau_scores`
+    (p(tau) per jet, see `tau_scores(outputs)`) together with `tau_threshold`
+    to empty the daughter set of rejected jets; leave them out for a study
+    restricted to true tau jets, where the tagger has nothing to add.
+    """
+    pred_scores, pred_p4, pred_charge, pred_meson_class = _predicted_components(
+        outputs, reco_jet_p4s
+    )
+    pred_mask = pred_scores >= obj_cls_trsh
+    if tau_scores is not None and tau_threshold is not None:
+        tagged = torch.as_tensor(tau_scores).to(pred_mask.device) >= tau_threshold
+        pred_mask = pred_mask & tagged[:, None]
 
     pred_p4 = ak.drop_none(ak.mask(pred_p4, pred_mask))
     pred_charge = ak.drop_none(ak.mask(pred_charge, pred_mask))
@@ -133,52 +222,27 @@ def match_particles(
     Returns:
         ak.Array with fields ``pred_idx``, ``true_idx`` (jagged int per event).
     """
+    p_eta, p_off = _flat_view(pred_p4.eta)
+    p_phi, _ = _flat_view(pred_p4.phi)
+    p_ch, _ = _flat_view(pred_charge)
+    p_cls, _ = _flat_view(pred_meson_class)
+    t_eta, t_off = _flat_view(true_p4.eta)
+    t_phi, _ = _flat_view(true_p4.phi)
+    t_ch, _ = _flat_view(true_charge)
+    t_cls, _ = _flat_view(true_meson_class)
+
     pred_idx_list = []
     true_idx_list = []
-
-    for evt_p, evt_t, p_ch, t_ch, pred_class, true_class in zip(
-        pred_p4,
-        true_p4,
-        pred_charge,
-        true_charge,
-        pred_meson_class,
-        true_meson_class,
-    ):
-        n_pred = len(evt_p)
-        n_true = len(evt_t)
-
-        # if n_pred == 0 or n_true == 0:
-        #     pred_idx_list.append(ak.Array([], dtype=np.int64))
-        #     true_idx_list.append(ak.Array([], dtype=np.int64))
-        #     continue
-
-        pred_eta = np.asarray(evt_p.eta)
-        pred_phi = np.asarray(evt_p.phi)
-        true_eta = np.asarray(evt_t.eta)
-        true_phi = np.asarray(evt_t.phi)
-
-        deta = np.abs(pred_eta[:, None] - true_eta[None, :])
-        dphi = np.abs(pred_phi[:, None] - true_phi[None, :])
-        dphi = np.minimum(dphi, 2 * np.pi - dphi)
-        dr = np.sqrt(deta**2 + dphi**2)  # [n_pred, n_true]
-
-        ch_mismatch = (np.asarray(p_ch)[:, None] != np.asarray(t_ch)[None, :]).astype(
-            np.float64
+    for i in range(len(p_off) - 1):
+        a, b = p_off[i], p_off[i + 1]
+        c, d = t_off[i], t_off[i + 1]
+        pred_idx, true_idx = _assign(
+            p_eta[a:b], p_phi[a:b], p_ch[a:b], p_cls[a:b],
+            t_eta[c:d], t_phi[c:d], t_ch[c:d], t_cls[c:d],
+            max_dr, mismatch_penalty,
         )
-        meson_class_mismatch = (
-            np.asarray(pred_class)[:, None] != np.asarray(true_class)[None, :]
-        ).astype(np.float64)
-
-        cost = dr + mismatch_penalty * (ch_mismatch + meson_class_mismatch)
-
-        pred_idx, true_idx = linear_sum_assignment(cost)
-
-        valid = dr[pred_idx, true_idx] <= max_dr
-        pred_idx = pred_idx[valid]
-        true_idx = true_idx[valid]
-
-        pred_idx_list.append(ak.Array(pred_idx.astype(np.int64)))
-        true_idx_list.append(ak.Array(true_idx.astype(np.int64)))
+        pred_idx_list.append(pred_idx)
+        true_idx_list.append(true_idx)
 
     return ak.Array(
         {"pred_idx": ak.Array(pred_idx_list), "true_idx": ak.Array(true_idx_list)}
@@ -284,10 +348,8 @@ def verbose_true_pred_comparison(
         )
 
 
-def calculate_metrics(matches, target_meson_class, pred_meson_class):
-    n_true = ak.num(target_meson_class).to_numpy()
-    n_pred = ak.num(pred_meson_class).to_numpy()
-    n_matched = ak.num(matches.pred_idx).to_numpy()
+def _f1_from_counts(n_matched, n_pred, n_true) -> float:
+    """Mean per-jet F1 of matched daughters. One definition, two call paths."""
     efficiency = np.divide(
         n_matched, n_true, out=np.zeros_like(n_true, dtype=float), where=n_true != 0
     )
@@ -298,6 +360,14 @@ def calculate_metrics(matches, target_meson_class, pred_meson_class):
     denom = efficiency + purity
     f1 = np.divide(num, denom, out=np.zeros_like(denom, dtype=float), where=denom != 0)
     return np.mean(f1)
+
+
+def calculate_metrics(matches, target_meson_class, pred_meson_class):
+    return _f1_from_counts(
+        ak.num(matches.pred_idx).to_numpy(),
+        ak.num(pred_meson_class).to_numpy(),
+        ak.num(target_meson_class).to_numpy(),
+    )
 
 
 def model_inference(checkpoint_path, data_path, cfg):
@@ -322,13 +392,29 @@ def model_inference(checkpoint_path, data_path, cfg):
 
 
 def create_predictions(
-    outputs, targets, _weights, reco_jet_p4s, cfg, obj_cls_trsh=0.885
+    outputs,
+    targets,
+    _weights,
+    reco_jet_p4s,
+    cfg,
+    obj_cls_trsh=0.885,
+    tau_threshold: float | None = None,
 ):
+    """
+    True and predicted daughter sets.
+
+    `tau_threshold` gates the predicted set with the tauID head (see
+    get_predicted_particles). Set it whenever the sample contains background
+    jets; on a signal-only sample it only removes the true taus the tagger
+    misses, which is a tagging inefficiency and not a reconstruction one.
+    """
     targets = get_true_particles(targets, reco_jet_p4s)
     predictions = get_predicted_particles(
         outputs,
         reco_jet_p4s,
         obj_cls_trsh=obj_cls_trsh,
+        tau_scores=tau_scores(outputs) if tau_threshold is not None else None,
+        tau_threshold=tau_threshold,
     )
     true_daughters = TauDaughter(*targets)
     pred_daughters = TauDaughter(*predictions)
@@ -362,39 +448,78 @@ def scan_thresholds(
     true_p4,
     target_charge,
     target_meson_class,
-    cfg: DictConfig,
-):
-    thresholds = np.linspace(0.9, 0.8, 21)
-    f1_scores = []
-    for obj_cls_trsh in tqdm.tqdm(thresholds):
-        pred_p4, pred_charge, pred_meson_class = get_predicted_particles(
-            outputs,
-            reco_jet_p4s,
-            obj_cls_trsh=obj_cls_trsh,
-        )
-        matches = match_particles(
-            pred_p4,
-            true_p4,
-            pred_charge,
-            target_charge,
-            pred_meson_class,
-            target_meson_class,
-            max_dr=0.4,
-        )
-        f1 = calculate_metrics(matches, target_meson_class, pred_meson_class)
-        f1_scores.append(f1)
-    best_thrsh_idx = np.argmax(f1_scores)
-    best_thrsh = thresholds[best_thrsh_idx]
+    cfg: DictConfig | None = None,
+    thresholds=None,
+    max_dr: float = 0.4,
+    mismatch_penalty: float = 5.0,
+) -> float:
+    """
+    Objectness threshold maximising the mean per-jet daughter F1.
 
-    pred_p4, pred_charge, pred_meson_class = get_predicted_particles(
-        outputs, reco_jet_p4s, obj_cls_trsh=best_thrsh
+    Everything that does not depend on the threshold is computed once, outside
+    the loop: the softmaxes, the argmaxes and the kinematics decode (dense
+    [N, Q], since no mask has been applied yet), and the truth side flattened
+    to numpy. A point in the scan is then only a per-event boolean selection
+    plus the assignment itself.
+
+    Doing it the other way -- calling get_predicted_particles and
+    match_particles per point, each walking jagged awkward arrays element by
+    element -- costs about 4 minutes per point at 100k jets, so a 21-point scan
+    ran for an hour and a half without tqdm ever advancing past 0/21.
+
+    `cfg` is accepted for call-site compatibility and not used.
+    """
+    thresholds = np.linspace(0.9, 0.8, 21) if thresholds is None else np.asarray(thresholds)
+
+    scores, pred_p4, pred_charge, pred_meson_class = _predicted_components(
+        outputs, reco_jet_p4s
     )
-    matches = match_particles(
-        pred_p4,
-        true_p4,
-        pred_charge,
-        target_charge,
-        pred_meson_class,
-        target_meson_class,
-        max_dr=0.4,
-    )  # Matches is needed to compare against true particle.
+    scores = _to_numpy(scores)  # [N, Q]
+    p_eta = ak.to_numpy(pred_p4.eta)  # [N, Q]; dense, nothing masked yet
+    p_phi = ak.to_numpy(pred_p4.phi)
+    p_ch = _to_numpy(pred_charge)
+    p_cls = _to_numpy(pred_meson_class)
+
+    t_eta, t_off = _flat_view(true_p4.eta)
+    t_phi, _ = _flat_view(true_p4.phi)
+    t_ch, _ = _flat_view(target_charge)
+    t_cls, _ = _flat_view(target_meson_class)
+    n_true = np.diff(t_off)
+
+    # True tau jets only. Objectness is trained on signal jets alone -- the
+    # tauID head decides tau vs not -- so on background jets its scores are
+    # untrained and every query above threshold would count as a false
+    # positive against zero true daughters; with a 7:1 mix that would set the
+    # threshold instead of the matching quality on taus. Every true tau has at
+    # least one visible daughter, so n_true > 0 is the tag.
+    signal = n_true > 0
+    if not signal.all():
+        print(
+            f"threshold scan: {int(signal.sum()):,} jets with true daughters, "
+            f"ignoring {int((~signal).sum()):,} without.",
+            flush=True,
+        )
+
+    n_events = scores.shape[0]
+    f1_scores = []
+    for obj_cls_trsh in tqdm.tqdm(thresholds, desc="threshold scan", unit="point"):
+        keep = scores >= obj_cls_trsh  # [N, Q]
+        n_pred = keep.sum(axis=1)
+        n_matched = np.zeros(n_events, dtype=np.int64)
+        # Only jets that can produce a match are worth solving.
+        for i in np.nonzero((n_pred > 0) & (n_true > 0))[0]:
+            sel = keep[i]
+            c, d = t_off[i], t_off[i + 1]
+            pred_idx, _ = _assign(
+                p_eta[i][sel], p_phi[i][sel], p_ch[i][sel], p_cls[i][sel],
+                t_eta[c:d], t_phi[c:d], t_ch[c:d], t_cls[c:d],
+                max_dr, mismatch_penalty,
+            )
+            n_matched[i] = pred_idx.size
+        f1_scores.append(
+            _f1_from_counts(n_matched[signal], n_pred[signal], n_true[signal])
+        )
+
+    best_thrsh = float(thresholds[int(np.argmax(f1_scores))])
+    print(f"best objectness threshold {best_thrsh:.4f} (F1 {max(f1_scores):.4f})")
+    return best_thrsh

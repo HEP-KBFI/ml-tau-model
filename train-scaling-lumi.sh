@@ -1,19 +1,27 @@
 #!/bin/bash
-# Array runner for the ParTauDETR scaling study. Submitted by
-# submit_scaling_study.sh, which exports MANIFEST, OUT_ROOT and MAX_STEPS and
-# sets --array.
+# Runner for one point of the ParTauDETR scaling study. Submitted once per run
+# by submit_scaling_study.sh, which exports the whole configuration:
+# STAGE, N_SIG, N_BKG, SEED, RUN_NAME, OUT_DIR, MAX_EPOCHS and optionally
+# MAX_STEPS.
 #
-# Not meant to be sbatch'ed directly: it reads its configuration from the
-# manifest line matching $SLURM_ARRAY_TASK_ID.
+# It can be sbatch'ed by hand to repeat a single point, provided those are
+# exported:
+#   sbatch --export=ALL,STAGE=1,N_SIG=5000000,N_BKG=30000000,SEED=1,\
+#          RUN_NAME=redo,OUT_DIR=/scratch/.../redo,MAX_EPOCHS=100 \
+#          train-scaling-lumi.sh
 #
 # Resources are identical to train-gpu-lumi.sh so that timings are comparable
 # across the study; see that file for why 7 cores / 60 G.
 #SBATCH --job-name=scal
 #SBATCH --account=project_465001293
-# Sized from the largest configuration: ~24-36 h observed. small-g allows
-# 3 days, so 48 h leaves margin without asking for the maximum (shorter
-# requests schedule better on a shared partition).
-#SBATCH --time=48:00:00
+# 3 days is the maximum small-g allows, and the study asks for it because the
+# largest configuration is estimated at ~42 h: 5M signal + 30M background is
+# 2,493 steps per epoch at batch 12288, and 100 epochs of that is ~249k steps at
+# the 608 ms/step measured on an L40. A shorter request would schedule sooner
+# but puts the stage-1 points within a few hours of the wall clock, and a run
+# lost at 40 h costs far more than the queue wait. Re-check once the first run
+# records wall_seconds and global_step in metrics.json on MI250X.
+#SBATCH --time=72:00:00
 #SBATCH --nodes=1
 #SBATCH --ntasks-per-node=1
 #SBATCH --partition=small-g
@@ -21,31 +29,33 @@
 #SBATCH --cpus-per-task=7
 #SBATCH --mem=60G
 #SBATCH --no-requeue
-#SBATCH -o logs/scaling/slurm-%A_%a.out
+#SBATCH -o logs/scaling/slurm-%x-%j.out
 
 set -euo pipefail
 
 cd /scratch/project_465001293/ml-tau-model
 mkdir -p logs/scaling
 
-: "${MANIFEST:?must be exported by submit_scaling_study.sh}"
-: "${OUT_ROOT:?must be exported by submit_scaling_study.sh}"
-: "${MAX_STEPS:?must be exported by submit_scaling_study.sh}"
+: "${STAGE:?must be exported by submit_scaling_study.sh}"
+: "${N_SIG:?must be exported by submit_scaling_study.sh}"
+: "${N_BKG:?must be exported by submit_scaling_study.sh}"
+: "${SEED:?must be exported by submit_scaling_study.sh}"
+: "${RUN_NAME:?must be exported by submit_scaling_study.sh}"
+: "${OUT_DIR:?must be exported by submit_scaling_study.sh}"
+: "${MAX_EPOCHS:?must be exported by submit_scaling_study.sh}"
+# May be unset: an epoch-budgeted study passes max_steps=null.
+MAX_STEPS="${MAX_STEPS:-}"
 
-LINE=$(sed -n "${SLURM_ARRAY_TASK_ID}p" "$MANIFEST")
-[[ -n "$LINE" ]] || { echo "no manifest line ${SLURM_ARRAY_TASK_ID}" >&2; exit 1; }
-read -r STAGE N_SIG N_BKG SEED RUN_NAME <<<"$LINE"
-
-OUT_DIR="${OUT_ROOT}/${RUN_NAME}"
 mkdir -p "$OUT_DIR"
 
 echo "=============================================================="
 echo " run        : $RUN_NAME"
-echo " stage      : $STAGE   task $SLURM_ARRAY_TASK_ID of $MANIFEST"
+echo " stage      : $STAGE"
 echo " n_sig      : $N_SIG"
 echo " n_bkg      : $N_BKG"
 echo " seed       : $SEED"
-echo " max_steps  : $MAX_STEPS"
+echo " max_epochs : $MAX_EPOCHS"
+echo " max_steps  : ${MAX_STEPS:-none (epoch-budgeted)}"
 echo " output_dir : $OUT_DIR"
 echo "=============================================================="
 
@@ -92,8 +102,9 @@ cat > "${OUT_DIR}/run_meta.json" <<JSON
   "n_sig_requested": ${N_SIG},
   "n_bkg_requested": ${N_BKG},
   "seed": ${SEED},
-  "max_steps": ${MAX_STEPS},
-  "slurm_job": "${SLURM_ARRAY_JOB_ID:-}_${SLURM_ARRAY_TASK_ID:-}",
+  "max_epochs": ${MAX_EPOCHS},
+  "max_steps": ${MAX_STEPS:-null},
+  "slurm_job": "${SLURM_JOB_ID:-}",
   "partition": "${SLURM_JOB_PARTITION:-}",
   "cpus_per_task": ${SLURM_CPUS_PER_TASK:-0},
   "gpu": "$(command -v rocm-smi >/dev/null 2>&1 && rocm-smi --showproductname --csv 2>/dev/null | tail -1 || echo unknown)"
@@ -104,10 +115,14 @@ JSON
 # (dataset.selection_seed) and how they are trained on (training.seed). That is
 # the realistic run-to-run spread the 3 repeats are meant to measure.
 #
-# max_steps forces max_epochs=-1 inside the train script, so every run gets the
-# same optimizer budget regardless of dataset size, and OneCycleLR anneals over
-# exactly that many steps. Note the epoch COUNT therefore varies ~200x across
-# the grid; metrics.json records it.
+# Budgeted in EPOCHS, so every point is trained to the same number of passes
+# over its own data -- matched exposure, which is what a "does doubling the
+# sample help" curve is asking about. The optimizer STEP count therefore varies
+# with dataset size across the grid, and OneCycleLR anneals over whatever
+# estimated_stepping_batches works out to; metrics.json records both.
+#
+# MAX_STEPS, when non-empty, caps that and forces max_epochs=-1 inside the train
+# script, making the budget compute-matched instead. Passed as null otherwise.
 SECONDS=0
 ./run-lumi.sh python3 mltau/scripts/train_ParTauDETR.py \
     --config-name main_ParTauDETR \
@@ -116,7 +131,8 @@ SECONDS=0
     dataset.max_jets_per_sample.qq="$N_BKG" \
     dataset.selection_seed="$SEED" \
     training.seed="$SEED" \
-    training.trainer.max_steps="$MAX_STEPS" \
+    training.trainer.max_epochs="$MAX_EPOCHS" \
+    training.trainer.max_steps="${MAX_STEPS:-null}" \
     logging.comet.experiment_name="$RUN_NAME" \
     "logging.comet.tags=[scaling,stage-${STAGE}]" \
     "$@"

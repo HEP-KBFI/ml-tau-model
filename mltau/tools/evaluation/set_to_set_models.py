@@ -1,103 +1,80 @@
 import awkward as ak
+import numpy as np
+
+# The decay mode definition lives in ml-tau-data so that the label derived here
+# and the `gen_jet_tau_decaymode` stored in the ntuples cannot drift apart.  It
+# classifies daughters by particle property rather than by an enumerated PDG
+# list, ignores photons (a radiative decay is classed with its parent mode, as
+# PDG treats them), and ignores neutrinos.
+#
+# ml-tau-data has to be importable for this: as the submodule, or pip installed,
+# or on PYTHONPATH.
+from ntupelizer.tools.tau_decaymode import RARE_DECAY_MODE_EXT, classify_decay_modes
 
 from mltau.tools.general import reinitialize_p4
 from mltau.tools.meson_classes import get_meson_classes
 
-# Both lists hold hadrons only.  A daughter that is in neither -- a photon, a
-# conversion electron, anything else -- is not on the prong/pi0 grid at all, so
-# the jet is labelled rare rather than being silently counted as zero prongs.
-charged_pdg = [321, 211, 323]
-# 310 (K0_S) and 223 (omega) are neutral hadrons like the rest and must be here:
-# leaving them out counted e.g. "K0_L pi K0_S" as one neutral instead of two, and
-# "omega K" as zero instead of one, which shifted those decays a class down.
-neutral_pdg = [311, 221, 111, 130, 310, 223]
-hadron_pdg = charged_pdg + neutral_pdg
-
-# Matches DM_NAME_MAPPING in ml-tau-data (ntupelizer/tools/tau_decaymode.py).
-RARE_DECAY_MODE = 15
+# The set model predicts meson CLASSES, not species. For the decay mode a class
+# is represented by one hadron that stands for it: any charged hadron for a
+# charged class, any neutral hadron for a neutral one. These are the same
+# representative ids the ntupelizer writes into gen_jet_tau_vis_daughter_pdgs
+# (map_pdgid_to_candid), and ml-tau-data classifies them by property, so a
+# class and a stored daughter go through the identical code path.
+CHARGED_HADRON_PDG = 211
+NEUTRAL_HADRON_PDG = 130
 
 
-def _count_species(pdg, species):
-    """Number of daughters per jet whose |PDG| is in `species`."""
-    in_species = abs(pdg) == species[0]
-    for code in species[1:]:
-        in_species = in_species | (abs(pdg) == code)
-    return ak.sum(in_species, axis=1)
-
-
-def count_ch_neutral(pdg):
-    """Charged- and neutral-hadron multiplicity per jet.
-
-    Reads the species off the module-level lists rather than repeating them, so
-    that adding a code in one place is enough.
-    """
-    return _count_species(pdg, charged_pdg), _count_species(pdg, neutral_pdg)
-
-
-def count_non_hadrons(pdg):
-    """Daughters that are neither a charged nor a neutral hadron.
-
-    In this dataset that is photons from a radiative decay and the occasional
-    conversion electron; neutrinos never appear, the daughter PDGs being the
-    visible ones.
-    """
-    is_hadron = abs(pdg) == hadron_pdg[0]
-    for code in hadron_pdg[1:]:
-        is_hadron = is_hadron | (abs(pdg) == code)
-    return ak.sum(~is_hadron, axis=1)
-
-
-def get_decay_mode(n_charged, n_neutral, n_non_hadrons=None):
-    """Map (charged, neutral) hadron multiplicity onto the decay mode id.
-
-    A decay with a non-hadronic daughter is not on that grid, so when
-    `n_non_hadrons` is given such jets are labelled rare instead of being
-    assigned whatever class their hadrons alone would imply.
-    """
-    decay_mode = 5 * (n_charged - 1) + n_neutral
-    if n_non_hadrons is not None:
-        decay_mode = ak.where(n_non_hadrons > 0, RARE_DECAY_MODE, decay_mode)
-    return decay_mode
-
-
-def count_ch_neutral_meson_classes(meson_class, tau_daughter_pdg_ids):
-    """Count charged and neutral daughters from configured class charges."""
-    charged_indices = []
-    neutral_indices = []
-    for index, daughter_class in enumerate(get_meson_classes(tau_daughter_pdg_ids)):
-        charges = set(daughter_class.charges)
+def meson_class_representative_pdgs(tau_daughter_pdg_ids) -> list[int]:
+    """One representative |PDG| per configured meson class, in class order."""
+    representatives = []
+    for meson_class in get_meson_classes(tau_daughter_pdg_ids):
+        charges = set(meson_class.charges)
         if charges == {0}:
-            neutral_indices.append(index)
+            representatives.append(NEUTRAL_HADRON_PDG)
         elif 0 not in charges:
-            charged_indices.append(index)
+            representatives.append(CHARGED_HADRON_PDG)
         else:
             raise ValueError(
-                f"Meson class '{daughter_class.name}' mixes neutral and charged particles."
+                f"Meson class '{meson_class.name}' mixes neutral and charged particles."
             )
+    return representatives
 
-    charged_mask = meson_class == charged_indices[0]
-    for index in charged_indices[1:]:
-        charged_mask = charged_mask | (meson_class == index)
-    neutral_mask = meson_class == neutral_indices[0]
-    for index in neutral_indices[1:]:
-        neutral_mask = neutral_mask | (meson_class == index)
-    return ak.sum(charged_mask, axis=1), ak.sum(neutral_mask, axis=1)
+
+def meson_class_to_pdg(meson_class, tau_daughter_pdg_ids):
+    """Jagged meson-class indices -> jagged representative PDG ids."""
+    representatives = np.asarray(
+        meson_class_representative_pdgs(tau_daughter_pdg_ids), dtype=np.int64
+    )
+    counts = ak.num(meson_class, axis=1)
+    flat = ak.to_numpy(ak.flatten(meson_class, axis=1)).astype(np.int64)
+    return ak.unflatten(representatives[flat], counts)
+
+
+def get_decay_mode(pdg):
+    """Decay mode per jet from the daughter PDG ids.
+
+    Uses the extended rare id (30): 15, the value the ntuples store, is also a
+    reachable point on the 5*(n_charged-1)+n_neutral grid (four prongs, no
+    neutrals), so under the normal convention a rare decay and a four-prong
+    reconstruction are the same number.  A set model can predict four prongs --
+    no tau decays that way, so it is a failure worth seeing -- and 30 keeps it
+    visible.  Compare derived with derived: a mode from here is not directly
+    comparable with the ntuple column, which says 15.
+    """
+    return ak.Array(classify_decay_modes(pdg, rare=RARE_DECAY_MODE_EXT))
 
 
 def construct_jet_level_predictions(
     pred_daughters, true_daughters, tau_daughter_pdg_ids
 ):
-    n_charged, n_neutral = count_ch_neutral_meson_classes(
-        pred_daughters.meson_class, tau_daughter_pdg_ids
-    )
-    pred_tau_decay_mode = get_decay_mode(n_charged, n_neutral)
+    pred_pdg = meson_class_to_pdg(pred_daughters.meson_class, tau_daughter_pdg_ids)
+    true_pdg = meson_class_to_pdg(true_daughters.meson_class, tau_daughter_pdg_ids)
+
+    pred_tau_decay_mode = get_decay_mode(pred_pdg)
     pred_tau_p4 = reinitialize_p4(ak.sum(pred_daughters.p4, axis=1))
     pred_tau_charge = ak.sum(pred_daughters.charge, axis=1)
 
-    n_charged_true, n_neutral_true = count_ch_neutral_meson_classes(
-        true_daughters.meson_class, tau_daughter_pdg_ids
-    )
-    true_tau_decay_mode_exp = get_decay_mode(n_charged_true, n_neutral_true)
+    true_tau_decay_mode_exp = get_decay_mode(true_pdg)
     return ak.Array(
         {
             "tau_decaymode": pred_tau_decay_mode,

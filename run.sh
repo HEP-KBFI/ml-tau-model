@@ -11,4 +11,15 @@ if [[ "$1" == "jupyter" && "$2" == "server" ]]; then
 	set -- "$1" "$2" "--ServerApp.root_dir=$jupyter_root_dir" "${@:3}"
 fi
 
-apptainer exec -B /scratch/persistent,/local,/home --env PYTHONPATH="$repo_dir:$repo_dir/mltau" --nv /home/software/singularity/pytorch.simg\:2025-09-01 "$@"
+# ml-tau-data provides ntupelizer.tools.tau_decaymode, the single definition of
+# the tau decay mode; mltau.tools.evaluation.set_to_set_models imports it, so the
+# training module does not import without it. Default: a sibling checkout.
+mltau_data_dir="${MLTAU_DATA_DIR:-$repo_dir/../ml-tau-data}"
+pythonpath="$repo_dir:$repo_dir/mltau"
+if [[ -d "$mltau_data_dir" ]]; then
+	pythonpath="$pythonpath:$(cd -- "$mltau_data_dir" && pwd)"
+else
+	echo "run.sh: ml-tau-data not found at $mltau_data_dir (set MLTAU_DATA_DIR); decay-mode code will not import" >&2
+fi
+
+apptainer exec -B /scratch/persistent,/local,/home --env PYTHONPATH="$pythonpath" --nv /home/software/singularity/pytorch.simg\:2025-09-01 "$@"

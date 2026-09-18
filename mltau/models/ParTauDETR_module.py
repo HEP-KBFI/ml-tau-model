@@ -1,3 +1,4 @@
+import warnings
 from typing import Any
 
 import lightning as L
@@ -9,6 +10,7 @@ from omegaconf import DictConfig, OmegaConf
 
 from mltau.models.ParTauDETR import ParTauDETR
 from mltau.tools.io.general import BatchInputs
+from mltau.tools.logging import set_to_set as s2s
 from mltau.tools.losses import TauLoss
 from mltau.tools.meson_classes import MesonClass, get_meson_classes
 from mltau.tools.partau_detr import decode_kinematics
@@ -102,26 +104,72 @@ def _solve_assignment(cost: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
     return pred_idx[order], tgt_idx[order]
 
 
+CLASSIFICATION_COSTS = ("prob", "nll", "clipped_nll")
+
+
 def _classification_cost_matrix(
     pred_logits: torch.Tensor,
     target_classes: torch.Tensor,
-    ignore_index: int,
+    ignore_index: int = -100,
+    kind: str = "clipped_nll",
+    clip: float = 5.0,
 ) -> torch.Tensor:
     """
-    Per-query/per-target classification matching cost based on -log softmax.
+    Per-query/per-target classification matching cost.
+
+    Three forms, all functions of p = p(true class of the target):
+
+      "nll"          -log p          unbounded (the first model's choice)
+      "prob"         1 - p           bounded in [0, 1] (DETR's own choice)
+      "clipped_nll"  min(-log p, clip)   bounded, but sharp where it matters
+
+    The cost decides WHICH daughter a query is trained towards, so the question
+    is how much a confident identity should count against a position error.
+    Tau daughters are collimated: while the model's angular error is about one
+    target sigma (~0.07), position cannot tell two daughters of a jet apart and
+    identity and pt -- which are learned first -- have to carry the decision.
+    On synthetic daughters with realistic spreads, 1-sigma kinematic noise and a
+    3% class error rate, the intended assignment was recovered:
+
+        unweighted L1 + nll (first model)     93%, 11% churn between noise draws
+        1/sigma-weighted L1 + prob            71%, 46% churn
+        [1,5,5,5,0.2] L1 + clipped nll (5)    94%, 10% churn   <- default
+
+    "prob" is too weak here: a wrong class costs at most 1 while one sigma of
+    angular noise costs ~1.5 through the kinematics term, so identity loses.
+    "nll" is unbounded: a confidently wrong query (p -> 0) pays an arbitrarily
+    large cost, and late in training, when predictions are sharp, the class
+    share of the total cost was measured to grow from 26% to 62%, i.e. the
+    assignment starts being decided by predicted identity rather than by
+    position, and a single confident mistake can flip a whole jet's assignment
+    (the late-training loss spikes). The clip keeps the useful range -- a wrong
+    class at p = 0.01 still costs 4.6, a soft p = 0.6 costs 0.5 -- and removes
+    the tail.
 
     Args:
         pred_logits: [B, Q, C]
         target_classes: [B, T]
+        kind: one of CLASSIFICATION_COSTS.
+        clip: upper bound of the per-pair cost for "clipped_nll".
     Returns:
         cost: [B, Q, T] in float32, zero where the target is `ignore_index`.
     """
-    # Build matching costs in fp32 for AMP stability.
-    nll = -F.log_softmax(pred_logits.float(), dim=-1)  # [B, Q, C]
+    # Built in fp32 for AMP stability.
+    log_p = F.log_softmax(pred_logits.float(), dim=-1)  # [B, Q, C]
+    if kind == "prob":
+        per_class = 1.0 - log_p.exp()
+    elif kind == "nll":
+        per_class = -log_p
+    elif kind == "clipped_nll":
+        per_class = (-log_p).clamp(max=float(clip))
+    else:
+        raise ValueError(
+            f"classification cost must be one of {CLASSIFICATION_COSTS}, got {kind!r}"
+        )
     valid = target_classes != ignore_index  # [B, T]
     # `gather` needs in-range indices even for the entries we discard afterwards.
-    idx = target_classes.clamp_min(0).unsqueeze(1).expand(-1, nll.size(1), -1)
-    cost = torch.gather(nll, 2, idx)  # [B, Q, T]
+    idx = target_classes.clamp_min(0).unsqueeze(1).expand(-1, per_class.size(1), -1)
+    cost = torch.gather(per_class, 2, idx)  # [B, Q, T]
     return cost * valid.unsqueeze(1)
 
 
@@ -143,21 +191,36 @@ class HungarianMatcher(nn.Module):
         object_class_index: int = 0,
         ignore_index: int = -100,
         kinematics_component_weights: list[float] | None = None,
+        classification_cost: str = "clipped_nll",
+        classification_cost_clip: float = 5.0,
     ):
         super().__init__()
+        if classification_cost not in CLASSIFICATION_COSTS:
+            raise ValueError(
+                f"matcher.classification_cost must be one of {CLASSIFICATION_COSTS}, "
+                f"got {classification_cost!r}"
+            )
+        self.classification_cost = classification_cost
+        self.classification_cost_clip = float(classification_cost_clip)
+        # Mean of each cost term over the pairs actually chosen, refreshed every
+        # forward. The criterion reads it so the split can be logged: if the
+        # classification share climbs while the losses blow up, the matcher has
+        # started matching by predicted identity instead of by position.
+        self.last_cost_terms: dict[str, float] = {}
         self.cost_objectness = cost_objectness
         self.cost_kinematics_l1 = cost_kinematics_l1
         # Per-component weights for the kinematics matching cost, over
         # [log_pt_ratio, delta_eta, sin_dphi, cos_dphi, log_mass_ratio].
         #
-        # An unweighted L1 is dominated by whichever component has the largest
-        # dynamic range. The log ratios have sigma ~1 while the angular offsets
-        # of collimated tau daughters have sigma ~0.05, so pt and mass together
-        # decided ~95% of every assignment and direction contributed ~5%. Two
-        # daughters of similar pt could then be swapped at almost no cost, and
-        # the whole error of that swap landed on the angular targets -- which is
-        # why pt looked accurate (it is what the matcher optimised) while phi
-        # did not.
+        # Unweighted, the log ratios (sigma ~1) dominate and the angular offsets
+        # of collimated daughters (sigma ~0.07) barely count. Weighting the
+        # angles at 1/sigma (20) over-corrects: while the model's angular error
+        # is still of order sigma, position is noise and an angle-dominated
+        # cost reassigns queries between steps (71% intended-assignment recovery
+        # and 46% churn under 1-sigma noise, against 93% / 11% unweighted).
+        # A moderate weight (5, set in the config) keeps direction in the cost
+        # without letting it override pt and identity: 94% / 10%. See
+        # _classification_cost_matrix for the measurement.
         if kinematics_component_weights is None:
             kinematics_component_weights = [1.0, 1.0, 1.0, 1.0, 1.0]
         self.register_buffer(
@@ -227,10 +290,18 @@ class HungarianMatcher(nn.Module):
             )
         kin_cost = (component_diff * weights).sum(-1)  # [B, Q, T]
         charge_cost = _classification_cost_matrix(
-            pred_charge_logits, target_charge_cls, self.ignore_index
+            pred_charge_logits,
+            target_charge_cls,
+            self.ignore_index,
+            self.classification_cost,
+            self.classification_cost_clip,
         )
         meson_class_cost = _classification_cost_matrix(
-            pred_meson_class_logits, target_meson_class, self.ignore_index
+            pred_meson_class_logits,
+            target_meson_class,
+            self.ignore_index,
+            self.classification_cost,
+            self.classification_cost_clip,
         )
 
         total_cost = (
@@ -266,6 +337,29 @@ class HungarianMatcher(nn.Module):
         target_idx = target_idx.reshape(-1)
         keep = valid_np[batch_idx, target_idx]
 
+        # Cost split over the pairs actually chosen. Detached scalars only, so
+        # this costs four reductions and holds no graph.
+        b_sel = torch.from_numpy(batch_idx[keep]).to(device)
+        q_sel = torch.from_numpy(query_idx[keep]).to(device)
+        t_sel = torch.from_numpy(target_idx[keep]).to(device)
+        if b_sel.numel() > 0:
+            with torch.no_grad():
+                terms = {
+                    "objectness": self.cost_objectness * obj_cost[b_sel, q_sel],
+                    "kinematics": self.cost_kinematics_l1 * kin_cost[b_sel, q_sel, t_sel],
+                    "charge": self.cost_charge_ce * charge_cost[b_sel, q_sel, t_sel],
+                    "meson_class": self.cost_meson_class_ce
+                    * meson_class_cost[b_sel, q_sel, t_sel],
+                }
+                means = {k: float(v.mean()) for k, v in terms.items()}
+                total = sum(means.values()) or 1.0
+                self.last_cost_terms = {
+                    **{f"cost/{k}": v for k, v in means.items()},
+                    # The share is the number that matters: it is what shifts as
+                    # the model sharpens.
+                    "cost/class_share": (means["charge"] + means["meson_class"]) / total,
+                }
+
         return (
             torch.from_numpy(batch_idx[keep]).to(device, non_blocking=True),
             torch.from_numpy(query_idx[keep]).to(device, non_blocking=True),
@@ -274,8 +368,29 @@ class HungarianMatcher(nn.Module):
 
 
 class SetCriterion(nn.Module):
-    """DETR-style criterion with objectness + kinematics + charge + meson class
-    losses, plus auxiliary consistency penalties."""
+    """
+    DETR-style criterion: objectness + kinematics + charge + meson-class losses
+    on the matched daughters, the jet-level tauID loss, and auxiliary penalties
+    (consistency, charge count, and the parent constraints).
+
+    Division of labour, fixed by design:
+
+    - Whether a jet is a tau at all is decided by the tauID head ONLY. It is the
+      one term background jets contribute to, and the one term `jet_weights`
+      (cls_weight) applies to: that weight matches the (theta, p) spectra of
+      signal and background so the tagger cannot key on pt and theta, and it
+      has no other purpose.
+    - Objectness answers "which queries are real daughters of this tau", and
+      together with kinematics, charge, meson class and the parent constraints
+      it is trained on signal jets only and UNWEIGHTED. Reweighting the
+      reconstruction would reshape the pt spectrum the regression and
+      classification heads are optimised on without decorrelating anything;
+      the first model trained them unweighted (its production had no
+      cls_weight column) and that is the behaviour kept.
+    - Background jets are deliberately NOT pushed towards "no object": on a
+      background jet objectness is untrained and its scores are meaningless, so
+      inference and evaluation gate the daughter set with the tauID score.
+    """
 
     def __init__(
         self,
@@ -390,10 +505,9 @@ class SetCriterion(nn.Module):
         tgt_classes[pair_b, pair_q] = self.object_class_index
 
         if num_matched > 0:
-            if jet_weights is not None:
-                pair_w = jet_weights.to(dtype=pred_logits.dtype, device=device)[pair_b]
-            else:
-                pair_w = pred_logits.new_ones(num_matched)
+            # Unweighted on purpose (class docstring): cls_weight is the
+            # tagger's decorrelation weight, not a reconstruction weight.
+            pair_w = pred_logits.new_ones(num_matched)
 
             kin_pred_cat = pred_kinematics[pair_b, pair_q]
             kin_tgt_cat = target_kinematics[pair_b, pair_t]
@@ -428,19 +542,14 @@ class SetCriterion(nn.Module):
             weight=class_weight,
             reduction="none",
         )
-        if jet_weights is not None:
-            w = jet_weights.to(dtype=pred_logits.dtype, device=device)
-            w = w * signal_mask.to(dtype=w.dtype)
-            loss_objectness = (ce_per_query * w[:, None]).sum() / (
-                w.sum() * num_queries + 1e-8
-            )
-        else:
-            sig_w = signal_mask.to(dtype=ce_per_query.dtype)
-            loss_objectness = (ce_per_query * sig_w[:, None]).sum() / (
-                sig_w.sum() * num_queries + 1e-8
-            )
+        # Signal jets only, unweighted (class docstring).
+        sig_w = signal_mask.to(dtype=ce_per_query.dtype)
+        loss_objectness = (ce_per_query * sig_w[:, None]).sum() / (
+            sig_w.sum() * num_queries + 1e-8
+        )
 
-        # jet-level tau-tagging loss
+        # jet-level tau-tagging loss: the ONLY term that sees cls_weight, and the
+        # only one background jets contribute to.
         if "is_tau" in outputs and target_is_tau is not None:
             if jet_weights is not None:
                 tau_w = jet_weights.to(dtype=pred_logits.dtype, device=device)
@@ -513,8 +622,19 @@ class SetCriterion(nn.Module):
             torch.is_grad_enabled() and self.loss_charge_count_weight > 0
         ):
             p_object = F.softmax(pred_logits, dim=-1)[..., 0]  # [B, Q]
-            pred_charge_cls = pred_charge_logits.argmax(dim=-1)  # [B, Q]
-            is_charged_pred = (pred_charge_cls != 1).float()  # class 1 = charge 0
+            # Probability of being charged, NOT argmax(charge) != neutral.
+            #
+            # The argmax made this term a step function of the charge logits:
+            # every query crossing its decision boundary moved expected_charged
+            # by a whole unit, so the penalty jumped discontinuously, and the
+            # jumps get more frequent late in training when many queries sit
+            # near a boundary. It also meant the charge head received NO
+            # gradient from this term at all -- only p_object did -- so the term
+            # could push objectness around without ever correcting the charge
+            # prediction that caused it. Summing the charged probability instead
+            # is continuous in both heads and differentiable through both.
+            charge_probs = F.softmax(pred_charge_logits, dim=-1)  # [B, Q, 3]
+            is_charged_pred = charge_probs[..., 0] + charge_probs[..., 2]
             expected_charged = (p_object * is_charged_pred).sum(dim=-1)  # [B]
             # Charged daughters are class 0 (-1) or class 2 (+1); ignore padded slots.
             is_charged_true = (
@@ -527,11 +647,9 @@ class SetCriterion(nn.Module):
         if self.loss_charge_count_weight > 0:
             total_loss = total_loss + self.loss_charge_count_weight * loss_charge_count
 
-        if jet_weights is not None:
-            parent_weights = jet_weights.to(dtype=pred_logits.dtype, device=device)
-        else:
-            parent_weights = pred_logits.new_ones(batch_size)
-        parent_weights = parent_weights * signal_mask.to(parent_weights.dtype)
+        # Parent constraints are reconstruction terms: signal jets only and
+        # unweighted, like the daughter losses (class docstring).
+        parent_weights = signal_mask.to(dtype=pred_logits.dtype)
 
         with torch.set_grad_enabled(
             torch.is_grad_enabled() and self.loss_parent_kinematics_weight > 0
@@ -692,6 +810,7 @@ class SetCriterion(nn.Module):
             "num_meson_class_supervised": num_meson_class_supervised.to(
                 pred_logits.dtype
             ),
+            **{k: pred_logits.new_tensor(v) for k, v in self.matcher.last_cost_terms.items()},
         }
 
 
@@ -746,16 +865,7 @@ class ParTauDETRModule(L.LightningModule):
         meson_classes = get_meson_classes(cfg.dataset.tau_daughter_pdg_ids)
         self.num_meson_classes = len(meson_classes)
 
-        self.tau_loss = TauLoss(
-            l_m=float(arch.tau_loss.l_m),
-            label_smoothing=float(arch.tau_loss.label_smoothing),
-            kinematics_weights={
-                k: float(v) for k, v in arch.tau_loss.kinematics_weights.items()
-            },
-            kinematics_scales={
-                k: float(v) for k, v in arch.tau_loss.kinematics_scales.items()
-            },
-        )
+        self.tau_loss = TauLoss.from_config(arch.tau_loss, owner="ParTauDETR")
         self.num_kinematics_components = int(arch.num_kinematics_components)
 
         embed_dims = [int(d) for d in encoder_cfg.embed_dims]
@@ -812,6 +922,12 @@ class ParTauDETRModule(L.LightningModule):
             kinematics_component_weights=list(
                 detr_cfg.matcher.kinematics_component_weights
             ),
+            classification_cost=str(
+                detr_cfg.matcher.get("classification_cost", "clipped_nll")
+            ),
+            classification_cost_clip=float(
+                detr_cfg.matcher.get("classification_cost_clip", 5.0)
+            ),
         )
 
         self.criterion = SetCriterion(
@@ -837,6 +953,65 @@ class ParTauDETRModule(L.LightningModule):
         )
 
         self.score_threshold = float(detr_cfg.inference.score_threshold)
+        # p(tau) above which a jet's predicted daughters are kept at prediction
+        # time. Objectness is trained on signal jets only, so the tauID head is
+        # the only thing that can say "this jet has no daughters at all".
+        self.tau_id_threshold = float(detr_cfg.inference.get("tau_id_threshold", 0.5))
+
+        # One representative |PDG| per meson class, for the jet-level
+        # evaluation: the decay mode is derived by ml-tau-data from PDG ids
+        # classified by property, so a class is handed over as the hadron that
+        # represents it -- 211 for a charged class, 130 for a neutral one, the
+        # same convention the ntupelizer uses when it writes the daughter ids.
+        # Not persisted: it is derived from the config, not learned.
+        self.register_buffer(
+            "meson_class_repr_pdg",
+            torch.tensor(
+                [130 if set(c.charges) == {0} else 211 for c in meson_classes],
+                dtype=torch.long,
+            ),
+            persistent=False,
+        )
+
+        # Every val metric at the epoch with the lowest val_losses/loss. The
+        # checkpoint callback records the best SCORE, but nothing records the
+        # per-head breakdown that produced it: trainer.callback_metrics at the
+        # end of the run is the LAST validation pass, which is a different epoch
+        # whenever the run stopped improving early. Snapshotted here so a
+        # scaling study can read the components that belong to the best loss.
+        self.best_val_metrics: dict[str, float] | None = None
+
+        # Jet-level validation performance: the losses say how well the
+        # criterion is minimised, these say whether the reconstructed tau is
+        # right. Capped, because a validation split can be millions of jets and
+        # the distributions converge long before that.
+        self.val_jets = s2s.SetToSetAccumulator(
+            max_jets=int(cfg.training.get("jet_level_eval_jets", 200_000))
+        )
+
+        # The objectness threshold is calibrated, not assumed. inference
+        # .score_threshold is only the starting value and the fallback: the
+        # right operating point moves as the objectness head sharpens, so it is
+        # rescanned before every validation on recent TRAIN jets. Using train
+        # data for this matters -- picking the operating point on the same split
+        # the model is then scored on would flatter every number that follows.
+        scan_cfg = cfg.training.get("threshold_scan", None)
+        self.threshold_scan_enabled = (
+            True if scan_cfg is None else bool(scan_cfg.get("enabled", True))
+        )
+        self.threshold_buffer = s2s.ThresholdCalibrationBuffer(
+            max_jets=int(scan_cfg.get("jets", 100_000)) if scan_cfg else 100_000
+        )
+        self.threshold_grid = (
+            np.linspace(
+                float(scan_cfg.get("low", 0.5)),
+                float(scan_cfg.get("high", 0.9)),
+                int(scan_cfg.get("points", 9)),
+            )
+            if scan_cfg
+            else np.linspace(0.5, 0.9, 9)
+        )
+        self.current_score_threshold = float(detr_cfg.inference.score_threshold)
 
     @staticmethod
     def _ohe_to_class_indices(
@@ -1063,8 +1238,163 @@ class ParTauDETRModule(L.LightningModule):
             on_step=False,
             on_epoch=True,
         )
+        # Matched pairs per step: if the daughter losses move because the matcher
+        # stopped finding targets, this moves with them. on_step as well as
+        # on_epoch, because an epoch mean hides a collapse that lasts a chunk.
+        self.log("counts/num_matched", losses["num_matched"],
+                 on_step=True, on_epoch=True)
+        if self.threshold_scan_enabled:
+            self._buffer_for_threshold_scan(batch, outputs, targets)
+        # What the matcher is actually deciding on. cost/class_share rising over
+        # training is the signature of the assignment being driven by predicted
+        # identity rather than position.
+        for key, value in losses.items():
+            if key.startswith("cost/"):
+                self.log(key, value, on_step=False, on_epoch=True)
+        self.log("counts/num_charge_supervised", losses["num_charge_supervised"],
+                 on_step=False, on_epoch=True)
+        self.log("counts/num_meson_class_supervised",
+                 losses["num_meson_class_supervised"], on_step=False, on_epoch=True)
 
         return losses["loss"]
+
+    def _buffer_for_threshold_scan(self, batch, outputs, targets) -> None:
+        """
+        Stash what the dR matching needs from this training batch.
+
+        Signal jets only. Objectness is trained on signal jets alone -- whether a
+        jet is a tau at all is the tauID head's decision, not objectness's -- so
+        on background jets the objectness scores are untrained and arbitrary.
+        Letting them into the scan would count every such query above threshold
+        as a false positive against zero true daughters, and with a 7:1
+        background:signal mix that would decide the threshold rather than the
+        matching quality on taus.
+        """
+        reco_jet = batch[6]
+        target_mask = targets["particles_mask"].bool()
+        if "is_tau" in targets:
+            signal = targets["is_tau"].bool()
+        else:
+            signal = target_mask.any(dim=1)
+        if not bool(signal.any()):
+            return
+        target_kinematics = targets["particles_kinematics"][signal]
+        target_mask = target_mask[signal]
+        outputs = {k: v[signal] for k, v in outputs.items() if k in ("pred_logits", "pred_kinematics")}
+        reco_jet = {k: v[signal] for k, v in reco_jet.items()}
+        with torch.no_grad():
+            scores = torch.softmax(outputs["pred_logits"].float(), dim=-1)[..., 0]
+            pred_eta = outputs["pred_kinematics"][..., 1].float() + reco_jet["eta"][:, None]
+            pred_phi = reco_jet["phi"][:, None] + torch.atan2(
+                outputs["pred_kinematics"][..., 2].float(),
+                outputs["pred_kinematics"][..., 3].float(),
+            )
+            true_eta = target_kinematics[..., 1].float() + reco_jet["eta"][:, None]
+            true_phi = reco_jet["phi"][:, None] + torch.atan2(
+                target_kinematics[..., 2].float(), target_kinematics[..., 3].float()
+            )
+        self.threshold_buffer.add(
+            scores, pred_eta, pred_phi, true_eta, true_phi, target_mask
+        )
+
+    def on_validation_start(self) -> None:
+        """Recalibrate the objectness threshold on recent training jets."""
+        if not self.threshold_scan_enabled or self.trainer is None:
+            return
+        if self.trainer.sanity_checking:
+            return
+        try:
+            best, f1_by_threshold = self.threshold_buffer.scan(self.threshold_grid)
+        except Exception as exc:  # pragma: no cover - never fail a run on this
+            warnings.warn(f"threshold scan failed: {exc}")
+            return
+        if best is None:
+            return
+        self.current_score_threshold = float(best)
+        self.log("threshold/score_threshold", self.current_score_threshold,
+                 on_step=False, on_epoch=True)
+        self.log("threshold/best_f1", float(f1_by_threshold[best]),
+                 on_step=False, on_epoch=True)
+
+    def _accumulate_jet_level(self, batch, outputs, targets) -> None:
+        """
+        Collapse this batch's predicted and true daughter sets to jet level.
+
+        Predictions are selected by the same objectness threshold inference
+        uses, so what is logged is what a downstream user would actually get,
+        not an oracle-selected best case. Meson classes are handed to the
+        evaluators as their representative PDG id (see meson_class_repr_pdg),
+        which is what ml-tau-data's decay-mode classifier expects.
+        """
+        reco_jet = batch[6]
+        (
+            target_kinematics,
+            target_charge_cls,
+            target_meson_class,
+            target_mask,
+            target_is_tau,
+            _target_parent_charge,
+            _target_parent_decay_mode,
+        ) = self._extract_set_targets(targets)
+
+        charge_lut = torch.tensor([-1, 0, 1], device=self.device)
+        repr_pdg = self.meson_class_repr_pdg.to(self.device)
+
+        scores = torch.softmax(outputs["pred_logits"].float(), dim=-1)[..., 0]
+        pred = s2s.daughters_to_jet_level(
+            kin=outputs["pred_kinematics"].float(),
+            charge=charge_lut[outputs["pred_charge_logits"].argmax(-1)],
+            pdg=repr_pdg[outputs["pred_meson_class_logits"].argmax(-1)],
+            valid=scores >= self.current_score_threshold,
+            reco_jet=reco_jet,
+        )
+        # Padded slots carry ignore_index; clamp before the lookup and let the
+        # mask decide what counts.
+        true = s2s.daughters_to_jet_level(
+            kin=target_kinematics.float(),
+            charge=charge_lut[target_charge_cls.clamp_min(0)],
+            pdg=repr_pdg[target_meson_class.clamp_min(0)],
+            valid=target_mask,
+            reco_jet=reco_jet,
+        )
+        tau_score = None
+        if "is_tau" in outputs:
+            tau_score = torch.softmax(outputs["is_tau"].float(), dim=-1)[:, 1]
+        # The evaluators bin efficiencies against the gen tau and the reco jet,
+        # so those travel with the predictions.
+        self.val_jets.update(
+            pred,
+            true,
+            target_is_tau,
+            tau_score,
+            {
+                "gen_jet_tau_p4s": batch[5],
+                "reco_jet_p4s": batch[6],
+                "gen_jet_p4s": batch[7],
+            },
+        )
+
+    def on_validation_epoch_end(self) -> None:
+        """Turn the accumulated jets into figures and scalars, then start over."""
+        if self.trainer is None or self.trainer.sanity_checking:
+            self.val_jets.reset()
+            return
+        tb_logger = None
+        for logger in self.trainer.loggers:
+            experiment = getattr(logger, "experiment", None)
+            if hasattr(experiment, "add_figure"):
+                tb_logger = experiment
+                break
+        try:
+            scalars = s2s.log_set_to_set_metrics(
+                self.val_jets, tb_logger, self.cfg, self.current_epoch, dataset="val"
+            )
+        except Exception as exc:  # pragma: no cover - never fail a run on a plot
+            warnings.warn(f"jet-level validation logging failed: {exc}")
+            scalars = {}
+        for name, value in scalars.items():
+            self.log(f"val_jet/{name}", value, on_step=False, on_epoch=True)
+        self.val_jets.reset()
 
     def validation_step(self, batch, _batch_idx):
         outputs, targets, weights, gen_jet_tau_p4, kinematics_reference_p4 = self.forward(batch)
@@ -1175,7 +1505,89 @@ class ParTauDETRModule(L.LightningModule):
             on_epoch=True,
         )
 
+        if not self.trainer.sanity_checking:
+            self._accumulate_jet_level(batch, outputs, targets)
         return losses["loss"]
+
+    def on_before_optimizer_step(self, optimizer) -> None:
+        """
+        Per-step optimizer diagnostics, logged because nothing else records them.
+
+        A late-training blow-up in every head at once, in train AND val, with a
+        smoothly decaying learning rate, cannot be attributed from the loss
+        curves alone: they show the damage, not the cause. These three do.
+
+        grad/total_norm is the 2-norm BEFORE clipping (Lightning calls this hook
+        after unscaling and before gradient_clip_val applies), so it says whether
+        the optimizer saw an outlier gradient and whether clipping was active at
+        all. A norm that starts oscillating and growing while the loss does the
+        same is progressive sharpening -- the step size outrunning the curvature
+        -- and points at the schedule. A single isolated spike points at one bad
+        batch instead.
+
+        grad/amp_scale matters because with 16-mixed a shrinking scale means
+        GradScaler is catching infinities and silently skipping steps, which
+        looks like a plateau rather than an error.
+
+        optim/beta1 is logged because OneCycleLR CYCLES it by default: nothing in
+        this repository asked for momentum to sweep 0.95 -> 0.85 -> 0.95, but it
+        does, and the second half of that sweep coincides with the unstable
+        phase.
+        """
+        if self.trainer is None:
+            return
+        grads = [p.grad for p in self.parameters() if p.grad is not None]
+        if grads:
+            total = torch.sqrt(
+                torch.stack([(g.detach() ** 2).sum() for g in grads]).sum()
+            )
+            self.log("grad/total_norm", total, on_step=True, on_epoch=False)
+            self.log(
+                "grad/clipped",
+                (total > 1.0).float(),  # fraction of steps clipping is active
+                on_step=True,
+                on_epoch=True,
+            )
+
+        scaler = getattr(
+            getattr(self.trainer, "precision_plugin", None), "scaler", None
+        )
+        if scaler is not None:
+            self.log("grad/amp_scale", float(scaler.get_scale()),
+                     on_step=True, on_epoch=False)
+
+        for group in optimizer.param_groups:
+            betas = group.get("betas")
+            if betas is not None:
+                self.log("optim/beta1", float(betas[0]), on_step=True, on_epoch=False)
+            break
+
+    def on_validation_end(self) -> None:
+        """
+        Keep the whole val metric set from the best epoch.
+
+        Deliberately `on_validation_end` rather than `on_validation_epoch_end`:
+        the epoch-end reduction of `self.log(..., on_epoch=True)` values has not
+        happened yet in the latter, so `trainer.callback_metrics` would still
+        hold the previous epoch's numbers.
+        """
+        if self.trainer is None or self.trainer.sanity_checking:
+            return
+        metrics = {
+            name: float(value)
+            for name, value in self.trainer.callback_metrics.items()
+            if name.startswith("val_losses/") and hasattr(value, "item")
+        }
+        current = metrics.get("val_losses/loss")
+        if current is None:
+            return
+        best = self.best_val_metrics
+        if best is None or current < best["val_losses/loss"]:
+            self.best_val_metrics = {
+                **metrics,
+                "epoch": int(self.current_epoch),
+                "step": int(self.global_step),
+            }
 
     def predict_step(self, batch, _batch_idx):
         outputs, _, _, _, _ = self.forward(batch)
@@ -1205,6 +1617,14 @@ class ParTauDETRModule(L.LightningModule):
         if "is_tau" in outputs:
             result["is_tau_logits"] = outputs["is_tau"]
             result["is_tau"] = torch.softmax(outputs["is_tau"], dim=-1)[..., 1]
+            # Whether the jet is a tau at all is the tauID head's decision, not
+            # objectness's (see SetCriterion): on a background jet the
+            # objectness scores are untrained. pred_mask is the gated set that
+            # downstream code should use; the raw objectness selection is kept
+            # alongside for studies on true tau jets.
+            result["pred_mask_objectness"] = pred_mask
+            tagged = result["is_tau"] >= self.tau_id_threshold
+            result["pred_mask"] = pred_mask & tagged[:, None]
 
         return result
 

@@ -1,3 +1,5 @@
+import warnings
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -105,9 +107,11 @@ class TauLoss(nn.Module):
         # loss sees is a dimensionless "error in units of the spread of this
         # target" and every component is comparable by construction. Defaults of
         # 1.0 reproduce the unscaled behaviour.
-        self.kinematics_scales = dict(
-            kinematics_scales
-            or {"log_pt": 1.0, "delta_eta": 1.0, "phi_chord": 1.0, "log_mass": 1.0}
+        # None means "not measured": the loss then falls back to the legacy
+        # unscaled form (see _compute_kinematics_loss_per_sample) rather than
+        # pretending a scale of 1 is a measurement. Use from_config().
+        self.kinematics_scales = (
+            dict(kinematics_scales) if kinematics_scales else None
         )
         # Tagging: all jets (background=0, signal=1)
         self.tag_loss_fn = nn.CrossEntropyLoss(
@@ -119,6 +123,49 @@ class TauLoss(nn.Module):
         self.dm_loss_fn = nn.CrossEntropyLoss(reduction="none")
         # Kinematics: signal taus only
         self.kin_loss_fn = nn.HuberLoss(reduction="none", delta=1.0)
+
+    @classmethod
+    def from_config(cls, tau_loss_cfg=None, owner: str = "model") -> "TauLoss":
+        """
+        Build from a `tau_loss` config block. Every key is optional:
+
+            tau_loss:
+                l_m: 0.2                 # legacy mass weight, used if no weights
+                label_smoothing: 0.1
+                kinematics_scales:  {log_pt: .., delta_eta: .., phi_chord: .., log_mass: ..}
+                kinematics_weights: {log_pt: 1, delta_eta: 1, phi_chord: 1, log_mass: 0.2}
+
+        ParTauDETR, MultiParTau and SingleParTau all construct their loss here,
+        so the three are configured the same way. The scales are properties of
+        the data -- the spread of each regression target -- and cannot be
+        defaulted sensibly: daughter-level targets (DETR) and tau-level targets
+        (ParT) differ by an order of magnitude in delta_eta and delta_phi.
+        Without them the loss uses its legacy unscaled form and says so;
+        measure them with mltau/scripts/measure_kinematics_scales.py.
+        """
+        cfg = tau_loss_cfg if tau_loss_cfg is not None else {}
+        weights = cfg.get("kinematics_weights", None)
+        scales = cfg.get("kinematics_scales", None)
+        if not scales:
+            warnings.warn(
+                f"[{owner}] tau_loss.kinematics_scales is not set. The kinematics "
+                "loss runs in its legacy unscaled form (Huber in raw units, linear "
+                "phi chord), in which the angular components carry almost no "
+                "gradient. Measure the scales with "
+                "`python3 mltau/scripts/measure_kinematics_scales.py` and put "
+                "them in the config.",
+                stacklevel=2,
+            )
+        return cls(
+            l_m=float(cfg.get("l_m", 0.2)),
+            label_smoothing=float(cfg.get("label_smoothing", 0.1)),
+            kinematics_weights=(
+                {k: float(v) for k, v in weights.items()} if weights else None
+            ),
+            kinematics_scales=(
+                {k: float(v) for k, v in scales.items()} if scales else None
+            ),
+        )
 
     def compute_tagging_loss(self, predictions, targets, weights):
         """CrossEntropy loss for background vs signal classification."""
@@ -163,7 +210,10 @@ class TauLoss(nn.Module):
         tail, instead of quadratic everywhere (delta_eta) or linear everywhere
         (a chord of order 1 at initialisation).
         """
-        s = self.kinematics_scales
+        scaled = self.kinematics_scales is not None
+        s = self.kinematics_scales or {
+            "log_pt": 1.0, "delta_eta": 1.0, "phi_chord": 1.0, "log_mass": 1.0
+        }
         log_pt_loss = self.kin_loss_fn(
             predictions[:, 0] / s["log_pt"], targets[:, 0] / s["log_pt"]
         )
@@ -174,15 +224,22 @@ class TauLoss(nn.Module):
         # chord length between the predicted and the true angle. Feeding the
         # scaled chord through the same Huber makes this component quadratic
         # near zero like the others, rather than linear everywhere.
-        phi_chord = (
-            torch.sqrt(
-                (predictions[:, 2] - targets[:, 2]) ** 2
-                + (predictions[:, 3] - targets[:, 3]) ** 2
-                + 1e-8
-            )
-            / s["phi_chord"]
+        chord = torch.sqrt(
+            (predictions[:, 2] - targets[:, 2]) ** 2
+            + (predictions[:, 3] - targets[:, 3]) ** 2
+            + 1e-8
         )
-        phi_chord_loss = self.kin_loss_fn(phi_chord, torch.zeros_like(phi_chord))
+        if scaled:
+            phi_chord = chord / s["phi_chord"]
+            phi_chord_loss = self.kin_loss_fn(phi_chord, torch.zeros_like(phi_chord))
+        else:
+            # Legacy form, kept for a loss without measured scales: the chord
+            # enters linearly. Putting an unscaled chord (~0.05 for tau-level
+            # targets) through a Huber with its knee at 1 would make this term
+            # quadratic everywhere and shrink its gradient twentyfold, which is
+            # what silently happened to MultiParTau between 2026-09-15 and this
+            # change.
+            phi_chord_loss = chord
         log_mass_loss = self.kin_loss_fn(
             predictions[:, 4] / s["log_mass"], targets[:, 4] / s["log_mass"]
         )

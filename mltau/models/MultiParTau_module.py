@@ -34,7 +34,10 @@ class ParTauModule(L.LightningModule):
         )
 
         # Unified loss module handles all task-specific functions and weighting logic.
-        self.tau_loss = TauLoss(l_m=0.2, label_smoothing=0.1)
+        # Loss configuration (residual scales, component weights, smoothing)
+        # comes from cfg.tau_loss so the ParT models and ParTauDETR are set up
+        # the same way; see TauLoss.from_config.
+        self.tau_loss = TauLoss.from_config(cfg.get("tau_loss"), owner="MultiParTau")
 
         self.num_tasks = 4
         # Disable automatic optimization so PCGrad can do per-task backward passes

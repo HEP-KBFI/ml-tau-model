@@ -273,7 +273,97 @@ def build_loggers(cfg: DictConfig, tb_log_dir: str) -> list:
     return loggers
 
 
-def write_run_metrics(cfg, trainer, datamodule, loggers, wall_seconds, path):
+def measure_inference_time(model, datamodule, cfg, max_batches: int = 20,
+                           warmup_batches: int = 3) -> dict | None:
+    """
+    Time a forward-only pass over the validation loader.
+
+    Two numbers, because they answer different questions. `forward_*` excludes
+    everything but the model, which is what scales with model size and is
+    comparable across a study whose runs differ in dataset size. `end_to_end_*`
+    includes waiting for the dataloader, so a big gap between them says the run
+    was input-bound rather than compute-bound -- worth knowing before reading
+    any throughput number as a property of the network.
+
+    The first batches are discarded: on ROCm and CUDA alike the first forward
+    pays for kernel compilation and allocator warm-up, which at these batch
+    counts would otherwise dominate the mean.
+    """
+    loader = datamodule.val_dataloader()
+    if loader is None:
+        return None
+
+    device = next(model.parameters()).device
+    model.eval()
+
+    forward_seconds = 0.0
+    loop_start = None
+    jets = 0
+    batches = 0
+
+    def _sync():
+        if device.type == "cuda":
+            torch.cuda.synchronize()
+
+    try:
+        with torch.no_grad():
+            for index, batch in enumerate(loader):
+                if index == warmup_batches:
+                    # Start the end-to-end clock only once warm, so both numbers
+                    # cover the same batches.
+                    _sync()
+                    loop_start = time.perf_counter()
+                batch = _move_batch(batch, device)
+                _sync()
+                started = time.perf_counter()
+                model.forward(batch)
+                _sync()
+                elapsed = time.perf_counter() - started
+                if index >= warmup_batches:
+                    forward_seconds += elapsed
+                    jets += int(batch[0].shape[0])
+                    batches += 1
+                if batches >= max_batches:
+                    break
+    except Exception as exc:  # pragma: no cover - timing must not fail a run
+        warnings.warn(f"inference timing failed: {exc}")
+        return None
+    finally:
+        model.train()
+
+    if batches == 0 or jets == 0:
+        return None
+
+    end_to_end = time.perf_counter() - loop_start if loop_start else forward_seconds
+    return {
+        "device": str(device),
+        "batches_timed": batches,
+        "jets_timed": jets,
+        "batch_size": jets // batches,
+        "forward_seconds_total": round(forward_seconds, 4),
+        "forward_ms_per_batch": round(forward_seconds / batches * 1e3, 3),
+        "forward_us_per_jet": round(forward_seconds / jets * 1e6, 3),
+        "forward_jets_per_second": round(jets / forward_seconds, 1),
+        "end_to_end_seconds_total": round(end_to_end, 4),
+        "end_to_end_jets_per_second": round(jets / end_to_end, 1),
+        # < 1 means the loop spends most of its time waiting for data.
+        "forward_fraction_of_wall": round(forward_seconds / end_to_end, 3),
+    }
+
+
+def _move_batch(batch, device):
+    """Batches are nested tuples/dicts of tensors; move the tensors only."""
+    if isinstance(batch, torch.Tensor):
+        return batch.to(device, non_blocking=True)
+    if isinstance(batch, dict):
+        return {key: _move_batch(value, device) for key, value in batch.items()}
+    if isinstance(batch, (list, tuple)):
+        return type(batch)(_move_batch(value, device) for value in batch)
+    return batch
+
+
+def write_run_metrics(cfg, trainer, datamodule, loggers, wall_seconds, path,
+                      inference=None):
     """
     Summarise the run into one JSON file next to the checkpoints.
 
@@ -350,6 +440,17 @@ def write_run_metrics(cfg, trainer, datamodule, loggers, wall_seconds, path):
         summary["warning"] = note
         warnings.warn(note)
 
+    # The per-head breakdown BELONGING TO the best validation loss, captured by
+    # ParTauDETRModule.on_validation_end. final_metrics below is the last
+    # validation pass, which is a different epoch whenever the run stopped
+    # improving early, so the two must not be confused.
+    best_metrics = getattr(getattr(trainer, "lightning_module", None),
+                           "best_val_metrics", None)
+    summary["best_val_metrics"] = best_metrics
+
+    # Forward-only throughput of the trained model.
+    summary["inference"] = inference
+
     # Every metric from the final validation pass, so the per-head breakdown is
     # available without opening TensorBoard.
     summary["final_metrics"] = {
@@ -374,6 +475,26 @@ def write_run_metrics(cfg, trainer, datamodule, loggers, wall_seconds, path):
         json.dump(summary, out_file, indent=2, sort_keys=True)
         out_file.write("\n")
     print(f"[ParTauDETR] wrote {path}")
+
+    # Also to stdout, so the slurm log of a scaling task carries the headline
+    # numbers without anyone opening the JSON.
+    if best_metrics:
+        print(
+            f"[ParTauDETR] best val loss {best_metrics['val_losses/loss']:.5f} "
+            f"at epoch {best_metrics['epoch']} (step {best_metrics['step']})",
+            flush=True,
+        )
+        for name, value in sorted(best_metrics.items()):
+            if name.startswith("val_losses/") and name != "val_losses/loss":
+                print(f"    {name:38s} {value:.5f}", flush=True)
+    if inference:
+        print(
+            f"[ParTauDETR] inference {inference['forward_us_per_jet']} us/jet "
+            f"({inference['forward_jets_per_second']:,.0f} jets/s) on "
+            f"{inference['device']}, {inference['batches_timed']} batches of "
+            f"{inference['batch_size']}",
+            flush=True,
+        )
     return summary
 
 
@@ -507,8 +628,28 @@ def train(cfg: DictConfig):
     )
 
     started = time.perf_counter()
+    inference = None
     try:
         trainer.fit(model=model, datamodule=datamodule)
+        # After fit, so the timing reflects the trained model on the device it
+        # trained on. Guarded inside the helper: a timing failure must not lose
+        # the run's metrics.
+        bench_cfg = cfg.training.get("inference_benchmark", None)
+        if bench_cfg is None or bool(bench_cfg.get("enabled", True)):
+            inference = measure_inference_time(
+                model,
+                datamodule,
+                cfg,
+                max_batches=int(bench_cfg.get("batches", 20)) if bench_cfg else 20,
+                warmup_batches=int(bench_cfg.get("warmup", 3)) if bench_cfg else 3,
+            )
+            if inference is not None:
+                print(
+                    f"[ParTauDETR] inference: {inference['forward_us_per_jet']} us/jet, "
+                    f"{inference['forward_jets_per_second']:,.0f} jets/s forward "
+                    f"({inference['forward_fraction_of_wall']:.0%} of wall)",
+                    flush=True,
+                )
     finally:
         # Written in `finally` so a run killed by the wall clock still records
         # the best score it reached, which is the quantity the scaling study
@@ -521,6 +662,7 @@ def train(cfg: DictConfig):
                 loggers,
                 time.perf_counter() - started,
                 os.path.join(cfg.output_dir, "metrics.json"),
+                inference=inference,
             )
         except Exception as exc:  # pragma: no cover - never mask a training error
             warnings.warn(f"Could not write metrics.json: {exc}")
