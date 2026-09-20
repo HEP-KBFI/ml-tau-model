@@ -492,80 +492,134 @@ def _assign(p_eta, p_phi, t_eta, t_phi, max_dr):
     return int((dr[rows, cols] <= max_dr).sum())
 
 
+def _decay_mode_correct(n_charged_pred, n_neutral_pred, n_charged_true, n_neutral_true):
+    """
+    Per-jet: does the predicted daughter set map to the true decay mode?
+
+    Decay mode is 5 * (n_charged - 1) + min(n_neutral, 4) in ml-tau-data, so
+    equality of the two counts (neutrals clamped at 4) is equality of the mode.
+    Done on counts rather than through the classifier so the scan stays a few
+    numpy operations per threshold.
+    """
+    return (n_charged_pred == n_charged_true) & (
+        np.minimum(n_neutral_pred, 4) == np.minimum(n_neutral_true, 4)
+    )
+
+
+def _mean_f1(scores, threshold, pred_eta, pred_phi, true_eta, true_phi, true_valid, max_dr):
+    """Mean per-jet F1 of dR-matched daughters at one threshold."""
+    n_true = true_valid.sum(axis=1)
+    keep = scores >= threshold
+    n_pred = keep.sum(axis=1)
+    matched = np.zeros(len(n_true), dtype=np.int64)
+    for i in np.nonzero((n_pred > 0) & (n_true > 0))[0]:
+        matched[i] = _assign(
+            pred_eta[i][keep[i]], pred_phi[i][keep[i]],
+            true_eta[i][true_valid[i]], true_phi[i][true_valid[i]], max_dr,
+        )
+    efficiency = np.divide(matched, n_true, out=np.zeros(len(n_true)), where=n_true > 0)
+    purity = np.divide(matched, n_pred, out=np.zeros(len(n_true), dtype=float), where=n_pred > 0)
+    denominator = efficiency + purity
+    f1 = np.divide(2 * efficiency * purity, denominator, out=np.zeros_like(denominator),
+                   where=denominator > 0)
+    return float(f1.mean())
+
+
 def scan_threshold(
-    scores, pred_eta, pred_phi, true_eta, true_phi, true_valid,
-    thresholds=None, max_dr: float = 0.4,
+    scores, pred_eta, pred_phi, pred_charged, true_eta, true_phi, true_valid, true_charged,
+    thresholds=None, max_dr: float = 0.4, objective: str = "decay_mode",
 ):
     """
-    Threshold maximising the mean per-jet F1 of matched daughters.
+    Objectness threshold maximising `objective` over true tau jets.
 
-    Same figure of merit as scan_thresholds in the inference path: efficiency is
-    matched/true, purity is matched/predicted, and their harmonic mean is
-    averaged over jets. Only jets with at least one true daughter take part --
-    background contributes no F1 either way and would only dilute it.
+    objective = "decay_mode": fraction of jets whose predicted charged and
+    neutral daughter counts both equal the truth, i.e. decay-mode accuracy.
+    That is the deliverable, and it is all-or-nothing in the prong count: one
+    spurious daughter changes the mode outright.
 
-    Everything is dense numpy, and the per-jet assignment is dR only: the
-    identity penalties the inference matcher adds do not change which threshold
-    wins, and leaving them out keeps a scan over ~9 points affordable inside a
-    training run.
+    objective = "f1": mean per-jet F1 of dR-matched daughters, the older figure
+    of merit. It treats a spurious or missing daughter as a partial loss, so
+    its optimum sits below the decay-mode one; on the 20k-step baseline it
+    picked 0.75 where 0.85 was 1.7 points of accuracy better.
+
+    Only jets with at least one true daughter take part -- background has no
+    decay mode and would only dilute either figure. The F1 at the chosen
+    threshold is returned alongside whichever objective was used, for
+    continuity of the logged curves.
+
+    Returns (best_threshold, {threshold: {"decay_mode_accuracy": .., "f1": ..}}),
+    where "f1" is filled only at the best threshold unless it was the
+    objective (the assignment is the expensive part of the scan).
     """
+    if objective not in ("decay_mode", "f1"):
+        raise ValueError(f"threshold_scan.objective must be 'decay_mode' or 'f1', got {objective!r}")
     if thresholds is None:
-        thresholds = np.linspace(0.5, 0.9, 9)
+        thresholds = np.linspace(0.3, 0.9, 13)
     signal = true_valid.any(axis=1)
     if not signal.any():
         return None, {}
-    scores, pred_eta, pred_phi = scores[signal], pred_eta[signal], pred_phi[signal]
-    true_eta, true_phi = true_eta[signal], true_phi[signal]
-    true_valid = true_valid[signal]
-    n_true = true_valid.sum(axis=1)
+    scores, pred_eta, pred_phi, pred_charged = (
+        scores[signal], pred_eta[signal], pred_phi[signal], pred_charged[signal]
+    )
+    true_eta, true_phi, true_valid, true_charged = (
+        true_eta[signal], true_phi[signal], true_valid[signal], true_charged[signal]
+    )
+    n_charged_true = (true_valid & true_charged).sum(axis=1)
+    n_neutral_true = (true_valid & ~true_charged).sum(axis=1)
 
-    f1_by_threshold = {}
+    by_threshold = {}
     for threshold in thresholds:
         keep = scores >= threshold
-        n_pred = keep.sum(axis=1)
-        matched = np.zeros(len(n_true), dtype=np.int64)
-        for i in np.nonzero((n_pred > 0) & (n_true > 0))[0]:
-            matched[i] = _assign(
-                pred_eta[i][keep[i]], pred_phi[i][keep[i]],
-                true_eta[i][true_valid[i]], true_phi[i][true_valid[i]], max_dr,
-            )
-        efficiency = np.divide(matched, n_true, out=np.zeros(len(n_true)), where=n_true > 0)
-        purity = np.divide(matched, n_pred, out=np.zeros(len(n_true), dtype=float),
-                           where=n_pred > 0)
-        denominator = efficiency + purity
-        f1 = np.divide(2 * efficiency * purity, denominator,
-                       out=np.zeros_like(denominator), where=denominator > 0)
-        f1_by_threshold[float(threshold)] = float(f1.mean())
-    best = max(f1_by_threshold, key=f1_by_threshold.get)
-    return best, f1_by_threshold
+        n_charged_pred = (keep & pred_charged).sum(axis=1)
+        n_neutral_pred = (keep & ~pred_charged).sum(axis=1)
+        entry = {
+            "decay_mode_accuracy": float(
+                _decay_mode_correct(n_charged_pred, n_neutral_pred, n_charged_true, n_neutral_true).mean()
+            ),
+        }
+        if objective == "f1":
+            entry["f1"] = _mean_f1(scores, threshold, pred_eta, pred_phi, true_eta, true_phi, true_valid, max_dr)
+        by_threshold[float(threshold)] = entry
+
+    key = "decay_mode_accuracy" if objective == "decay_mode" else "f1"
+    best = max(by_threshold, key=lambda t: by_threshold[t][key])
+    if "f1" not in by_threshold[best]:
+        by_threshold[best]["f1"] = _mean_f1(
+            scores, best, pred_eta, pred_phi, true_eta, true_phi, true_valid, max_dr
+        )
+    return best, by_threshold
 
 
 class ThresholdCalibrationBuffer:
     """
-    Holds the most recent TRAIN batches for the threshold scan.
+    Holds recent TRAIN batches for the threshold scan.
 
     Filled from training_step, so the scan costs no extra forward passes; the
     buffer is a ring of the last batches, which are the closest thing available
-    to the model's current state. Only what the dR matching needs is kept.
+    to the model's current state. Only what the two objectives need is kept:
+    objectness scores, directions for the dR matching, and whether each
+    predicted / true daughter is of a charged class for the decay-mode count.
     """
 
     def __init__(self, max_jets: int = 100_000):
         self.max_jets = max_jets
         self.batches: list[dict] = []
 
-    def add(self, scores, pred_eta, pred_phi, true_eta, true_phi, true_valid) -> None:
+    def add(self, scores, pred_eta, pred_phi, pred_charged, true_eta, true_phi, true_valid, true_charged) -> None:
         self.batches.append({
             "scores": scores.detach().float().cpu().numpy(),
             "pred_eta": pred_eta.detach().float().cpu().numpy(),
             "pred_phi": pred_phi.detach().float().cpu().numpy(),
+            "pred_charged": pred_charged.detach().bool().cpu().numpy(),
             "true_eta": true_eta.detach().float().cpu().numpy(),
             "true_phi": true_phi.detach().float().cpu().numpy(),
-            "true_valid": true_valid.detach().cpu().numpy(),
+            "true_valid": true_valid.detach().bool().cpu().numpy(),
+            "true_charged": true_charged.detach().bool().cpu().numpy(),
         })
         while sum(len(b["scores"]) for b in self.batches) > self.max_jets and len(self.batches) > 1:
             self.batches.pop(0)
 
-    def scan(self, thresholds=None, max_dr: float = 0.4):
+    def scan(self, thresholds=None, max_dr: float = 0.4, objective: str = "decay_mode"):
         if not self.batches:
             return None, {}
         merged = {
@@ -573,7 +627,7 @@ class ThresholdCalibrationBuffer:
             for key in self.batches[0]
         }
         return scan_threshold(
-            merged["scores"], merged["pred_eta"], merged["pred_phi"],
-            merged["true_eta"], merged["true_phi"], merged["true_valid"],
-            thresholds=thresholds, max_dr=max_dr,
+            merged["scores"], merged["pred_eta"], merged["pred_phi"], merged["pred_charged"],
+            merged["true_eta"], merged["true_phi"], merged["true_valid"], merged["true_charged"],
+            thresholds=thresholds, max_dr=max_dr, objective=objective,
         )

@@ -30,6 +30,7 @@ import hydra
 import lightning as L
 import torch
 from lightning.pytorch.callbacks import (
+    EarlyStopping,
     LearningRateMonitor,
     ModelCheckpoint,
     TQDMProgressBar,
@@ -273,7 +274,7 @@ def build_loggers(cfg: DictConfig, tb_log_dir: str) -> list:
     return loggers
 
 
-def measure_inference_time(model, datamodule, cfg, max_batches: int = 20,
+def measure_inference_time(model, datamodule, cfg, device, max_batches: int = 20,
                            warmup_batches: int = 3) -> dict | None:
     """
     Time a forward-only pass over the validation loader.
@@ -288,13 +289,27 @@ def measure_inference_time(model, datamodule, cfg, max_batches: int = 20,
     The first batches are discarded: on ROCm and CUDA alike the first forward
     pays for kernel compilation and allocator warm-up, which at these batch
     counts would otherwise dominate the mean.
+
+    `device` is passed in rather than read off the model: Lightning moves the
+    module back to the CPU when fit() tears down, so taking the device from the
+    parameters timed the CPU and wrote that into metrics.json as the model's
+    throughput (2.6 ms/jet against ~45 us/jet on the L40S it trained on).
     """
     loader = datamodule.val_dataloader()
     if loader is None:
         return None
 
-    device = next(model.parameters()).device
+    device = torch.device(device)
+    model.to(device)
     model.eval()
+    # A short run has fewer validation batches than the requested count; time
+    # what exists rather than looping past the end.
+    try:
+        available = len(loader) - warmup_batches
+        if available >= 1:
+            max_batches = min(max_batches, available)
+    except TypeError:  # loader without a length
+        pass
 
     forward_seconds = 0.0
     loop_start = None
@@ -368,10 +383,11 @@ def write_run_metrics(cfg, trainer, datamodule, loggers, wall_seconds, path,
     Summarise the run into one JSON file next to the checkpoints.
 
     The best validation loss is otherwise recorded nowhere machine-readable:
-    `save_weights_only=True` drops the `callbacks` block from the checkpoint (so
-    no best_model_score), the filename carries no metric template, and the value
-    survives only in the TensorBoard event files and in Comet. Aggregating a
-    scaling study then means parsing protobufs or hitting the network.
+    the best-model checkpoint is weights-only, so it carries no `callbacks`
+    block (and no best_model_score), the filename carries no metric template,
+    and the value survives only in the TensorBoard event files and in Comet.
+    Aggregating a scaling study then means parsing protobufs or hitting the
+    network.
     """
     summary = {
         "wall_seconds": round(wall_seconds, 1),
@@ -544,6 +560,9 @@ def train(cfg: DictConfig):
     # Seed before anything builds a module or a dataloader. workers=True gives
     # each dataloader worker a distinct, derived seed.
     L.seed_everything(int(cfg.training.get("seed", 42)), workers=True)
+    # TF32 matmuls on Ampere and later GPUs (L40S, A100). Lightning prints this
+    # hint on every run; it is free throughput and independent of AMP.
+    torch.set_float32_matmul_precision("high")
 
     # Ensure the datamodule follows the signal-only path by default.
     cfg.training.model.name = "ParTauDETR"
@@ -592,10 +611,34 @@ def train(cfg: DictConfig):
             monitor="val_losses/loss",
             mode="min",
             save_top_k=1,
-            save_last=True,
+            save_last=False,
             save_weights_only=True,
             filename="ParTauDETR-model_best",
             save_on_train_epoch_end=False,
+        ),
+        # last.ckpt with optimizer and scheduler state, so a run that is
+        # pre-empted or hits its wall clock can resume with `ckpt_path`. Kept
+        # apart from the best-model callback because that one is weights-only
+        # (a ModelCheckpoint has a single save_weights_only flag for both its
+        # top-k and its last file). Costs one full checkpoint (~90 MB).
+        ModelCheckpoint(
+            dirpath=models_dir,
+            save_top_k=0,
+            save_last=True,
+            save_weights_only=False,
+            save_on_train_epoch_end=False,
+        ),
+        # Stop on a non-finite validation loss. Nothing else did: the 250-epoch
+        # run of 2026-09-16 went NaN at epoch 91 and ran 19 more hours on NaN
+        # weights. patience is effectively infinite, so this never stops a run
+        # for plateauing -- it is purely the finiteness check. training_step
+        # has the per-step counterpart for the training loss.
+        EarlyStopping(
+            monitor="val_losses/loss",
+            mode="min",
+            patience=10**9,
+            check_finite=True,
+            verbose=True,
         ),
         # Fallback: best by train loss. train_losses/* are logged with
         # on_epoch=True, so they only appear once the training epoch has been
@@ -620,7 +663,7 @@ def train(cfg: DictConfig):
         accelerator=check_accelerator(cfg),
         devices=cfg.training.trainer.devices,
         precision=str(cfg.training.trainer.precision),
-        gradient_clip_val=1.0,
+        gradient_clip_val=float(cfg.training.trainer.get("gradient_clip_val", 1.0)),
         gradient_clip_algorithm="norm",
         num_sanity_val_steps=cfg.training.trainer.num_sanity_val_steps,
         enable_progress_bar=True,
@@ -640,6 +683,7 @@ def train(cfg: DictConfig):
                 model,
                 datamodule,
                 cfg,
+                device=trainer.strategy.root_device,
                 max_batches=int(bench_cfg.get("batches", 20)) if bench_cfg else 20,
                 warmup_batches=int(bench_cfg.get("warmup", 3)) if bench_cfg else 3,
             )

@@ -58,7 +58,6 @@ class ParTauDETR(ParticleTransformer):
         },
         activation: str = "gelu",
         # misc
-        trim: bool = True,
         for_inference: bool = False,
         use_amp: bool = False,
         metric: str = "eta-phi",  # for ee should be theta
@@ -84,7 +83,6 @@ class ParTauDETR(ParticleTransformer):
             cls_block_params=cls_block_params,
             fc_params=None,
             activation=activation,
-            trim=trim,
             for_inference=for_inference,
             use_amp=use_amp,
             metric=metric,

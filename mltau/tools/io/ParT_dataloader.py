@@ -232,6 +232,9 @@ class ParticleTransformerDataset(IterableDataset):
         # evaluation, notebooks -- standardises identically without having to
         # remember to ask.
         self.input_scaler = None
+        # Counts __iter__ calls, so every epoch gets its own reproducible
+        # shuffle (see _epoch_rng).
+        self._epochs_started = 0
         if self.row_groups:
             print(
                 f"There are {'{:,}'.format(self.num_rows)} jets in the dataset.",
@@ -270,6 +273,26 @@ class ParticleTransformerDataset(IterableDataset):
             )
             self._warn_if_shards_lose_a_sample()
 
+
+    def _epoch_rng(self) -> np.random.Generator:
+        """
+        Generator for this epoch's read order and in-chunk shuffles.
+
+        Seeded, so a run is reproducible from `training.seed` (which the
+        training scripts hand to seed_everything) -- an unseeded default_rng()
+        here made the read order differ between two runs of the same config
+        while the comment on `seed` claimed it covered shuffling. Three
+        ingredients: the configured seed; torch's per-process seed, which the
+        DataLoader derives from the global seed per worker so workers do not
+        replay each other; and the epoch counter, so persistent workers do not
+        replay the previous epoch.
+        """
+        self._epochs_started += 1
+        cfg_seed = 42
+        if "training" in self.cfg and "seed" in self.cfg.training:
+            cfg_seed = int(self.cfg.training.seed)
+        process_seed = int(torch.initial_seed() % (2**31 - 1))
+        return np.random.default_rng([cfg_seed, process_seed, self._epochs_started])
 
     def set_input_scaler(self, scaler) -> None:
         """Attach a `tensors -> tensors` callable, or None to disable scaling."""
@@ -748,7 +771,7 @@ class ParticleTransformerDataset(IterableDataset):
         in total, now split across the samples rather than possibly all being
         the same class.
         """
-        rng = np.random.default_rng()
+        rng = self._epoch_rng()
         queues: dict[str, list] = {}
         for unit in reads_to_process:
             queues.setdefault(sample_name(unit[0]), []).append(unit)
@@ -808,7 +831,7 @@ class ParticleTransformerDataset(IterableDataset):
         predict splits where the emission order is meaningful.
         """
         if self.shuffle:
-            np.random.default_rng().shuffle(reads_to_process)
+            self._epoch_rng().shuffle(reads_to_process)
 
         # Rows left over from a chunk are carried into the next one instead of
         # being emitted as a short batch. That keeps every batch full except the

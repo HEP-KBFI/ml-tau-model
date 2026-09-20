@@ -19,6 +19,12 @@ logging:
         # true needs outbound network access from the compute node. false writes
         # an archive under <output_dir>/comet to upload afterwards with
         # `comet upload <output_dir>/comet/*.zip`.
+        # true needs outbound network access from the compute node. On a node
+        # without it (KBFI compute nodes) comet spends ~3 minutes on connection
+        # retries at job start and then logs nothing; there, override with
+        # logging.comet.online=false, which writes an archive under
+        # <output_dir>/comet to upload afterwards with `comet upload
+        # <output_dir>/comet/*.zip`.
         online: true
         log_code: false
         log_graph: false
@@ -46,13 +52,14 @@ logging:
         workspace: null
 
 model:
-    # 8 = dataset.max_tau_daughters for now; to be reduced (pull request 30
-    # proposed 5: three charged + two neutral mesons) once
-    # `mltau/scripts/check_query_budget.py` has measured the daughter
-    # multiplicity of the production. The matcher hands out min(num_queries,
-    # n_targets) pairs, so a tau with more daughters than queries keeps targets
-    # no query can reach: change this and max_tau_daughters together.
-    num_queries: 8
+    # Always equal to dataset.max_tau_daughters, by interpolation. The matcher
+    # hands out min(num_queries, n_targets) pairs, so with fewer queries than
+    # target slots the surplus targets are unreachable and never supervised,
+    # silently (pull request 30 shipped 5 queries against 8 slots).
+    # ParTauDETRModule raises if a command-line override sets them apart. To
+    # change the count: dataset.max_tau_daughters=<n>. Changing it also changes
+    # the objectness class balance -- see loss.eos_coef.
+    num_queries: ${dataset.max_tau_daughters}
     num_charge_classes: 3
     num_kinematics_components: 5
     # The PDG head width is derived from dataset.tau_daughter_pdg_ids, which is
@@ -70,7 +77,6 @@ model:
         remove_self_pair: false
         activation: gelu
         metric: theta-phi # theta-phi for e+e-, eta-phi for pp
-        trim: true
 
     detr:
         decoder_num_layers: 4
@@ -128,9 +134,30 @@ model:
             weight_parent_kinematics: 0.0
             weight_parent_charge: 0.0
             weight_parent_decay_mode: 0.0
-            eos_coef: 0.1
+            # Loss weight of the "no object" class of the objectness head; the
+            # object class has weight 1. With n_obj real daughters among Q
+            # queries the two sides carry equal total weight at
+            #     eos_coef = n_obj / (Q - n_obj)
+            # DETR's 0.1 is that formula at Q=100, n_obj~7. Here n_obj = 2.31 on
+            # average, so at Q=6 balance is 0.63 and 0.1 was 6x below it: a query
+            # firing on nothing cost a tenth of a query missing a real daughter,
+            # the head over-fired (2.70 predicted daughters against 2.31 true),
+            # the threshold scan pushed the operating point to 0.70-0.85 to
+            # compensate, and at that point real charged daughters were cut too.
+            # Measured at 20k steps, 6 queries, everything else equal:
+            #     eos_coef 0.1: decay-mode accuracy 0.501, unphysical 0.160
+            #     eos_coef 1.0: decay-mode accuracy 0.799, unphysical 0.094
+            # 1.0 rather than the balanced 0.63 because false positives are what
+            # destroy the decay mode (an extra daughter changes the prong count
+            # outright), and it removes a magic number. Re-derive if Q changes.
+            eos_coef: 1.0
         inference:
-            score_threshold: 0.85
+            # Starting value and fallback for the objectness threshold. During
+            # training it is recalibrated before every validation (see
+            # training.threshold_scan), stored in the checkpoint, and that
+            # calibrated value is what predict_step uses. A balanced binary
+            # head belongs near 0.5; with eos_coef 1.0 the scan settles there.
+            score_threshold: 0.5
             # p(tau) from the tauID head above which a jet's predicted daughters
             # are kept in predict_step. Objectness is trained on signal jets
             # only, so whether a jet has daughters at all is the tagger's call.

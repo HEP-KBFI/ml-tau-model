@@ -1,7 +1,13 @@
 dataset:
     max_cands: 20
     num_features: 17
-    max_tau_daughters: 8
+    # Target slots per jet, and (by interpolation) the number of decoder
+    # queries. Measured over all 5.3M signal jets of the 0915 production with
+    # check_query_budget.py: after the meson-class filter no tau has more than
+    # 5 daughters (DM 4 and DM 12 reach exactly 5), so 6 is one slot of margin,
+    # not a requirement. Fewer queries make each one count more; see
+    # model.detr.loss.eos_coef before changing this.
+    max_tau_daughters: 6
      # Negative value disables the pT cut
      # NB! When enabling the cut, the charge, DM and 4-momentum that is
      # obtained by aggregating generator-level constituents passing the pT

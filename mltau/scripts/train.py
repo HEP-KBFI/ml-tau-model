@@ -17,6 +17,10 @@ import matplotlib
 
 matplotlib.use("Agg")
 
+# TF32 matmuls on Ampere and later GPUs: Lightning prints this hint on every
+# run; it is free throughput and does not touch mixed-precision numerics.
+torch.set_float32_matmul_precision("high")
+
 from mltau.models import MultiParTau_module, SingleParTau_module
 from mltau.tools.evaluation import inference
 from mltau.tools.io import ParT_dataloader as dl

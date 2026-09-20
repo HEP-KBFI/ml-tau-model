@@ -263,6 +263,10 @@ class HungarianMatcher(nn.Module):
         batch_size, num_queries, _ = pred_logits.shape
         num_targets = target_mask.size(1)
 
+        # Cleared every call: a batch without a single match must not re-log
+        # the previous batch's cost split as if it were current.
+        self.last_cost_terms = {}
+
         empty = torch.empty(0, dtype=torch.long, device=device)
         if num_targets == 0 or batch_size == 0:
             return empty, empty, empty
@@ -481,8 +485,10 @@ class SetCriterion(nn.Module):
             signal_mask = torch.ones(batch_size, dtype=torch.bool, device=device)
 
         # Restricting the matcher to signal jets means background jets are never
-        # even handed to the assignment solver -- with a 7:1 background:signal mix
-        # that alone removes most of the matching work.
+        # even handed to the assignment solver, which removes most of the
+        # matching work whenever background dominates the jet count. (The
+        # actual mix is set by dataset.max_jets_per_sample and, for the tauID
+        # loss, by cls_weight; do not assume a ratio here.)
         match_mask = target_mask & signal_mask.unsqueeze(1)
         pair_b, pair_q, pair_t = self.matcher(
             pred_logits=pred_logits,
@@ -651,9 +657,12 @@ class SetCriterion(nn.Module):
         # unweighted, like the daughter losses (class docstring).
         parent_weights = signal_mask.to(dtype=pred_logits.dtype)
 
-        with torch.set_grad_enabled(
-            torch.is_grad_enabled() and self.loss_parent_kinematics_weight > 0
-        ):
+        # Computed only when it contributes. These three ship at weight 0 and
+        # were still evaluated on every step (set_grad_enabled suppresses the
+        # backward, not the forward): a decode + index_add and two Python loops
+        # over the queries, ~50 kernel launches per step for a number used only
+        # as a log. With the weight at 0 the logged value is 0.
+        if self.loss_parent_kinematics_weight > 0:
             reference_pt = kinematics_reference_p4["pt"].to(dtype=pred_kinematics.dtype, device=device)[pair_b]
             reference_eta = kinematics_reference_p4["eta"].to(dtype=pred_kinematics.dtype, device=device)[pair_b]
             reference_phi = kinematics_reference_p4["phi"].to(dtype=pred_kinematics.dtype, device=device)[pair_b]
@@ -699,9 +708,12 @@ class SetCriterion(nn.Module):
         if self.loss_parent_kinematics_weight > 0:
             total_loss = total_loss + self.loss_parent_kinematics_weight * loss_parent_kinematics
 
-        with torch.set_grad_enabled(
-            torch.is_grad_enabled() and self.loss_parent_charge_weight > 0
-        ):
+        # Computed only when it contributes. These three ship at weight 0 and
+        # were still evaluated on every step (set_grad_enabled suppresses the
+        # backward, not the forward): a decode + index_add and two Python loops
+        # over the queries, ~50 kernel launches per step for a number used only
+        # as a log. With the weight at 0 the logged value is 0.
+        if self.loss_parent_charge_weight > 0:
             matched_query_mask = torch.zeros(
                 (batch_size, num_queries), dtype=torch.bool, device=device
             )
@@ -738,9 +750,12 @@ class SetCriterion(nn.Module):
         if self.loss_parent_charge_weight > 0:
             total_loss = total_loss + self.loss_parent_charge_weight * loss_parent_charge
 
-        with torch.set_grad_enabled(
-            torch.is_grad_enabled() and self.loss_parent_decay_mode_weight > 0
-        ):
+        # Computed only when it contributes. These three ship at weight 0 and
+        # were still evaluated on every step (set_grad_enabled suppresses the
+        # backward, not the forward): a decode + index_add and two Python loops
+        # over the queries, ~50 kernel launches per step for a number used only
+        # as a log. With the weight at 0 the logged value is 0.
+        if self.loss_parent_decay_mode_weight > 0:
             matched_query_mask = torch.zeros(
                 (batch_size, num_queries), dtype=torch.bool, device=device
             )
@@ -865,6 +880,19 @@ class ParTauDETRModule(L.LightningModule):
         meson_classes = get_meson_classes(cfg.dataset.tau_daughter_pdg_ids)
         self.num_meson_classes = len(meson_classes)
 
+        # The matcher returns min(num_queries, n_targets) pairs per jet, so
+        # with fewer queries than target slots the surplus targets are never
+        # supervised, silently. The config ties the two by interpolation; this
+        # catches a command-line override of one of them alone.
+        num_queries = int(arch.num_queries)
+        max_tau_daughters = int(cfg.dataset.max_tau_daughters)
+        if num_queries != max_tau_daughters:
+            raise ValueError(
+                f"model.num_queries ({num_queries}) must equal "
+                f"dataset.max_tau_daughters ({max_tau_daughters}). Override "
+                "dataset.max_tau_daughters and let num_queries follow it."
+            )
+
         self.tau_loss = TauLoss.from_config(arch.tau_loss, owner="ParTauDETR")
         self.num_kinematics_components = int(arch.num_kinematics_components)
 
@@ -899,7 +927,6 @@ class ParTauDETRModule(L.LightningModule):
             remove_self_pair=bool(encoder_cfg.remove_self_pair),
             activation=str(encoder_cfg.activation),
             metric=str(encoder_cfg.metric),
-            trim=bool(encoder_cfg.trim),
             # DETR decoder and heads
             decoder_num_layers=int(detr_cfg.decoder_num_layers),
             decoder_num_heads=decoder_num_heads,
@@ -952,6 +979,8 @@ class ParTauDETRModule(L.LightningModule):
             ignore_index=self.ignore_index,
         )
 
+        # Starting value and fallback for the objectness threshold; the
+        # calibrated value lives in the `score_threshold_calibrated` buffer.
         self.score_threshold = float(detr_cfg.inference.score_threshold)
         # p(tau) above which a jet's predicted daughters are kept at prediction
         # time. Objectness is trained on signal jets only, so the tauID head is
@@ -999,6 +1028,12 @@ class ParTauDETRModule(L.LightningModule):
         self.threshold_scan_enabled = (
             True if scan_cfg is None else bool(scan_cfg.get("enabled", True))
         )
+        self.threshold_scan_objective = (
+            str(scan_cfg.get("objective", "decay_mode")) if scan_cfg else "decay_mode"
+        )
+        self.threshold_buffer_every = max(
+            1, int(scan_cfg.get("buffer_every_n_steps", 20)) if scan_cfg else 20
+        )
         self.threshold_buffer = s2s.ThresholdCalibrationBuffer(
             max_jets=int(scan_cfg.get("jets", 100_000)) if scan_cfg else 100_000
         )
@@ -1009,9 +1044,18 @@ class ParTauDETRModule(L.LightningModule):
                 int(scan_cfg.get("points", 9)),
             )
             if scan_cfg
-            else np.linspace(0.5, 0.9, 9)
+            else np.linspace(0.3, 0.9, 13)
         )
-        self.current_score_threshold = float(detr_cfg.inference.score_threshold)
+        # The calibrated objectness threshold. A registered buffer, not a
+        # plain attribute, so it travels with the checkpoint: validation,
+        # predict_step and anything that loads the model then use the SAME
+        # operating point. Before the first scan it is the config value.
+        self.register_buffer(
+            "score_threshold_calibrated",
+            torch.tensor(float(detr_cfg.inference.score_threshold)),
+        )
+        # Consecutive non-finite training losses seen; see training_step.
+        self._non_finite_steps = 0
 
     @staticmethod
     def _ohe_to_class_indices(
@@ -1156,6 +1200,26 @@ class ParTauDETRModule(L.LightningModule):
             jet_weights=weights,
         )
 
+        # A non-finite loss must not reach the optimizer: one backward of a NaN
+        # writes NaN into every weight, and the run then continues producing
+        # NaN until its wall clock (the 250-epoch run of 2026-09-16 spent 19 h
+        # that way). Returning None skips this step; several in a row means
+        # the model is gone, so stop the run and let the checkpoints stand.
+        if not bool(torch.isfinite(losses["loss"])):
+            self._non_finite_steps += 1
+            self.log("train/non_finite_steps", float(self._non_finite_steps),
+                     on_step=True, on_epoch=False)
+            step = getattr(self.trainer, "global_step", "?") if self.trainer is not None else "?"
+            warnings.warn(
+                f"non-finite training loss at step {step} "
+                f"({self._non_finite_steps} in a row); skipping the optimizer step."
+            )
+            if self._non_finite_steps >= 5 and self.trainer is not None:
+                warnings.warn("5 consecutive non-finite losses: stopping the run.")
+                self.trainer.should_stop = True
+            return None
+        self._non_finite_steps = 0
+
         self.log("train_losses/loss", losses["loss"], on_step=False, on_epoch=True)
         self.log(
             "train_losses/objectness",
@@ -1243,7 +1307,7 @@ class ParTauDETRModule(L.LightningModule):
         # on_epoch, because an epoch mean hides a collapse that lasts a chunk.
         self.log("counts/num_matched", losses["num_matched"],
                  on_step=True, on_epoch=True)
-        if self.threshold_scan_enabled:
+        if self.threshold_scan_enabled and self.global_step % self.threshold_buffer_every == 0:
             self._buffer_for_threshold_scan(batch, outputs, targets)
         # What the matcher is actually deciding on. cost/class_share rising over
         # training is the signature of the assignment being driven by predicted
@@ -1266,9 +1330,14 @@ class ParTauDETRModule(L.LightningModule):
         jet is a tau at all is the tauID head's decision, not objectness's -- so
         on background jets the objectness scores are untrained and arbitrary.
         Letting them into the scan would count every such query above threshold
-        as a false positive against zero true daughters, and with a 7:1
-        background:signal mix that would decide the threshold rather than the
-        matching quality on taus.
+        as a false positive against zero true daughters, and the background
+        jets would then decide the threshold rather than the matching quality
+        on taus.
+
+        Throttled to every `threshold_scan.buffer_every_n_steps` training step:
+        the ring buffer holds ~17 batches, so buffering every step copied six
+        tensors to the host per step (each forcing a device sync) and discarded
+        97% of them.
         """
         reco_jet = batch[6]
         target_mask = targets["particles_mask"].bool()
@@ -1280,9 +1349,18 @@ class ParTauDETRModule(L.LightningModule):
             return
         target_kinematics = targets["particles_kinematics"][signal]
         target_mask = target_mask[signal]
-        outputs = {k: v[signal] for k, v in outputs.items() if k in ("pred_logits", "pred_kinematics")}
+        outputs = {
+            k: v[signal]
+            for k, v in outputs.items()
+            if k in ("pred_logits", "pred_kinematics", "pred_meson_class_logits")
+        }
         reco_jet = {k: v[signal] for k, v in reco_jet.items()}
         with torch.no_grad():
+            # Charged or neutral, per predicted and per true daughter: the
+            # decay-mode objective of the scan counts prongs and neutrals.
+            charged_class = self.meson_class_repr_pdg.to(self.device) == 211
+            pred_charged = charged_class[outputs["pred_meson_class_logits"].argmax(-1)]
+            true_charged = charged_class[targets["particles_meson_class_ohe"][signal].argmax(-1)]
             scores = torch.softmax(outputs["pred_logits"].float(), dim=-1)[..., 0]
             pred_eta = outputs["pred_kinematics"][..., 1].float() + reco_jet["eta"][:, None]
             pred_phi = reco_jet["phi"][:, None] + torch.atan2(
@@ -1294,7 +1372,7 @@ class ParTauDETRModule(L.LightningModule):
                 target_kinematics[..., 2].float(), target_kinematics[..., 3].float()
             )
         self.threshold_buffer.add(
-            scores, pred_eta, pred_phi, true_eta, true_phi, target_mask
+            scores, pred_eta, pred_phi, pred_charged, true_eta, true_phi, target_mask, true_charged
         )
 
     def on_validation_start(self) -> None:
@@ -1304,16 +1382,19 @@ class ParTauDETRModule(L.LightningModule):
         if self.trainer.sanity_checking:
             return
         try:
-            best, f1_by_threshold = self.threshold_buffer.scan(self.threshold_grid)
+            best, by_threshold = self.threshold_buffer.scan(
+                self.threshold_grid, objective=self.threshold_scan_objective
+            )
         except Exception as exc:  # pragma: no cover - never fail a run on this
             warnings.warn(f"threshold scan failed: {exc}")
             return
         if best is None:
             return
-        self.current_score_threshold = float(best)
-        self.log("threshold/score_threshold", self.current_score_threshold,
-                 on_step=False, on_epoch=True)
-        self.log("threshold/best_f1", float(f1_by_threshold[best]),
+        self.score_threshold_calibrated.fill_(float(best))
+        self.log("threshold/score_threshold", float(best), on_step=False, on_epoch=True)
+        self.log("threshold/best_decay_mode_accuracy",
+                 float(by_threshold[best]["decay_mode_accuracy"]), on_step=False, on_epoch=True)
+        self.log("threshold/best_f1", float(by_threshold[best]["f1"]),
                  on_step=False, on_epoch=True)
 
     def _accumulate_jet_level(self, batch, outputs, targets) -> None:
@@ -1345,7 +1426,7 @@ class ParTauDETRModule(L.LightningModule):
             kin=outputs["pred_kinematics"].float(),
             charge=charge_lut[outputs["pred_charge_logits"].argmax(-1)],
             pdg=repr_pdg[outputs["pred_meson_class_logits"].argmax(-1)],
-            valid=scores >= self.current_score_threshold,
+            valid=scores >= float(self.score_threshold_calibrated),
             reco_jet=reco_jet,
         )
         # Padded slots carry ignore_index; clamp before the lookup and let the
@@ -1593,7 +1674,10 @@ class ParTauDETRModule(L.LightningModule):
         outputs, _, _, _, _ = self.forward(batch)
 
         object_scores = torch.softmax(outputs["pred_logits"], dim=-1)[..., 0]
-        pred_mask = object_scores > self.score_threshold
+        # The calibrated threshold from the checkpoint, not the static config
+        # value: validation reports every val_jet/* number at this operating
+        # point, so prediction must use the same one.
+        pred_mask = object_scores >= self.score_threshold_calibrated.to(object_scores.dtype)
 
         charge_class = outputs["pred_charge_logits"].argmax(dim=-1)
         charge_value_lut = outputs["pred_charge_logits"].new_tensor(
@@ -1633,8 +1717,29 @@ class ParTauDETRModule(L.LightningModule):
 
     def configure_optimizers(self) -> Any:
         base_lr = self.cfg.training.lr
+        opt_cfg = self.cfg.training.get("optimizer", None) or {}
+        weight_decay = float(opt_cfg.get("weight_decay", 1e-2))
+
+        # Two parameter groups. Weight decay is a prior towards zero that makes
+        # sense for weight matrices and none for biases, LayerNorm gains, the
+        # DETR query embeddings or the cls token -- the last two are what
+        # ParTauDETR.no_weight_decay() lists, and until now that method was
+        # defined and never called, so they were decayed like everything else.
+        skip = set(self.ParTauDETR.no_weight_decay())
+        decay, no_decay = [], []
+        for name, parameter in self.ParTauDETR.named_parameters():
+            if not parameter.requires_grad:
+                continue
+            if parameter.ndim <= 1 or name in skip or name.endswith(".bias"):
+                no_decay.append(parameter)
+            else:
+                decay.append(parameter)
         optimizer = torch.optim.AdamW(
-            self.ParTauDETR.parameters(), lr=base_lr, weight_decay=1e-2
+            [
+                {"params": decay, "weight_decay": weight_decay},
+                {"params": no_decay, "weight_decay": 0.0},
+            ],
+            lr=base_lr,
         )
 
         estimated_steps = getattr(self.trainer, "estimated_stepping_batches", None)
@@ -1656,6 +1761,10 @@ class ParTauDETRModule(L.LightningModule):
             max_lr=base_lr,
             total_steps=total_steps,
             anneal_strategy="cos",
+            # Default True sweeps AdamW's beta1 0.95 -> 0.85 -> 0.95 alongside
+            # the learning rate; nothing here asked for that, and beta1 was at
+            # its minimum where the 250-epoch run diverged. Off by default.
+            cycle_momentum=bool(opt_cfg.get("cycle_momentum", False)),
         )
 
         return {

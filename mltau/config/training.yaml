@@ -33,8 +33,17 @@ training:
         # back to CPU, which looks like a working-but-inexplicably-slow run.
         accelerator: gpu
         devices: 1
-        # fp16 AMP is CUDA-only; use bf16-mixed if you ever run on CPU.
-        precision: 16-mixed
+        # bf16-mixed: no GradScaler, so the failure mode of the 250-epoch run of
+        # 2026-09-16 -- the fp16 loss scale collapsing to a subnormal around
+        # epoch 100, gradients underflowing to zero, weights going NaN at epoch
+        # 169 -- cannot recur. Native on Ada (L40S) and MI250X; measured cost 5%
+        # of throughput (1.79 -> 1.68 it/s). 16-mixed remains selectable.
+        precision: bf16-mixed
+        # Global-norm gradient clipping. In the 250-epoch run this bound on
+        # essentially every step of the healthy phase (grad/clipped ~ 1.0), so
+        # it was acting as the step-size controller rather than as a safety
+        # net; keep it visible here so it can be varied in a sweep.
+        gradient_clip_val: 1.0
 
         # Validation runs at epoch end by default. With a multi-hour epoch that
         # means no val_losses/* metrics and no ModelCheckpoint(monitor=
@@ -62,6 +71,16 @@ training:
         patience: 3
         factor: 0.5
         min_weight: 0.05
+
+    optimizer:
+        # AdamW weight decay, applied to weight matrices only. Biases, LayerNorm
+        # gains, the DETR query embeddings and the cls token are excluded (the
+        # models' no_weight_decay() sets, previously defined but never used).
+        weight_decay: 0.01
+        # OneCycleLR cycles AdamW's beta1 0.95 -> 0.85 -> 0.95 by default; that
+        # was never asked for, and beta1 sat at its minimum exactly where the
+        # 250-epoch run blew up. Off unless deliberately studied.
+        cycle_momentum: false
 
     dataloader:
         batch_size: 12288
@@ -104,9 +123,25 @@ training:
     threshold_scan:
         enabled: true
         jets: 100000
-        low: 0.5
+        # What the scan maximises. "decay_mode": the fraction of true taus whose
+        # predicted charged and neutral daughter counts both match the truth,
+        # i.e. decay-mode accuracy -- the deliverable, all-or-nothing in the
+        # prong count. "f1": mean per-jet F1 of dR-matched daughters, which
+        # treats one spurious or missing daughter as a partial loss; its optimum
+        # sits ~0.1 below the decay-mode one and cost ~2 points of accuracy
+        # when it was the objective (measured on the 20k-step baseline).
+        objective: decay_mode
+        # Grid. With eos_coef 1.0 the optimum sits at 0.5, which was the lower
+        # edge of the old [0.5, 0.9] grid, so the grid now starts well below.
+        low: 0.3
         high: 0.9
-        points: 9
+        points: 13
+        # Only every Nth training step is buffered. The ring holds `jets`
+        # jets, ~17 batches at the default batch size, so buffering every step
+        # copied six tensors to the host per step (each a device sync) and
+        # discarded 97% of them. Every 20th step covers ~340 steps of training
+        # with the same memory.
+        buffer_every_n_steps: 20
 
     # Jets kept per validation epoch for the jet-level figures (charge and decay
     # mode confusion matrices, tau kinematics residuals, tagging ROC). Only
