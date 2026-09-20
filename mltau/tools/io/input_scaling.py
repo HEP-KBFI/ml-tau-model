@@ -212,6 +212,25 @@ def apply_saved_input_scaling_from_cfg(tensors, cfg: DictConfig):
     return _apply_feature_scaler(tensors, mean, std, feature_indices)
 
 
+def load_saved_scaler(cfg: DictConfig) -> dict:
+    """
+    The fitted constants as a dict: mean, std (per selected feature) and
+    feature_indices. For code that needs the numbers themselves rather than a
+    tensors -> tensors transform -- the distillation module folds them into
+    buffers so it can un-scale the student's inputs for the frozen teacher.
+    """
+    path = scaler_path(cfg)
+    if not os.path.exists(path):
+        raise RuntimeError(f"Input scaling is enabled, but scaler was not found: {path}")
+    scaler = np.load(path)
+    _warn_on_foreign_scaler(scaler, cfg, path)
+    return {
+        "mean": scaler["mean"],
+        "std": scaler["std"],
+        "feature_indices": scaler["feature_indices"].astype(np.int64).tolist(),
+    }
+
+
 def make_input_scaler(cfg: DictConfig):
     """
     Return a `tensors -> tensors` callable, reading the scaler .npz once.

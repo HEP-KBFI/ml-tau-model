@@ -2,9 +2,20 @@ import os
 
 import hydra
 import lightning as L
+import torch
 from lightning.pytorch.callbacks import Callback, ModelCheckpoint, TQDMProgressBar
 from lightning.pytorch.loggers import TensorBoardLogger  # , CometLogger
-from omegaconf import DictConfig
+from omegaconf import DictConfig, ListConfig
+
+
+# Checkpoints carry the OmegaConf config in their hyperparameters; torch >= 2.6
+# refuses to unpickle those under its weights_only default unless registered.
+if hasattr(torch.serialization, "add_safe_globals"):
+    torch.serialization.add_safe_globals([DictConfig, ListConfig])
+
+import matplotlib
+
+matplotlib.use("Agg")
 
 from mltau.models import MultiParTau_module, SingleParTau_module
 from mltau.tools.evaluation import inference
@@ -32,6 +43,24 @@ def train(cfg: DictConfig):
     os.makedirs(log_dir, exist_ok=True)
     os.makedirs(tb_log_dir, exist_ok=True)
 
+    # Log dataset size
+    datamodule.setup("fit")
+    train_ds = datamodule.train_dataloader().dataset
+    val_ds = datamodule.val_dataloader().dataset
+
+    def get_ds_size(ds):
+        if hasattr(ds, "cand_features"):
+            return len(ds.cand_features)
+        elif hasattr(ds, "num_rows"):
+            return ds.num_rows
+        return 0
+
+    n_train = get_ds_size(train_ds)
+    n_val = get_ds_size(val_ds)
+    with open(os.path.join(cfg.output_dir, "dataset_size.txt"), "w") as f:
+        f.write(f"train: {n_train}\nval: {n_val}\ntotal: {n_train + n_val}\n")
+    print(f"[INFO] Dataset size saved to {cfg.output_dir}/dataset_size.txt")
+
     # Configure callbacks
     callbacks = [
         TQDMProgressBar(refresh_rate=100),
@@ -56,10 +85,10 @@ def train(cfg: DictConfig):
                 default_hp_metric=False,
             ),
         ],
-        accelerator="auto",  # Automatically detect GPU/CPU
-        precision="16-mixed",  # fp16 activations: halves GPU memory, ~30% faster
-        num_sanity_val_steps=0,  # Skip sanity validation for faster startup
-        enable_progress_bar=True,  # Keep enabled for monitoring
+        accelerator="auto",
+        precision="bf16-mixed",
+        num_sanity_val_steps=0,
+        enable_progress_bar=True,
     )
 
     trainer.fit(model=model, datamodule=datamodule)
@@ -79,6 +108,7 @@ def train(cfg: DictConfig):
                 input_dim=17,
                 num_dm_classes=6,
                 task=cfg.training.model.task,
+                weights_only=False,
             )
         else:
             raise ValueError(f"Unknown model '{model_name}' for prediction.")

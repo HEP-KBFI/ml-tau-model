@@ -1,6 +1,7 @@
 # End-to-End ML Reconstruction and Identification of Hadronically Decaying Tau Leptons
 
-[![Hugging Face](https://img.shields.io/badge/%F0%9F%A4%97%20Hugging%20Face-Models-orange)](https://huggingface.co/HEP-KBFI/fcc-tau)
+[![HuggingFace Model](https://img.shields.io/badge/%F0%9F%A4%97%20Hugging%20Face-Models-orange)](https://huggingface.co/HEP-KBFI/fcc-tau)
+[![HuggingFace Space](https://img.shields.io/badge/%F0%9F%A4%97%20Hugging%20Face-Spaces-orange)](https://huggingface.co/spaces/jpata/ml-tau-model)
 
 The aim of this project is to develop and test end-to-end machine learning methods for reconstruction and identification of hadronically decaying tau leptons, while also providing a thoroughly validated and tested dataset for evaluating the performance of said algorithms.
 
@@ -53,6 +54,12 @@ The dataset contains 2 signal samples (ZH→Ztautau and Z→tautau) and one back
 
 ## Quick Start
 
+```
+git clone http://github.com/HEP-KBFI/ml-tau-model
+git submodule update
+git submodule sync
+```
+
 ### Local Development (Custom Environment)
 For local training on your machine without requiring the exact same environment as the authors:
 
@@ -84,6 +91,30 @@ To generate prediction parquet files from a pretrained model checkpoint:
 ./run_inference.sh <path_to_checkpoint> <output_directory>
 ```
 This will run inference on the test dataset and save `.parquet` files to `<output_directory>/predictions/`.
+
+### ONNX Runtime benchmark
+
+Export and benchmark a fully static fp32 graph on a single CPU thread and an
+NVIDIA GPU, with 16 particles per jet by default. The benchmark supports
+SingleParTau, MultiParTau, and Mixer. It requires
+`onnxruntime-gpu`, which provides both the CPU and CUDA execution providers:
+
+```bash
+PYTHONPATH=. python3 mltau/scripts/benchmark_onnx.py all \
+  --iterations 500 \
+  --num-particles 32
+```
+
+Individual targets are `singlepartau`, `multipartau`, and `mixer`; `partau`
+remains an alias for `singlepartau`. Use `--devices cpu` or `--devices gpu`
+to benchmark only one runtime. GPU
+latency is measured with inputs and outputs resident on the GPU, excluding
+host/device transfer time.
+
+Use `--checkpoint PATH` for trained weights. Architecture arguments such as
+`--num-layers`, `--embed-dims`, and `--mixer-embed-dim` must match the
+checkpoint. The JSON output reports latency, throughput, PyTorch/ONNX
+agreement, and MACs from static ONNX `MatMul`, `Gemm`, and `Conv` nodes.
 
 ### Evaluation & Plotting
 Final physics performance plots (ROC, efficiency, resolution) are typically generated via Jupyter notebooks:

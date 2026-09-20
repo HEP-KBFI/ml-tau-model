@@ -1,6 +1,8 @@
+pyarrow
+pandas
 torch
 torchvision
-pytorch-lightning
+lightning
 omegaconf
 scikit-learn
 numpy
@@ -13,5 +15,6 @@ matplotlib
 boost-histogram
 mplhep
 numba
-lightning
 particle  # PDG property lookups used by ml-tau-data's decay-mode classifier
+onnx
+onnxruntime-gpu==1.23.2

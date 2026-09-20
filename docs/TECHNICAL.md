@@ -29,7 +29,7 @@ Four task-specific CLS tokens independently attend to the shared backbone output
   - Tau ID: `CrossEntropyLoss` (2-class) with label smoothing
   - Charge: `BCEWithLogitsLoss`
   - Decay mode: `CrossEntropyLoss`
-  - Kinematics: `HuberLoss(δ=1.0)` over 5 regression targets
+  - Kinematics: Combined loss using `HuberLoss(δ=1.0)` for $p_T$, $\eta$, and $m$, plus a chord loss (L2 distance) for the $(\sin\phi, \cos\phi)$ vector. The mass component is weighted by $\lambda_m = 0.2$.
 - **Conditional gating**: Auxiliary losses (charge, decay mode, kinematics) are multiplied by the truth tau label, so only signal jets contribute to those tasks.
 
 ## Input Features
@@ -52,9 +52,9 @@ Four task-specific CLS tokens independently attend to the shared backbone output
 | 12 | `isChargedHadron` | \|PDG\| = 211 (π±) |
 | 13 | `isNeutralHadron` | \|PDG\| = 130 (K⁰L) |
 | 14 | `cand_dz` | Longitudinal impact parameter $d_z$ |
-| 15 | `cand_dz_err` | Error on $d_z$ |
+| 15 | `cand_dz_error` | Significance of $d_z$ ($d_z / \sigma_{d_z}$) |
 | 16 | `cand_dxy` | Transverse impact parameter $d_{xy}$ |
-| 17 | `cand_dxy_err` | Error on $d_{xy}$ |
+| 17 | `cand_dxy_error` | Significance of $d_{xy}$ ($d_{xy} / \sigma_{d_{xy}}$) |
 
 A maximum of 20 candidates per jet are used (padded/clipped).
 
@@ -67,15 +67,15 @@ A maximum of 20 candidates per jet are used (padded/clipped).
 | 2 | 2, 3, 4 | 1-prong, ≥2 π⁰ |
 | 3 | 5, 10 | 3-prong, 0 π⁰ |
 | 4 | 6–9, 11–14 | 3-prong, ≥1 π⁰ |
-| 5 | 15, 16, -1 | Rare / Other |
+| 5 | 15, 16, -1 | Rare / Leptonic / Other |
 
-Leptonic decay modes (15) and background (-1) are not considered for this classification. Background is tagged in a separate head.
+Rare decay modes (15), leptonic decays (16), and background (-1) are all mapped to class 5. Background samples are masked during training so only signal taus contribute to this head. Background is also tagged in a separate `tau_id_head`.
 
 ## Data
 
 - **Format**: Apache Parquet files, streamed with `awkward-array` using row-group chunking
 - **Dataset**: CLD detector simulation (key4hep framework), $e^+e^-$ collision events
-- **Split**: 70% train / 10% validation / 20% test
+- **Split**: Dataset files are provided in a 90/10 Train/Test split.
 - **Batch size**: 12288
 
 ### Expected Parquet Fields
@@ -83,14 +83,14 @@ Leptonic decay modes (15) and background (-1) are not considered for this classi
 | Field | Description |
 |-------|-------------|
 | `reco_cand_p4s` | Jet constituent 4-momenta (px, py, pz, E) |
-| `reco_cand_charge` | Candidate charges |
-| `reco_cand_pdg` | Candidate PDG IDs |
-| `reco_jet_p4s` | Reconstructed jet 4-momenta |
-| `gen_jet_p4s` | Generator-level jet 4-momenta |
-| `gen_jet_tau_p4s` | Generator-level visible tau 4-momenta |
+| `reco_cand_charges` | Candidate charges |
+| `reco_cand_pdgs` | Candidate PDG IDs |
+| `reco_jet_p4` | Reconstructed jet 4-momenta |
+| `gen_jet_p4` | Generator-level jet 4-momenta |
+| `gen_jet_tau_p4` | Generator-level visible tau 4-momenta |
 | `gen_jet_tau_decaymode` | HPS decay mode index (−1 = background) |
 | `gen_jet_tau_charge` | True tau charge |
-| `weight` | Per-jet event weight (optional) |
+| `cls_weight` | Per-jet event weight (optional) |
 
 ## Installation
 
@@ -112,6 +112,58 @@ pip install -r requirements.txt
 | `tensorboard` | Training monitoring |
 | `matplotlib`, `mplhep` | CMS-style physics plots |
 | `boost-histogram` | Fast histogram filling |
+| `onnx`, `onnxruntime-gpu` | Static model export and CPU/GPU inference benchmarking |
+
+## ONNX Inference Runtime Benchmark
+
+`mltau/scripts/benchmark_onnx.py` exports a fixed-shape fp32 ONNX graph and
+benchmarks it with ONNX Runtime. The supported targets are:
+
+| Command model | Python model | Output |
+|---------------|--------------|--------|
+| `singlepartau` | `ParTau` from `mltau/models/SingleParTau.py` | Selected task head |
+| `multipartau` | `ParTau` from `mltau/models/MultiParTau.py` | All four task heads |
+| `mixer` | `MixerTau` from `mltau/models/MixerTau.py` | Selected task head |
+| `all` | All three models above | One result per model |
+
+`partau` remains an alias for `singlepartau`. The default graph uses a batch
+size of 1, 17 input features, and 16 particles per jet. All dimensions are
+static in the exported graph.
+
+### ONNX Runtime installation
+
+Install the project requirements:
+
+```bash
+pip install -r requirements.txt
+```
+
+The requirements use `onnxruntime-gpu`, not the CPU-only `onnxruntime`
+package. `onnxruntime-gpu` includes both `CUDAExecutionProvider` and
+`CPUExecutionProvider`, so the same installation runs both runtime targets.
+Do not install `onnxruntime` and `onnxruntime-gpu` in the same environment.
+
+### Benchmark all models on CPU and GPU
+
+Use `all` to export and benchmark SingleParTau, MultiParTau, and Mixer in one
+run. By default, both CPU and GPU are benchmarked:
+
+```bash
+PYTHONPATH=. python3 mltau/scripts/benchmark_onnx.py all \
+  --iterations 500 \
+  --num-particles 32
+```
+
+This writes `singlepartau_static_fp32.onnx`,
+`multipartau_static_fp32.onnx`, and `mixer_static_fp32.onnx`. The `all`
+target cannot be combined with `--output` or `--checkpoint`; benchmark an
+individual model when either option is needed.
+
+The CPU session is explicitly restricted to sequential execution with one
+intra-op thread and one inter-op thread. The GPU session uses
+`CUDAExecutionProvider` and ONNX Runtime I/O binding. Its reported latency
+covers inference with inputs and outputs resident on the GPU; host-to-device
+and device-to-host transfer time is excluded.
 
 ## Training
 
@@ -148,6 +200,7 @@ Configuration files live under `mltau/config/`:
 | `training.yaml` | `lr`, `max_epochs`, `batch_size`, `num_workers` |
 | `metrics/` | Plot styles, axis settings, and working points for all tasks |
 
+
 ### Outputs
 
 ```
@@ -180,6 +233,14 @@ Metrics are computed and logged to TensorBoard every epoch:
 - Baseline comparison with jet charge Q*κ method
 - Confusion matrix analysis with 95% average efficiency working point
 
+## Huggingface
+
+The latest model weights are available from huggingface at https://huggingface.co/HEP-KBFI/fcc-tau/tree/main/cld/qq_vs_z_91gev/0612.
+They can be upoaded with the following script, after authenticating
+```
+uv run python3 mltau/scripts/upload_model_hf.py --path-prefix cld/qq_vs_z_91gev/0612 outputs/0612_multipartau_full_b8483f6
+```
+
 ## Project Structure
 
 ```
@@ -196,7 +257,6 @@ mltau/
     train.py                 # Main training entry point
     run_inference.py         # Main inference entry point
     upload_model_hf.py       # Upload to HuggingFace Hub
-    move_models_hf.py        # Local model organization for HF
     HPS/                     # Baseline HPS processing scripts
   tools/
     features.py              # Math and kinematic utilities
@@ -206,12 +266,6 @@ mltau/
     io/                      # Data loading and preprocessing logic
     logging/                 # TensorBoard metric loggers per task
     optimizers/              # Optimizer wrappers (e.g., Lookahead)
-```
-``
-```
-       # Data loading and preprocessing logic
     logging/                 # TensorBoard metric loggers per task
     optimizers/              # Optimizer wrappers (e.g., Lookahead)
-```
-``
 ```

@@ -10,7 +10,7 @@ if [[ -n $(git status --porcelain) ]]; then
 fi
 
 # Get the current git revision
-TAG=0609
+TAG=0612
 GIT_REV=$(git rev-parse --short HEAD)
 echo "Current Git Revision: $GIT_REV"
 

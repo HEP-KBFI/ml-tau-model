@@ -58,7 +58,7 @@ export OPENBLAS_NUM_THREADS=${OPENBLAS_NUM_THREADS:-1}
 singularity exec \
     -B /scratch/project_465001293 \
     -B /tmp \
-    --env PYTHONPATH="`pwd`:`pwd`/mltau:${MLTAU_DATA_DIR:-`pwd`/../ml-tau-data}" \
+    --env PYTHONPATH="`pwd`:`pwd`/mltau:${MLTAU_DATA_DIR:-$([[ -d `pwd`/ml-tau-data/ntupelizer ]] && echo `pwd`/ml-tau-data || echo `pwd`/../ml-tau-data)}" \
     --env LD_LIBRARY_PATH=/opt/rocm/lib/ \
     --env CUDA_VISIBLE_DEVICES=$ROCR_VISIBLE_DEVICES \
      $IMG "$@"

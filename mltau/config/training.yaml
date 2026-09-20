@@ -3,7 +3,18 @@ training:
     lr: 0.001
     model:
         name: MultiParTau # MultiParTau | SingleParTau
+        backbone: ParT # ParT | Mixer (SingleParTau only; the Mixer wants dataset.sort_by_pt)
         task: is_tau # SingleParTau only: is_tau | charge | decay_mode | kinematics
+        # ParT encoder architecture. Set explicitly: the modules fall back to
+        # their own defaults when a key is missing (num_layers defaults to 8),
+        # so an absent key is a silent architecture change, not "the usual".
+        num_layers: 2
+        num_heads: 8
+        num_cls_layers: 2
+        embed_dims: [256, 512, 256]
+        pair_embed_dims: [64, 64, 64]
+        # MLP-Mixer width, used only when backbone is Mixer.
+        embed_dim: 128
     # Seeds model init, dropout and shuffling. dataset.selection_seed picks
     # WHICH jets are used; this one picks how they are trained on. A scaling
     # study wants both varied together per repeat.
@@ -130,3 +141,23 @@ training:
         # Only the continuous features: 7 is charge and 8-12 are the PID
         # one-hots, which are already 0/1 and must not be shifted.
         continuous_feature_indices: [0, 1, 2, 3, 4, 5, 6, 13, 14, 15, 16]
+
+# Mixer distillation (mltau/scripts/distill.py): representation distillation,
+# a low-LR head warm-up, then joint fine-tuning with separate learning rates
+# for the student backbone and the task head.
+distillation:
+    representation_epochs: 20
+    head_warmup_epochs: 5
+    representation_lr: 0.001
+    head_warmup_lr: 0.0001
+    joint_head_lr: 0.0003
+    joint_backbone_lr: 0.00002
+    global_loss_weight: 1.0
+    token_loss_weight: 1.0
+    masked_token_loss_weight: 1.0
+    mask_probability: 0.3
+    output_distill_loss_weight: 1.0
+    adaptation_feature_loss_weight: 0.1
+    enable_input_scaling: true
+
+teacher_checkpoint: null
