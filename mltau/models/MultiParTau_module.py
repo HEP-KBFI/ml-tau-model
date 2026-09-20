@@ -326,18 +326,27 @@ class ParTauModule(L.LightningModule):
             all_reco_jet_p4s = {}
             all_inputs = []  # Store all inputs for baseline calculation
 
+            def _host(tensor):
+                # awkward ingests tensors through DLPack, which has no bfloat16:
+                # under bf16-mixed the head outputs arrive in that dtype and
+                # ak.concatenate fails with "Unsupported dtype in DLTensor".
+                # Widen floating tensors to float32 first (the same treatment
+                # SingleParTau_module applies); integer targets pass through.
+                tensor = tensor.detach()
+                return (tensor.float() if tensor.is_floating_point() else tensor).cpu()
+
             for output in dataset_outputs:
                 # Concatenate predictions for each head
                 for key, pred in output["predictions"].items():
                     if key not in all_predictions:
                         all_predictions[key] = []
-                    all_predictions[key].append(pred.detach().cpu())
+                    all_predictions[key].append(_host(pred))
 
                 # Concatenate targets
                 for key, target in output["targets"].items():
                     if key not in all_targets:
                         all_targets[key] = []
-                    all_targets[key].append(target.detach().cpu())
+                    all_targets[key].append(_host(target))
 
                 # Store inputs for baseline calculation and p4s extraction
                 inputs = output["inputs"]
@@ -347,17 +356,17 @@ class ParTauModule(L.LightningModule):
                 for key, value in inputs.gen_jet_p4s.items():
                     if key not in all_gen_jet_p4s:
                         all_gen_jet_p4s[key] = []
-                    all_gen_jet_p4s[key].append(ak.Array(value.detach().cpu()))
+                    all_gen_jet_p4s[key].append(ak.Array(_host(value)))
 
                 for key, value in inputs.reco_jet_p4s.items():
                     if key not in all_reco_jet_p4s:
                         all_reco_jet_p4s[key] = []
-                    all_reco_jet_p4s[key].append(ak.Array(value.detach().cpu()))
+                    all_reco_jet_p4s[key].append(ak.Array(_host(value)))
 
                 for key, value in inputs.gen_jet_tau_p4s.items():
                     if key not in all_gen_jet_tau_p4s:
                         all_gen_jet_tau_p4s[key] = []
-                    all_gen_jet_tau_p4s[key].append(ak.Array(value.detach().cpu()))
+                    all_gen_jet_tau_p4s[key].append(ak.Array(_host(value)))
 
                 # Concatenate weights
                 # all_weights.append(output["weights"].detach().cpu())
