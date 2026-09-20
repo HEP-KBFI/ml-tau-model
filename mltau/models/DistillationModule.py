@@ -5,7 +5,7 @@ import lightning as L
 from omegaconf import DictConfig
 
 from mltau.tools.io.general import BatchInputs
-from mltau.tools.io import scaling
+from mltau.tools.io import input_scaling as scaling
 from mltau.tools.losses import TauLoss
 from mltau.models.SingleParTau import ParTau as TeacherParT
 from mltau.models.MixerTau import MixerTau as StudentMixer
@@ -176,7 +176,7 @@ class DistillationModule(L.LightningModule):
 
     def on_fit_start(self):
         """Load scaler statistics after the data module has fitted them."""
-        if not scaling.input_scaling_enabled(self.cfg):
+        if not scaling.scaling_enabled(self.cfg):
             return
 
         scaler = scaling.load_saved_scaler(self.cfg)
@@ -196,7 +196,7 @@ class DistillationModule(L.LightningModule):
 
     def _teacher_features(self, student_features, cand_mask):
         """Undo data-loader scaling because the frozen teacher expects raw inputs."""
-        if not scaling.input_scaling_enabled(self.cfg):
+        if not scaling.scaling_enabled(self.cfg):
             return student_features
 
         mean = self._input_scaler_mean.view(1, -1, 1)

@@ -3,34 +3,21 @@ import os
 os.environ["OMP_NUM_THREADS"] = "1"
 os.environ["MKL_NUM_THREADS"] = "1"
 os.environ["OPENBLAS_NUM_THREADS"] = "1"
-import hydra
-import string
-import random
-import awkward as ak
 import multiprocessing
+import random
+import string
+
+import awkward as ak
+import hydra
 from omegaconf import DictConfig
+
 from mltau.models import HPS
-from mltau.tools.io import general as iog
-
-
-def generate_run_id(run_id_len=10):
-    """Creates a random alphanumeric string with a length of run_id_len
-
-    Args:
-        run_id_len : int
-            [default: 10] Length of the alphanumeric string
-
-    Returns:
-        random_string : str
-            The randomly generated alphanumeric string
-    """
-    return "".join(random.choices(string.ascii_uppercase + string.digits, k=run_id_len))
 
 
 @hydra.main(config_path="../../config", config_name="tau_builder", version_base=None)
 def main(cfg: DictConfig) -> None:
-    files = [os.path.join(cfg.base_ntuple_dir, file) for file in cfg.files]
-    data = iog.load_all_data(files)
+    file_path = cfg.input_file_path
+    data = ak.from_parquet(file_path)
     builder = HPS.HPSTauBuilder(cfg=cfg.models.HPS)
     processed_data = builder.process_jets(data)
 
@@ -38,11 +25,9 @@ def main(cfg: DictConfig) -> None:
     data_to_save = {field: data[field] for field in data.fields}
     data_to_save.update(processed_data)
 
-    random_file_name = cfg.files[0]
+    file_name = os.path.basename(file_path)
     os.makedirs(cfg.output_dir, exist_ok=True)
-    ak.to_parquet(
-        ak.Array(data_to_save), os.path.join(cfg.output_dir, random_file_name)
-    )
+    ak.to_parquet(ak.Array(data_to_save), os.path.join(cfg.output_dir, file_name))
 
 
 if __name__ == "__main__":

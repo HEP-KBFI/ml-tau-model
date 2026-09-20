@@ -22,29 +22,31 @@ class ParTauModule(L.LightningModule):
             raise ValueError(f"task must be one of {VALID_TASKS}, got '{task}'")
         self.cfg = cfg
         self.task = task
-        
-        model_type = cfg.training.model.get("backbone", "ParT")
-        if model_type == "Mixer":
+        m_cfg = cfg.training.model
+        # Two backbones behind one switch (training.model.backbone), so a Mixer
+        # and a ParT run differ in exactly that key and nothing else.
+        if m_cfg.get("backbone", "ParT") == "Mixer":
             self.ParTau = MixerTau(
                 input_dim=input_dim,
                 task=task,
                 n_constituents=cfg.dataset.get("max_cands", 20),
                 num_dm_classes=num_dm_classes,
-                embed_dim=cfg.training.model.get("embed_dim", 128),
+                embed_dim=m_cfg.get("embed_dim", 128),
             )
         else:
             self.ParTau = ParTau(
                 input_dim=input_dim,
                 task=task,
                 num_dm_classes=num_dm_classes,
-                num_layers=cfg.training.model.get("num_layers", 2),
-                embed_dims=cfg.training.model.get("embed_dims", [256, 512, 256]),
+                num_layers=m_cfg.get("num_layers", 2),
+                embed_dims=m_cfg.get("embed_dims", [256, 512, 256]),
                 use_pre_activation_pair=False,
                 for_inference=False,
                 use_amp=False,
                 metric="theta-phi",
             )
-        self.tau_loss = TauLoss(l_m=0.2, label_smoothing=0.1)
+        # Loss configuration comes from cfg.tau_loss; see TauLoss.from_config.
+        self.tau_loss = TauLoss.from_config(cfg.get("tau_loss"), owner="SingleParTau")
 
     def _loss_key(self):
         task_name = "tau_id" if self.task == "is_tau" else self.task

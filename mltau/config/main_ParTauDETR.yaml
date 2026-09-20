@@ -1,0 +1,206 @@
+# Dedicated Hydra entrypoint for ParTauDETR training
+# Keeps existing configs untouched.
+output_dir: /home/laurits/20260722_ParTauDETR
+
+logging:
+    tensorboard:
+        enabled: true
+    comet:
+        enabled: true
+        # The project is deliberately NOT configurable: it is fixed to
+        # COMET_PROJECT_NAME in mltau/scripts/train_ParTauDETR.py so that every
+        # run lands in the same Comet project.
+        # Human-readable name shown in the Comet UI. Leave null and Comet
+        # generates one itself.
+        experiment_name: null
+        # Set to append to / resume an existing Comet experiment instead of
+        # creating a new one. Leave null for a fresh experiment.
+        experiment_key: null
+        # true needs outbound network access from the compute node. false writes
+        # an archive under <output_dir>/comet to upload afterwards with
+        # `comet upload <output_dir>/comet/*.zip`.
+        # true needs outbound network access from the compute node. On a node
+        # without it (KBFI compute nodes) comet spends ~3 minutes on connection
+        # retries at job start and then logs nothing; there, override with
+        # logging.comet.online=false, which writes an archive under
+        # <output_dir>/comet to upload afterwards with `comet upload
+        # <output_dir>/comet/*.zip`.
+        online: true
+        log_code: false
+        log_graph: false
+        # comet_ml monkey-patches Tensor.backward() and logs the value it is
+        # called on as a bare metric named "loss" -- every 10th backward, on its
+        # own step counter, so it matches neither train_losses/loss (an epoch
+        # mean) nor val_losses/loss, and it reads as a third, unexplained curve
+        # in the Metrics tab. Everything this repository wants logged is logged
+        # explicitly, so leave this off.
+        auto_metric_logging: false
+        # System metrics -> Comet's "System Metrics" tab: GPU utilisation %,
+        # GPU memory, power, temperature (via pynvml), plus CPU and host info.
+        # log_env_gpu/cpu are force-disabled by comet_ml unless log_env_details
+        # is also true, so keep them consistent.
+        # Tags applied to the experiment, e.g. ["scaling"]. Lets a 36-run study
+        # be filtered out of the shared ml-tau project.
+        tags: []
+        log_env_details: true
+        log_env_gpu: true
+        log_env_cpu: true
+        # The API key is deliberately NOT here: it is a secret, and
+        # save_hyperparameters() would bake it into every checkpoint. comet_ml
+        # resolves it from ~/.comet.config or COMET_API_KEY. Workspace may be
+        # set here, or left null to come from the same place.
+        workspace: null
+
+model:
+    # Always equal to dataset.max_tau_daughters, by interpolation. The matcher
+    # hands out min(num_queries, n_targets) pairs, so with fewer queries than
+    # target slots the surplus targets are unreachable and never supervised,
+    # silently (pull request 30 shipped 5 queries against 8 slots).
+    # ParTauDETRModule raises if a command-line override sets them apart. To
+    # change the count: dataset.max_tau_daughters=<n>. Changing it also changes
+    # the objectness class balance -- see loss.eos_coef.
+    num_queries: ${dataset.max_tau_daughters}
+    num_charge_classes: 3
+    num_kinematics_components: 5
+    # The PDG head width is derived from dataset.tau_daughter_pdg_ids, which is
+    # the same list the dataloader one-hot encodes against. Do not duplicate it.
+
+    # ParticleTransformer encoder
+    encoder:
+        num_layers: 2
+        num_heads: 8
+        num_cls_layers: 2
+        embed_dims: [256, 512, 256] # last entry is the model dimension
+        pair_embed_dims: [64, 64, 64]
+        pair_input_dim: 4
+        use_pre_activation_pair: false
+        remove_self_pair: false
+        activation: gelu
+        metric: theta-phi # theta-phi for e+e-, eta-phi for pp
+
+    detr:
+        decoder_num_layers: 4
+        decoder_num_heads: null # null -> reuse encoder.num_heads
+        decoder_ffn_ratio: 4
+        decoder_dropout: 0.1
+        append_global_token: true
+        tau_id_head: true
+        head_dropout: 0.1
+        matcher:
+            cost_objectness: 1.0
+            cost_kinematics_l1: 2.0
+            cost_charge: 1.0
+            cost_meson_class_ce: 1.0
+            # Per-component weights of the kinematics matching cost, over
+            # [log_pt_ratio, delta_eta, sin_dphi, cos_dphi, log_mass_ratio].
+            # These decide WHICH daughter a query is trained towards, so what
+            # matters is not that every component counts equally but that the
+            # assignment stays stable while the model is still wrong. Tau
+            # daughters are collimated (measured on z_train: sigma =
+            # [0.875, 0.077, 0.071, 0.028, 1.064]), so while the angular error is
+            # of order sigma, position cannot tell two daughters apart and pt
+            # and identity -- learned first -- have to carry the decision.
+            # Angles at 1/sigma (20) drowned them out: on synthetic daughters
+            # with 1-sigma noise the intended assignment was recovered 71% of
+            # the time and 46% of assignments changed between two noise draws,
+            # against 93% / 11% for the first model's unweighted cost. With 5
+            # and the clipped class cost below: 94% / 10% early, 99.4% / 0.9%
+            # late. sin_dphi and cos_dphi MUST share a weight (together they
+            # encode the angle). log_mass_ratio stays low: only ~5% of its
+            # variance is the daughter's own, the rest is the jet mass shared by
+            # every query in the jet, so it says little about WHICH daughter.
+            kinematics_component_weights: [1.0, 5.0, 5.0, 5.0, 0.2]
+            # How the charge and PDG terms enter the MATCHING cost (not the
+            # loss). "clipped_nll" is -log p(true class) clamped at
+            # classification_cost_clip: sharp enough that identity decides a tie
+            # in position (a wrong class at p = 0.01 costs 4.6, a soft p = 0.6
+            # costs 0.5), but bounded, so a confidently wrong query cannot pay an
+            # arbitrarily large cost and flip a jet's assignment late in
+            # training -- the unbounded "nll" did exactly that (its share of the
+            # cost grew 26% -> 62% as predictions sharpened). "prob" is DETR's
+            # 1 - p, bounded in [0, 1] but too weak here: the class terms lose to
+            # angular noise early on (the 71% above). Configurable so the three
+            # can be compared.
+            classification_cost: clipped_nll
+            classification_cost_clip: 5.0
+        loss:
+            weight_objectness: 1.0
+            weight_tau_id: 1.0
+            weight_kinematics: 5.0
+            weight_charge: 1.0
+            weight_meson_class: 1.0
+            weight_consistency: 0.1
+            weight_charge_count: 0.1
+            weight_parent_kinematics: 0.0
+            weight_parent_charge: 0.0
+            weight_parent_decay_mode: 0.0
+            # Loss weight of the "no object" class of the objectness head; the
+            # object class has weight 1. With n_obj real daughters among Q
+            # queries the two sides carry equal total weight at
+            #     eos_coef = n_obj / (Q - n_obj)
+            # DETR's 0.1 is that formula at Q=100, n_obj~7. Here n_obj = 2.31 on
+            # average, so at Q=6 balance is 0.63 and 0.1 was 6x below it: a query
+            # firing on nothing cost a tenth of a query missing a real daughter,
+            # the head over-fired (2.70 predicted daughters against 2.31 true),
+            # the threshold scan pushed the operating point to 0.70-0.85 to
+            # compensate, and at that point real charged daughters were cut too.
+            # Measured at 20k steps, 6 queries, everything else equal:
+            #     eos_coef 0.1: decay-mode accuracy 0.501, unphysical 0.160
+            #     eos_coef 1.0: decay-mode accuracy 0.799, unphysical 0.094
+            # 1.0 rather than the balanced 0.63 because false positives are what
+            # destroy the decay mode (an extra daughter changes the prong count
+            # outright), and it removes a magic number. Re-derive if Q changes.
+            eos_coef: 1.0
+        inference:
+            # Starting value and fallback for the objectness threshold. During
+            # training it is recalibrated before every validation (see
+            # training.threshold_scan), stored in the checkpoint, and that
+            # calibrated value is what predict_step uses. A balanced binary
+            # head belongs near 0.5; with eos_coef 1.0 the scan settles there.
+            score_threshold: 0.5
+            # p(tau) from the tauID head above which a jet's predicted daughters
+            # are kept in predict_step. Objectness is trained on signal jets
+            # only, so whether a jet has daughters at all is the tagger's call.
+            tau_id_threshold: 0.5
+
+    tau_loss:
+        l_m: 0.2 # mass-term weight in the kinematics loss
+        # Smoothing floors the tagging loss at ~0.199 (minimised at p=0.95) and
+        # actively penalises confident predictions, while the other heads are
+        # unsmoothed and can reach 0. That inflates tau_id's share of the total
+        # and works against a figure of merit like misID at fixed efficiency.
+        label_smoothing: 0.0
+        # Residual scales for the kinematics regression loss, one per
+        # component, in that component's own units. Each residual is divided by
+        # its scale before the Huber, so every component enters the loss as
+        # "error in units of the spread of its own target" and the weights below
+        # can all be 1.
+        #
+        # Measured on the daughter targets of z_train (47k daughters):
+        #   log_pt_ratio  sigma 0.875
+        #   delta_eta     sigma 0.077
+        #   sin_dphi      sigma 0.071   (the chord is ~|dphi| for collimated daughters)
+        #   log_mass_ratio sigma 1.064
+        # Recompute these if the target parameterisation or the sample changes;
+        # they are properties of the data, not tuning knobs.
+        kinematics_scales:
+            log_pt: 0.88
+            delta_eta: 0.077
+            phi_chord: 0.080
+            log_mass: 1.06
+        # With the residuals scaled, equal weights give each component an equal
+        # share. log_mass is the one worth reconsidering rather than reweighting:
+        # only 4.8% of the variance of log(m_dau/m_jet) comes from the daughter's
+        # identity, the other 95% is the jet mass, which every query in the jet
+        # would be re-deriving. See the note in the loss docstring.
+        kinematics_weights:
+            log_pt: 1.0
+            delta_eta: 1.0
+            phi_chord: 1.0
+            log_mass: 1.0
+
+defaults:
+    - _self_
+    - metrics/metrics
+    - dataset_ParTauDETR
+    - training

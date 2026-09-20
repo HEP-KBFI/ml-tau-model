@@ -10,9 +10,11 @@ vector
 awkward
 hydra-core
 tensorboard
+comet_ml
 matplotlib
 boost-histogram
 mplhep
 numba
+particle  # PDG property lookups used by ml-tau-data's decay-mode classifier
 onnx
 onnxruntime-gpu==1.23.2

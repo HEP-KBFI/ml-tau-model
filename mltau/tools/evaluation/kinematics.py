@@ -3,7 +3,6 @@ import json
 import numpy as np
 import mplhep as hep
 import awkward as ak
-import boost_histogram as bh
 import matplotlib.pyplot as plt
 from omegaconf import DictConfig
 import matplotlib.colors as colors
@@ -12,6 +11,7 @@ from mpl_toolkits.axes_grid1 import make_axes_locatable
 from mltau.tools.io.general import NpEncoder
 from mltau.tools.general import reinitialize_p4
 from mltau.tools import features as f
+from mltau.tools.evaluation.general import calculate_bin_centers, to_bh
 
 hep.style.use(hep.styles.CMS)
 plt.rcParams["mathtext.fontset"] = "stix"
@@ -144,22 +144,6 @@ def plot_regression_confusion_matrix(
 
 def IQR(ratios: np.array) -> np.array:
     return np.quantile(ratios, 0.75) - np.quantile(ratios, 0.25)
-
-
-def to_bh(data, bins, cumulative=False):
-    h1 = bh.Histogram(bh.axis.Variable(bins))
-    h1.fill(data)
-    if cumulative:
-        h1[:] = np.sum(h1.values()) - np.cumsum(h1)
-    return h1
-
-
-def calculate_bin_centers(edges: np.array) -> np.array:
-    bin_widths = np.array([edges[i + 1] - edges[i] for i in range(len(edges) - 1)])
-    bin_centers = []
-    for i in range(len(edges) - 1):
-        bin_centers.append(edges[i] + (bin_widths[i] / 2))
-    return np.array(bin_centers), bin_widths / 2
 
 
 class RegressionEvaluator:
@@ -525,7 +509,7 @@ class RegressionMultiEvaluator:
             nticks=var_cfg.response_plot.nticks,
             axhline_loc=axhline_loc,
         )
-        self.resolution_lineplot = LinePlot(
+        self.d_lineplot = LinePlot(
             cfg=self.cfg,
             xlabel=var_cfg.resolution_plot.xlabel,
             ylabel=var_cfg.resolution_plot.ylabel,
@@ -601,7 +585,7 @@ class KinematicsEvaluator:
         true_p4: ak.Array,
         cfg: DictConfig,
         algorithm: str,
-        sample_name: str = "",
+        sample_name: str = "z",
     ):
         self.predicted_p4 = reinitialize_p4(predicted_p4)
         self.true_p4 = reinitialize_p4(true_p4)

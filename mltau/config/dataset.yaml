@@ -1,8 +1,12 @@
 dataset:
-  max_cands: 20
-  sort_by_pt: false # Recommended 'true' for MLP-Mixer
-  data_dir: /scratch/persistent/laurits/ml-tau/0528_Large_stats/
-  relative_sizes:
-    train: 0.7
-    val: 0.1
-    test: 0.2
+    max_cands: 20
+    # Order the candidates of every jet by descending pT before padding. The
+    # ParT encoder is permutation invariant and does not care; the MLP-Mixer is
+    # not and needs it (recommended 'true' for training.model.backbone: Mixer).
+    sort_by_pt: false
+    # data_dir: /scratch/persistent/laurits/ml-tau/0509_dsinphi_to_sindphi/
+    data_dir: /scratch/persistent/laurits/ml-tau/0528_Large_stats/
+    relative_sizes:
+        train: 0.7
+        val: 0.1
+        test: 0.2

@@ -1,36 +1,34 @@
 import os
+
 import hydra
 import lightning as L
-import numpy as np
 import torch
-
-from omegaconf import DictConfig, ListConfig
+from lightning.pytorch.callbacks import Callback, ModelCheckpoint, TQDMProgressBar
 from lightning.pytorch.loggers import TensorBoardLogger  # , CometLogger
-from lightning.pytorch.callbacks import TQDMProgressBar, ModelCheckpoint, Callback
+from omegaconf import DictConfig, ListConfig
 
+
+# Checkpoints carry the OmegaConf config in their hyperparameters; torch >= 2.6
+# refuses to unpickle those under its weights_only default unless registered.
 if hasattr(torch.serialization, "add_safe_globals"):
     torch.serialization.add_safe_globals([DictConfig, ListConfig])
 
 import matplotlib
-matplotlib.use('Agg')
-import matplotlib.pyplot as plt
 
-from mltau.tools.io import preprocessed_ParTau_dataloader as dl_pre
-from mltau.tools.io import ParT_dataloader as dl_raw
+matplotlib.use("Agg")
+
+# TF32 matmuls on Ampere and later GPUs: Lightning prints this hint on every
+# run; it is free throughput and does not touch mixed-precision numerics.
+torch.set_float32_matmul_precision("high")
+
 from mltau.models import MultiParTau_module, SingleParTau_module
 from mltau.tools.evaluation import inference
+from mltau.tools.io import ParT_dataloader as dl
 
 
 @hydra.main(config_path="../config", config_name="main", version_base=None)
 def train(cfg: DictConfig):
-    dl_type = cfg.training.dataloader.get("type", "preprocessed")
-    if dl_type == "preprocessed":
-        datamodule = dl_pre.ParTDataModule(cfg=cfg, debug_run=cfg.training.debug_run)
-    elif dl_type == "parquet":
-        datamodule = dl_raw.ParTDataModule(cfg=cfg, debug_run=cfg.training.debug_run)
-    else:
-        raise ValueError(f"Unknown dataloader type '{dl_type}'. Choose 'preprocessed' or 'parquet'.")
-    
+    datamodule = dl.ParTDataModule(cfg=cfg, debug_run=cfg.training.debug_run)
     model_name = cfg.training.model.name
     if model_name == "MultiParTau":
         model = MultiParTau_module.ParTauModule(cfg=cfg, input_dim=17, num_dm_classes=6)

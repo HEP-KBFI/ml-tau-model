@@ -1,6 +1,8 @@
 import operator
 import numpy as np
 
+from mltau.tools.evaluation.general import calculate_bin_centers
+
 OPERATORS = {
     ">=": operator.ge,
     "<=": operator.le,
@@ -64,7 +66,7 @@ class Histogram:
         self.data = np.array(data)
         self.histogram_data_type = histogram_data_type
         self.bin_edges = bin_edges
-        self.bin_centers, self.bin_halfwidths = self.calculate_bin_centers(bin_edges)
+        self.bin_centers, self.bin_halfwidths = calculate_bin_centers(bin_edges)
         if not binned:
             self.binned_data = np.histogram(data, bins=bin_edges)[0]
         else:
@@ -83,13 +85,6 @@ class Histogram:
                 )
         else:
             raise AssertionError("Unknown input for uncertainties")
-
-    def calculate_bin_centers(self, edges: list) -> np.array:
-        bin_widths = np.array([edges[i + 1] - edges[i] for i in range(len(edges) - 1)])
-        bin_centers = []
-        for i in range(len(edges) - 1):
-            bin_centers.append(edges[i] + (bin_widths[i] / 2))
-        return np.array(bin_centers), bin_widths / 2
 
     def __add__(self, other):
         if (other.bin_edges).all() != (self.bin_edges).all():

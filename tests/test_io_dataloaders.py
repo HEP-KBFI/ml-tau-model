@@ -1,113 +1,104 @@
-import torch
-import sys
-import tqdm
-from omegaconf import OmegaConf
-from mltau.tools.io.ParT_dataloader import ParTDataModule as ParTDataModuleRaw
-from mltau.tools.io.preprocessed_ParTau_dataloader import ParTDataModule as ParTDataModulePre
+"""
+Structure and composition checks for the parquet dataloaders.
+
+Runs against whatever `dataset.data_dir` points at, or a directory given as
+MLTAU_TEST_DATA_DIR, so the same script works on the cluster and on a laptop
+with a small local sample. Both data modules are exercised: the ParT one that
+MultiParTau / SingleParTau train with, and the DETR one.
+
+What is asserted:
+  - the batch tuple has the eight expected members with the expected shapes;
+  - every batch but the last of a worker shard has exactly batch_size jets,
+    and the number of batches equals len(dataset);
+  - when more than one sample is present, every batch contains both classes.
+
+    ./run.sh python3 tests/test_io_dataloaders.py
+    MLTAU_TEST_DATA_DIR=/tmp/newprod python3 tests/test_io_dataloaders.py
+"""
 
 import os
+import sys
+from pathlib import Path
 
-def get_cfg():
-    base_cfg = OmegaConf.load("mltau/config/dataset.yaml")
-    # If the path in the config doesn't exist locally, try the local folder as a fallback
-    # to allow the test to run in both local and remote (cluster) environments.
-    if not os.path.exists(base_cfg.dataset.data_dir):
-        local_dir = os.path.join(os.getcwd(), "0528_Large_stats")
-        if os.path.exists(local_dir):
-             base_cfg.dataset.data_dir = local_dir
+import torch
+from omegaconf import OmegaConf
 
-    training_cfg = OmegaConf.create({
-        "training": {
-            "model": {"task": "is_tau", "name": "MultiParTau"},
-            "dataloader": {
-                "batch_size": 1024,
-                "num_dataloader_workers": 0,
-                "prefetch_factor": 2
-            },
-            "input_scaling": {"enabled": False}
-        }
-    })
-    return OmegaConf.merge(base_cfg, training_cfg)
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-def test_raw_dataloader_structure(cfg):
-    print("Testing Raw dataloader structure...")
-    dm = ParTDataModuleRaw(cfg)
-    dm.setup("test")
-    loader = dm.test_dataloader()
-    batch = next(iter(loader))
-    
-    assert len(batch) == 8
-    # cand_features, cand_kinematics, targets, mask, weights, gen_tau, reco, gen_jet
-    assert batch[0].shape[1:] == (17, 20)
-    assert batch[1].shape[1:] == (4, 20)
-    assert isinstance(batch[2], dict)
-    assert batch[3].shape[1:] == (1, 20)
-    assert len(batch[4].shape) == 1
-    assert isinstance(batch[5], dict)
-    assert isinstance(batch[6], dict)
-    assert isinstance(batch[7], dict)
-    print("OK")
+from mltau.tools.io.ParT_dataloader import ParTDataModule  # noqa: E402
+from mltau.tools.io.ParTauDETR_dataloader import ParTauDETRDataModule  # noqa: E402
 
-def test_pre_dataloader_structure(cfg):
-    print("Testing Preprocessed dataloader structure...")
-    dm = ParTDataModulePre(cfg)
-    dm.setup("test")
-    loader = dm.test_dataloader()
-    batch = next(iter(loader))
-    
-    assert len(batch) == 8
-    assert batch[0].shape[1:] == (17, 20)
-    assert batch[1].shape[1:] == (4, 20)
-    assert isinstance(batch[2], dict)
-    assert batch[3].shape[1:] == (1, 20)
-    assert len(batch[4].shape) == 1
-    print("OK")
+CONFIG_DIR = Path(__file__).resolve().parents[1] / "mltau" / "config"
 
-def get_dataset_stats(loader, name):
-    total_jets = 0
-    total_signal = 0
-    for batch in tqdm.tqdm(loader, desc=f"Iterating {name}"):
+
+def compose(main: str, dataset: str, batch_size: int):
+    cfg = OmegaConf.merge(
+        OmegaConf.load(CONFIG_DIR / "training.yaml"),
+        OmegaConf.load(CONFIG_DIR / dataset),
+        OmegaConf.load(CONFIG_DIR / main),
+    )
+    cfg.output_dir = os.environ.get("MLTAU_TEST_OUTPUT_DIR", "/tmp/mltau_test_output")
+    data_dir = os.environ.get("MLTAU_TEST_DATA_DIR")
+    if data_dir:
+        cfg.dataset.data_dir = data_dir
+    cfg.training.dataloader.batch_size = batch_size
+    cfg.training.dataloader.num_dataloader_workers = 0
+    cfg.training.dataloader.row_groups_per_read = 4
+    cfg.training.dataloader.mixing_reads = 2
+    cfg.training.input_scaling.enabled = False
+    return cfg
+
+
+def check_structure(batch, n_features: int, max_cands: int):
+    assert len(batch) == 8, len(batch)
+    assert batch[0].shape[1:] == (n_features, max_cands), batch[0].shape
+    assert batch[1].shape[1:] == (4, max_cands), batch[1].shape
+    assert isinstance(batch[2], dict) and "is_tau" in batch[2]
+    assert batch[3].shape[1:] == (1, max_cands), batch[3].shape
+    assert batch[4].ndim == 1
+    for p4 in batch[5:8]:
+        assert isinstance(p4, dict) and {"pt", "eta", "phi", "energy"} <= set(p4)
+
+
+def check_batches(loader, batch_size: int, name: str):
+    dataset = loader.dataset
+    sizes, mixed, single = [], 0, 0
+    for batch in loader:
+        n = batch[0].shape[0]
+        sizes.append(n)
         is_tau = batch[2]["is_tau"]
-        total_jets += is_tau.shape[0]
-        total_signal += is_tau.sum().item()
-    return total_jets, total_signal
+        frac = float(is_tau.float().mean())
+        if 0.0 < frac < 1.0:
+            mixed += 1
+        else:
+            single += 1
+    total = sum(sizes)
+    assert len(sizes) == len(dataset), f"{name}: {len(sizes)} batches yielded, len(dataset)={len(dataset)}"
+    assert total == dataset.num_rows, f"{name}: {total} jets yielded, dataset has {dataset.num_rows}"
+    assert all(s == batch_size for s in sizes[:-1]), f"{name}: short batch before the last: {sizes}"
+    multi_sample = len(getattr(dataset, "reads_by_sample", {})) > 1
+    if multi_sample and getattr(dataset, "stratify_samples", False):
+        assert single == 0, f"{name}: {single} single-class batches with stratification on"
+    print(
+        f"  {name}: {len(sizes)} batches, {total:,} jets, batch sizes "
+        f"{sorted(set(sizes))}, mixed {mixed}, single-class {single}"
+    )
 
-def test_functional_equivalence(cfg):
-    print("Testing functional equivalence...")
-    
-    dm_raw = ParTDataModuleRaw(cfg)
-    dm_raw.setup("test")
-    loader_raw = dm_raw.test_dataloader()
-    
-    dm_pre = ParTDataModulePre(cfg)
-    dm_pre.setup("test")
-    loader_pre = dm_pre.test_dataloader()
-    
-    n_raw, s_raw = get_dataset_stats(loader_raw, "Raw")
-    n_pre, s_pre = get_dataset_stats(loader_pre, "Pre")
-    
-    print(f"Raw: {n_raw} jets, {s_raw} signal, fraction {s_raw/n_raw:.4f}")
-    print(f"Pre: {n_pre} jets, {s_pre} signal, fraction {s_pre/n_pre:.4f}")
-    
-    assert n_raw == n_pre, f"Total jets mismatch: raw={n_raw}, pre={n_pre}"
-    assert s_raw == s_pre, f"Signal count mismatch: raw={s_raw}, pre={s_pre}"
-    
-    # Verify no repetition/completeness if we know the expected number
-    # From 0528_Large_stats: z_test (593540) + qq_test (3928385) = 4521925
-    expected_total = 4521925
-    assert n_raw == expected_total, f"Expected {expected_total} jets, but got {n_raw}"
-    
-    print("OK")
+
+def run(main: str, dataset: str, module_cls, label: str, batch_size: int = 256):
+    print(f"[{label}]")
+    cfg = compose(main, dataset, batch_size)
+    dm = module_cls(cfg=cfg, debug_run=False)
+    dm.setup("fit")
+    train = dm.train_dataloader()
+    check_structure(next(iter(train)), int(cfg.dataset.num_features) if "num_features" in cfg.dataset else 17, int(cfg.dataset.max_cands))
+    check_batches(train, batch_size, "train")
+    check_batches(dm.val_dataloader(), batch_size, "val")
+    print("  OK")
+
 
 if __name__ == "__main__":
-    cfg = get_cfg()
-    try:
-        test_raw_dataloader_structure(cfg)
-        test_pre_dataloader_structure(cfg)
-        test_functional_equivalence(cfg)
-        print("\nAll tests passed successfully!")
-    except Exception as e:
-        print(f"\nTest failed: {e}")
-        import traceback
-        traceback.print_exc()
-        sys.exit(1)
+    torch.manual_seed(0)
+    run("main.yaml", "dataset.yaml", ParTDataModule, "ParT data module")
+    run("main_ParTauDETR.yaml", "dataset_ParTauDETR.yaml", ParTauDETRDataModule, "DETR data module")
+    print("\nAll dataloader tests passed.")
