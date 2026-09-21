@@ -157,6 +157,11 @@ def _apply_tags(logger, comet_cfg):
     return logger
 
 
+def _optional_float(value: float | None) -> float | None:
+    """`null` in the config disables a threshold; anything else is a float."""
+    return None if value is None else float(value)
+
+
 def _optional_trainer_kwargs(cfg: DictConfig) -> dict:
     """
     Trainer arguments that are only passed when set, because Lightning's own
@@ -628,16 +633,29 @@ def train(cfg: DictConfig):
             save_weights_only=False,
             save_on_train_epoch_end=False,
         ),
-        # Stop on a non-finite validation loss. Nothing else did: the 250-epoch
-        # run of 2026-09-16 went NaN at epoch 91 and ran 19 more hours on NaN
-        # weights. patience is effectively infinite, so this never stops a run
-        # for plateauing -- it is purely the finiteness check. training_step
-        # has the per-step counterpart for the training loss.
+        # Stop on a non-finite OR a diverging validation loss. Nothing else
+        # did: the 250-epoch run of 2026-09-16 went NaN at epoch 91 and ran 19
+        # more hours on NaN weights. patience is effectively infinite, so this
+        # never stops a run for plateauing -- it is purely the finiteness and
+        # divergence check. training_step has the per-step counterpart for the
+        # training loss, and ParTauDETR_module.on_before_optimizer_step has the
+        # per-step gradient counterpart.
+        #
+        # check_finite alone was not enough for the 2026-09-20 run: the
+        # gradients overflowed at step 62 949 but the val loss only went
+        # 0.75 -> 5.34 -> 7.67 and stayed finite, so the callback never fired
+        # and 11 600 dead steps followed. divergence_threshold catches that --
+        # with mode="min" Lightning stops once the monitor rises ABOVE it, and
+        # a healthy plateau here is ~0.73, so 3.0 leaves a 4x margin over
+        # anything the run does while it is still learning.
         EarlyStopping(
             monitor="val_losses/loss",
             mode="min",
             patience=10**9,
             check_finite=True,
+            divergence_threshold=_optional_float(
+                cfg.training.trainer.get("val_loss_divergence_threshold", 3.0)
+            ),
             verbose=True,
         ),
         # Fallback: best by train loss. train_losses/* are logged with

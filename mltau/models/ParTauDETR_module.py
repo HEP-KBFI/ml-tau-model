@@ -1,3 +1,4 @@
+import math
 import warnings
 from typing import Any
 
@@ -1057,6 +1058,20 @@ class ParTauDETRModule(L.LightningModule):
         # Consecutive non-finite training losses seen; see training_step.
         self._non_finite_steps = 0
 
+        # Gradient-outlier guard and the clip value it is logged against; see
+        # on_before_optimizer_step. Read here rather than from the Trainer so a
+        # module built outside a Trainer still has the documented defaults.
+        _opt_cfg = cfg.training.get("optimizer", None) or {}
+        _trainer_cfg = cfg.training.get("trainer", None) or {}
+        self.grad_skip_norm = float(_opt_cfg.get("grad_skip_norm", 50.0))
+        self.grad_skip_patience = int(_opt_cfg.get("grad_skip_patience", 50))
+        self.grad_clip_val = float(_trainer_cfg.get("gradient_clip_val", 1.0))
+        self._consecutive_skips = 0
+
+        # Best decay-mode accuracy any threshold scan has reached, so a later
+        # scan that collapses can be recognised as such; see on_validation_start.
+        self._best_scan_accuracy = 0.0
+
     @staticmethod
     def _ohe_to_class_indices(
         one_hot: torch.Tensor, ignore_index: int = -100
@@ -1390,10 +1405,44 @@ class ParTauDETRModule(L.LightningModule):
             return
         if best is None:
             return
-        self.score_threshold_calibrated.fill_(float(best))
-        self.log("threshold/score_threshold", float(best), on_step=False, on_epoch=True)
+        # The scan is a bare argmax over the grid, so it always returns
+        # something -- including when the model is broken and every threshold is
+        # equally worthless, in which case the least-bad option is to suppress
+        # every prediction and the argmax runs to the grid's upper edge. The
+        # 2026-09-20 run wrote 0.9 into the checkpoint that way, which then read
+        # as a tuning result rather than as the wreckage it was. Refuse the
+        # update when the objective has collapsed against the best this run has
+        # ever scanned, and flag an optimum sitting on a grid edge: that means
+        # either the grid is too narrow or the model is broken, and either way
+        # the value should not pass silently.
+        accuracy = float(by_threshold[best]["decay_mode_accuracy"])
+        if accuracy < 0.5 * self._best_scan_accuracy:
+            warnings.warn(
+                f"threshold scan objective collapsed "
+                f"(decay_mode_accuracy {accuracy:.3f} vs best "
+                f"{self._best_scan_accuracy:.3f} this run); keeping threshold "
+                f"{float(self.score_threshold_calibrated):.2f} instead of {best:.2f}"
+            )
+        else:
+            self._best_scan_accuracy = max(self._best_scan_accuracy, accuracy)
+            self.score_threshold_calibrated.fill_(float(best))
+            if bool(
+                np.isclose(best, self.threshold_grid[0])
+                or np.isclose(best, self.threshold_grid[-1])
+            ):
+                warnings.warn(
+                    f"threshold scan optimum at grid edge ({best:.2f}); the grid "
+                    f"[{self.threshold_grid[0]:.2f}, {self.threshold_grid[-1]:.2f}] "
+                    f"may be too narrow, or the model may be diverging"
+                )
+        # The threshold actually in use, which after a refused update is the
+        # previous one, not the scan's argmax. Both are logged: a gap between
+        # them is the guard having fired.
+        self.log("threshold/score_threshold",
+                 float(self.score_threshold_calibrated), on_step=False, on_epoch=True)
+        self.log("threshold/scan_argmax", float(best), on_step=False, on_epoch=True)
         self.log("threshold/best_decay_mode_accuracy",
-                 float(by_threshold[best]["decay_mode_accuracy"]), on_step=False, on_epoch=True)
+                 accuracy, on_step=False, on_epoch=True)
         self.log("threshold/best_f1", float(by_threshold[best]["f1"]),
                  on_step=False, on_epoch=True)
 
@@ -1623,12 +1672,57 @@ class ParTauDETRModule(L.LightningModule):
                 torch.stack([(g.detach() ** 2).sum() for g in grads]).sum()
             )
             self.log("grad/total_norm", total, on_step=True, on_epoch=False)
+            # Against the configured clip value, not a hardcoded 1.0: raising
+            # gradient_clip_val used to leave this metric silently reporting
+            # against the old bound, so it stopped meaning "clipping fired".
             self.log(
                 "grad/clipped",
-                (total > 1.0).float(),  # fraction of steps clipping is active
+                (total > self.grad_clip_val).float(),
                 on_step=True,
                 on_epoch=True,
             )
+
+            # Outlier guard. Clipping is NOT one: it renormalises a gradient of
+            # norm 1e11 to the clip value and applies it anyway, in whatever
+            # direction that garbage points, and once the norm overflows to inf
+            # the clip coefficient is 1/inf = 0, so every step silently becomes
+            # a no-op and the run looks alive while only weight decay still
+            # moves the weights. That is exactly how the 2026-09-20 run spent
+            # its last 11 600 steps. Zeroing the gradient here skips the step
+            # instead, which is only possible because grad_skip_norm sits well
+            # above the healthy distribution (p99 ~ 10, max ~ 38) and therefore
+            # means something when it fires.
+            #
+            # Caveat worth knowing: zeroing the gradient keeps the outlier out
+            # of AdamW's m and v and out of the clip, but it does not freeze the
+            # weights. AdamW's update is lr * m_hat / (sqrt(v_hat) + eps), so a
+            # zeroed step still moves along the existing momentum and still
+            # applies decoupled weight decay. That is the point -- the step
+            # stays bounded by the HEALTHY history instead of following a
+            # gradient of norm 1e11 -- but it is a damped step, not a true skip.
+            if self.grad_skip_norm > 0.0:
+                total_value = float(total)  # one host sync; logging forces one
+                skipped = (
+                    not math.isfinite(total_value)
+                    or total_value > self.grad_skip_norm
+                )
+                if skipped:
+                    for parameter in self.parameters():
+                        if parameter.grad is not None:
+                            parameter.grad.zero_()
+                    self._consecutive_skips += 1
+                    if self._consecutive_skips > self.grad_skip_patience:
+                        raise RuntimeError(
+                            f"gradient norm non-finite or above "
+                            f"{self.grad_skip_norm} for "
+                            f"{self._consecutive_skips} consecutive steps "
+                            f"(last: {total_value}); the run has diverged."
+                        )
+                else:
+                    self._consecutive_skips = 0
+                self.log(
+                    "grad/skipped", float(skipped), on_step=True, on_epoch=True
+                )
 
         scaler = getattr(
             getattr(self.trainer, "precision_plugin", None), "scaler", None
@@ -1756,10 +1850,24 @@ class ParTauDETRModule(L.LightningModule):
                 f"Using calculated total_steps={total_steps} from estimated_stepping_batches"
             )
 
+        # pct_start is the fraction of total_steps spent ramping UP, from
+        # max_lr/div_factor (div_factor defaults to 25) to max_lr; the rest is
+        # the cosine decay. It does not change the peak height -- that is
+        # training.lr -- and it barely changes how long the schedule dwells near
+        # the peak, because the ramp side shortening is cancelled by the decay
+        # side lengthening (measured on this run's 184 750 steps: 11 854 steps
+        # within 1% of max_lr at 0.3, 11 806 at 0.1). What it changes is WHEN
+        # that dwell happens. At the default 0.3 the peak landed at step 55 425
+        # and the near-peak window was steps 51 818-63 671, i.e. late, on a model
+        # sharp enough that the step size outran the curvature -- the 2026-09-20
+        # run diverged at step 60 449, inside that window. At 0.1 the peak is at
+        # step 18 475, while the model is still under-trained and the loss
+        # surface flatter, and 90% of the run is annealing.
         scheduler = torch.optim.lr_scheduler.OneCycleLR(
             optimizer,
             max_lr=base_lr,
             total_steps=total_steps,
+            pct_start=float(opt_cfg.get("pct_start", 0.1)),
             anneal_strategy="cos",
             # Default True sweeps AdamW's beta1 0.95 -> 0.85 -> 0.95 alongside
             # the learning rate; nothing here asked for that, and beta1 was at
