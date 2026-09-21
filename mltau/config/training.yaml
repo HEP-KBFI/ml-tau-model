@@ -51,9 +51,15 @@ training:
         # steps over the measured window), so it was the step-size controller
         # rather than a safety net, and it deleted the gradient magnitude that
         # is the only signal curvature is rising. Healthy norms on the
-        # 2026-09-20 run were p50 2.6, p95 7.4, p99 10.3, max 37.9, so 5.0 sits
-        # above the bulk: it leaves ~83% of healthy steps untouched and actually
-        # means something when it fires. Raise this only together with a lower
+        # 2026-09-20 run, measured over steps 150-55 000, were p50 2.8, p95 7.5,
+        # p99 10.0, max 13.4, so 5.0 sits above the bulk: it leaves ~83% of
+        # healthy steps untouched and actually means something when it fires.
+        # (An earlier version of this comment quoted max 37.9. That number is
+        # the START-UP transient -- the first logged step of the run -- not the
+        # healthy maximum, and taking it for one is what mis-set grad_skip_norm
+        # below.) Clipping is also what absorbs that start-up transient, which
+        # is why grad_skip_warmup_steps hands the first steps to it.
+        # Raise this only together with a lower
         # training.lr -- note that with AdamW a constant rescale of every
         # gradient cancels out of the update, so this is not itself an LR knob.
         # optimizer.grad_skip_norm, not this, is the guard against a runaway.
@@ -113,12 +119,30 @@ training:
         # A step whose pre-clip global norm exceeds this, or is non-finite, has
         # its gradient zeroed and is skipped rather than clipped and applied --
         # clipping keeps the direction of a garbage gradient and only discards
-        # its magnitude. Healthy norms peaked at 37.9, so 50.0 does not fire in
-        # normal training. grad_skip_patience consecutive skips abort the run:
-        # at that point it is not an outlier batch, it has diverged. Set
-        # grad_skip_norm to 0 to disable the skip and keep only the logging.
+        # its magnitude. Healthy norms over steps 150-55 000 of the 2026-09-20
+        # run were p50 2.8, p99 10.0, max 13.4, and the divergence went
+        # 2.6 -> 26 -> 2582 -> 1.3e5 -> inf, so 50.0 separates the two cleanly.
+        # grad_skip_patience consecutive skips abort the run: at that point it
+        # is not an outlier batch, it has diverged. Set grad_skip_norm to 0 to
+        # disable the skip and keep only the logging.
         grad_skip_norm: 50.0
         grad_skip_patience: 50
+        # Steps at the start of training during which a LARGE BUT FINITE norm
+        # does not skip and does not count towards grad_skip_patience; a
+        # non-finite one still does, at any step, because that is never
+        # legitimate. Needed because the guard's threshold describes trained
+        # weights, not fresh ones: at initialisation the norm is ~270, and it
+        # is gradient_clip_val, not the guard, that is supposed to absorb that.
+        # Without this grace the guard is a deadlock -- it zeroes the gradient
+        # from step 0, so the weights never move, so the norm never falls, so
+        # every step skips. Run 61024711 (2026-09-21) died exactly that way:
+        # 51 consecutive skips, aborted at step 51 of epoch 0 with the LR still
+        # at its 1.2e-5 starting value, without ever applying one real update.
+        # The 2026-09-20 run, which had clipping only, was already down to 6.4
+        # by step 149, so 500 is a wide margin; the loss-side checks
+        # (training_step's non-finite counter, EarlyStopping) still cover the
+        # window. 0 disables the grace and arms the guard from step 0.
+        grad_skip_warmup_steps: 500
 
     dataloader:
         batch_size: 12288

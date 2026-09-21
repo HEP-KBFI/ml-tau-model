@@ -1065,8 +1065,13 @@ class ParTauDETRModule(L.LightningModule):
         _trainer_cfg = cfg.training.get("trainer", None) or {}
         self.grad_skip_norm = float(_opt_cfg.get("grad_skip_norm", 50.0))
         self.grad_skip_patience = int(_opt_cfg.get("grad_skip_patience", 50))
+        self.grad_skip_warmup_steps = int(
+            _opt_cfg.get("grad_skip_warmup_steps", 500)
+        )
         self.grad_clip_val = float(_trainer_cfg.get("gradient_clip_val", 1.0))
         self._consecutive_skips = 0
+        # One warning per run for the start-up transient, not one per step.
+        self._warned_warmup_grad = False
 
         # Best decay-mode accuracy any threshold scan has reached, so a later
         # scan that collapses can be recognised as such; see on_validation_start.
@@ -1690,8 +1695,21 @@ class ParTauDETRModule(L.LightningModule):
             # moves the weights. That is exactly how the 2026-09-20 run spent
             # its last 11 600 steps. Zeroing the gradient here skips the step
             # instead, which is only possible because grad_skip_norm sits well
-            # above the healthy distribution (p99 ~ 10, max ~ 38) and therefore
-            # means something when it fires.
+            # above the healthy distribution (steps 150-55 000 of that run:
+            # p50 2.8, p99 10.0, max 13.4) and therefore means something when
+            # it fires.
+            #
+            # The threshold describes TRAINED weights. Fresh ones have a norm
+            # in the hundreds -- ~270 on this model -- and absorbing that is
+            # gradient_clip_val's job, not the guard's. Arming the guard from
+            # step 0 is therefore not conservative but a deadlock: the gradient
+            # is zeroed, so the weights do not move, so the next norm is just
+            # as large, so every step skips until grad_skip_patience aborts the
+            # run. Run 61024711 (2026-09-21) died that way at step 51 of epoch
+            # 0, having never applied a single real update. Hence the warm-up
+            # grace, during which a large but finite norm is left to the clip.
+            # A NON-FINITE norm still skips at any step: it is never legitimate,
+            # and bf16-mixed has no GradScaler to catch it.
             #
             # Caveat worth knowing: zeroing the gradient keeps the outlier out
             # of AdamW's m and v and out of the clip, but it does not freeze the
@@ -1702,10 +1720,27 @@ class ParTauDETRModule(L.LightningModule):
             # gradient of norm 1e11 -- but it is a damped step, not a true skip.
             if self.grad_skip_norm > 0.0:
                 total_value = float(total)  # one host sync; logging forces one
-                skipped = (
-                    not math.isfinite(total_value)
-                    or total_value > self.grad_skip_norm
+                warming_up = (
+                    self.trainer.global_step < self.grad_skip_warmup_steps
                 )
+                if not math.isfinite(total_value):
+                    skipped = True
+                elif total_value > self.grad_skip_norm:
+                    skipped = not warming_up
+                    if warming_up and not self._warned_warmup_grad:
+                        self._warned_warmup_grad = True
+                        warnings.warn(
+                            f"gradient norm {total_value:.1f} above "
+                            f"{self.grad_skip_norm} at step "
+                            f"{self.trainer.global_step}, within the first "
+                            f"{self.grad_skip_warmup_steps} steps: left to "
+                            f"gradient_clip_val, not skipped. Expected once at "
+                            f"start-up; if grad/total_norm has not fallen below "
+                            f"the threshold by the end of the grace window, the "
+                            f"guard will start skipping and the run will abort."
+                        )
+                else:
+                    skipped = False
                 if skipped:
                     for parameter in self.parameters():
                         if parameter.grad is not None:
