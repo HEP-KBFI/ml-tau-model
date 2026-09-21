@@ -1,6 +1,13 @@
 training:
     debug_run: False
-    lr: 0.001
+    # OneCycleLR's max_lr (see ParTauDETR_module.configure_optimizers). This is
+    # the peak, reached at pct_start * total_steps; the schedule starts at
+    # lr/25 and anneals to ~0 afterwards. At 1e-3 the 2026-09-20 run was healthy
+    # all the way up to ~8e-4 (step 40k) and the gradient norm only began its
+    # runaway above ~9.9e-4, going 2.6 -> 26 -> 2582 -> 1.3e5 -> inf over 2500
+    # steps. 3e-4 keeps a 3.3x margin under the observed failure point; 5e-4 is
+    # the aggressive end of what that run supports.
+    lr: 0.0003
     model:
         name: MultiParTau # MultiParTau | SingleParTau
         backbone: ParT # ParT | Mixer (SingleParTau only; the Mixer wants dataset.sort_by_pt)
@@ -39,11 +46,24 @@ training:
         # 169 -- cannot recur. Native on Ada (L40S) and MI250X; measured cost 5%
         # of throughput (1.79 -> 1.68 it/s). 16-mixed remains selectable.
         precision: bf16-mixed
-        # Global-norm gradient clipping. In the 250-epoch run this bound on
-        # essentially every step of the healthy phase (grad/clipped ~ 1.0), so
-        # it was acting as the step-size controller rather than as a safety
-        # net; keep it visible here so it can be varied in a sweep.
-        gradient_clip_val: 1.0
+        # Global-norm gradient clipping. At 1.0 this bound on essentially every
+        # step of the healthy phase (grad/clipped ~ 1.0 for 75 epochs, 94% of
+        # steps over the measured window), so it was the step-size controller
+        # rather than a safety net, and it deleted the gradient magnitude that
+        # is the only signal curvature is rising. Healthy norms on the
+        # 2026-09-20 run were p50 2.6, p95 7.4, p99 10.3, max 37.9, so 5.0 sits
+        # above the bulk: it leaves ~83% of healthy steps untouched and actually
+        # means something when it fires. Raise this only together with a lower
+        # training.lr -- note that with AdamW a constant rescale of every
+        # gradient cancels out of the update, so this is not itself an LR knob.
+        # optimizer.grad_skip_norm, not this, is the guard against a runaway.
+        gradient_clip_val: 5.0
+
+        # Validation loss above which EarlyStopping calls the run diverged (see
+        # train_ParTauDETR.callbacks). check_finite alone missed the 2026-09-20
+        # blow-up because the loss rose to 7.67 without ever going non-finite.
+        # A healthy plateau is ~0.73. null disables the check.
+        val_loss_divergence_threshold: 3.0
 
         # Validation runs at epoch end by default. With a multi-hour epoch that
         # means no val_losses/* metrics and no ModelCheckpoint(monitor=
@@ -81,6 +101,24 @@ training:
         # was never asked for, and beta1 sat at its minimum exactly where the
         # 250-epoch run blew up. Off unless deliberately studied.
         cycle_momentum: false
+        # Fraction of total_steps OneCycleLR spends ramping up to lr. It sets
+        # WHERE the peak lands, not how high it is and not how long the schedule
+        # lingers near it (the ramp shortening is cancelled by the decay
+        # lengthening). The default 0.3 put the peak at step 55 425 of 184 750,
+        # so the highest LR of the run coincided with its sharpest model, which
+        # is where it diverged; 0.1 moves the peak to step 18 475, while the
+        # model is still under-trained, and leaves 90% of the run annealing.
+        pct_start: 0.1
+        # Gradient-norm outlier guard (ParTauDETR_module.on_before_optimizer_step).
+        # A step whose pre-clip global norm exceeds this, or is non-finite, has
+        # its gradient zeroed and is skipped rather than clipped and applied --
+        # clipping keeps the direction of a garbage gradient and only discards
+        # its magnitude. Healthy norms peaked at 37.9, so 50.0 does not fire in
+        # normal training. grad_skip_patience consecutive skips abort the run:
+        # at that point it is not an outlier batch, it has diverged. Set
+        # grad_skip_norm to 0 to disable the skip and keep only the logging.
+        grad_skip_norm: 50.0
+        grad_skip_patience: 50
 
     dataloader:
         batch_size: 12288
