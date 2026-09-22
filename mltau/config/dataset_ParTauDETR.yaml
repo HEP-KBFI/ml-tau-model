@@ -7,7 +7,7 @@ dataset:
     # 5 daughters (DM 4 and DM 12 reach exactly 5), so 6 is one slot of margin,
     # not a requirement. Fewer queries make each one count more; see
     # model.detr.loss.eos_coef before changing this.
-    max_tau_daughters: 6
+    max_tau_daughters: 5
      # Negative value disables the pT cut
      # NB! When enabling the cut, the charge, DM and 4-momentum that is
      # obtained by aggregating generator-level constituents passing the pT
@@ -38,7 +38,7 @@ dataset:
     # the test set.
     max_jets_per_sample:
         z: null
-        qq: 5000000
+        qq: 10_000_000
     selection_seed: 42
 
     relative_sizes:
