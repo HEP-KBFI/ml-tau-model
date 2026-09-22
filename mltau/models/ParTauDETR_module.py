@@ -658,12 +658,9 @@ class SetCriterion(nn.Module):
         # unweighted, like the daughter losses (class docstring).
         parent_weights = signal_mask.to(dtype=pred_logits.dtype)
 
-        # Computed only when it contributes. These three ship at weight 0 and
-        # were still evaluated on every step (set_grad_enabled suppresses the
-        # backward, not the forward): a decode + index_add and two Python loops
-        # over the queries, ~50 kernel launches per step for a number used only
-        # as a log. With the weight at 0 the logged value is 0.
-        if self.loss_parent_kinematics_weight > 0:
+        with torch.set_grad_enabled(
+            torch.is_grad_enabled() and self.loss_parent_kinematics_weight > 0
+        ):
             reference_pt = kinematics_reference_p4["pt"].to(dtype=pred_kinematics.dtype, device=device)[pair_b]
             reference_eta = kinematics_reference_p4["eta"].to(dtype=pred_kinematics.dtype, device=device)[pair_b]
             reference_phi = kinematics_reference_p4["phi"].to(dtype=pred_kinematics.dtype, device=device)[pair_b]
@@ -709,12 +706,9 @@ class SetCriterion(nn.Module):
         if self.loss_parent_kinematics_weight > 0:
             total_loss = total_loss + self.loss_parent_kinematics_weight * loss_parent_kinematics
 
-        # Computed only when it contributes. These three ship at weight 0 and
-        # were still evaluated on every step (set_grad_enabled suppresses the
-        # backward, not the forward): a decode + index_add and two Python loops
-        # over the queries, ~50 kernel launches per step for a number used only
-        # as a log. With the weight at 0 the logged value is 0.
-        if self.loss_parent_charge_weight > 0:
+        with torch.set_grad_enabled(
+            torch.is_grad_enabled() and self.loss_parent_charge_weight > 0
+        ):
             matched_query_mask = torch.zeros(
                 (batch_size, num_queries), dtype=torch.bool, device=device
             )
@@ -751,12 +745,9 @@ class SetCriterion(nn.Module):
         if self.loss_parent_charge_weight > 0:
             total_loss = total_loss + self.loss_parent_charge_weight * loss_parent_charge
 
-        # Computed only when it contributes. These three ship at weight 0 and
-        # were still evaluated on every step (set_grad_enabled suppresses the
-        # backward, not the forward): a decode + index_add and two Python loops
-        # over the queries, ~50 kernel launches per step for a number used only
-        # as a log. With the weight at 0 the logged value is 0.
-        if self.loss_parent_decay_mode_weight > 0:
+        with torch.set_grad_enabled(
+            torch.is_grad_enabled() and self.loss_parent_decay_mode_weight > 0
+        ):
             matched_query_mask = torch.zeros(
                 (batch_size, num_queries), dtype=torch.bool, device=device
             )
