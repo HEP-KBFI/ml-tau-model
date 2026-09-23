@@ -1038,6 +1038,9 @@ class ParTauDETRModule(L.LightningModule):
         self.threshold_buffer = s2s.ThresholdCalibrationBuffer(
             max_jets=int(scan_cfg.get("jets", 100_000)) if scan_cfg else 100_000
         )
+        self.validation_threshold_buffer = s2s.ThresholdCalibrationBuffer(
+            max_jets=int(scan_cfg.get("jets", 100_000)) if scan_cfg else 100_000
+        )
         self.threshold_grid = (
             np.linspace(
                 float(scan_cfg.get("low", 0.5)),
@@ -1342,7 +1345,9 @@ class ParTauDETRModule(L.LightningModule):
 
         return losses["loss"]
 
-    def _buffer_for_threshold_scan(self, batch, outputs, targets) -> None:
+    def _buffer_for_threshold_scan(
+        self, batch, outputs, targets, buffer=None
+    ) -> None:
         """
         Stash what the dR matching needs from this training batch.
 
@@ -1391,7 +1396,8 @@ class ParTauDETRModule(L.LightningModule):
             true_phi = reco_jet["phi"][:, None] + torch.atan2(
                 target_kinematics[..., 2].float(), target_kinematics[..., 3].float()
             )
-        self.threshold_buffer.add(
+        destination = self.threshold_buffer if buffer is None else buffer
+        destination.add(
             scores, pred_eta, pred_phi, pred_charged, true_eta, true_phi, target_mask, true_charged
         )
 
@@ -1513,6 +1519,7 @@ class ParTauDETRModule(L.LightningModule):
         """Turn the accumulated jets into figures and scalars, then start over."""
         if self.trainer is None or self.trainer.sanity_checking:
             self.val_jets.reset()
+            self.validation_threshold_buffer.reset()
             return
         tb_logger = None
         for logger in self.trainer.loggers:
@@ -1529,7 +1536,30 @@ class ParTauDETRModule(L.LightningModule):
             scalars = {}
         for name, value in scalars.items():
             self.log(f"val_jet/{name}", value, on_step=False, on_epoch=True)
+        if self.threshold_scan_enabled:
+            try:
+                best, by_threshold = self.validation_threshold_buffer.scan(
+                    self.threshold_grid, objective=self.threshold_scan_objective
+                )
+            except Exception as exc:  # pragma: no cover - never fail a run on this
+                warnings.warn(f"validation threshold scan failed: {exc}")
+            else:
+                if best is not None:
+                    self.log("threshold/validation_argmax", float(best), on_step=False, on_epoch=True)
+                    self.log(
+                        "threshold/validation_best_decay_mode_accuracy",
+                        float(by_threshold[best]["decay_mode_accuracy"]),
+                        on_step=False,
+                        on_epoch=True,
+                    )
+                    self.log(
+                        "threshold/validation_best_f1",
+                        float(by_threshold[best]["f1"]),
+                        on_step=False,
+                        on_epoch=True,
+                    )
         self.val_jets.reset()
+        self.validation_threshold_buffer.reset()
 
     def validation_step(self, batch, _batch_idx):
         outputs, targets, weights, gen_jet_tau_p4, kinematics_reference_p4 = self.forward(batch)
@@ -1642,6 +1672,10 @@ class ParTauDETRModule(L.LightningModule):
 
         if not self.trainer.sanity_checking:
             self._accumulate_jet_level(batch, outputs, targets)
+            if self.threshold_scan_enabled:
+                self._buffer_for_threshold_scan(
+                    batch, outputs, targets, self.validation_threshold_buffer
+                )
         return losses["loss"]
 
     def on_before_optimizer_step(self, optimizer) -> None:

@@ -592,18 +592,19 @@ def scan_threshold(
 
 class ThresholdCalibrationBuffer:
     """
-    Holds recent TRAIN batches for the threshold scan.
+    Holds batches for an objectness threshold scan.
 
-    Filled from training_step, so the scan costs no extra forward passes; the
-    buffer is a ring of the last batches, which are the closest thing available
-    to the model's current state. Only what the two objectives need is kept:
-    objectness scores, directions for the dR matching, and whether each
-    predicted / true daughter is of a charged class for the decay-mode count.
+    Only what the two objectives need is kept: objectness scores, directions
+    for the dR matching, and whether each predicted / true daughter is of a
+    charged class for the decay-mode count.
     """
 
     def __init__(self, max_jets: int = 100_000):
         self.max_jets = max_jets
         self.batches: list[dict] = []
+
+    def reset(self) -> None:
+        self.batches.clear()
 
     def add(self, scores, pred_eta, pred_phi, pred_charged, true_eta, true_phi, true_valid, true_charged) -> None:
         self.batches.append({
