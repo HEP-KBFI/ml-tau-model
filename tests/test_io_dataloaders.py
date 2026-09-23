@@ -20,13 +20,17 @@ import os
 import sys
 from pathlib import Path
 
+import awkward as ak
 import torch
 from omegaconf import OmegaConf
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from mltau.tools.io.ParT_dataloader import ParTDataModule  # noqa: E402
-from mltau.tools.io.ParTauDETR_dataloader import ParTauDETRDataModule  # noqa: E402
+from mltau.tools.io.ParTauDETR_dataloader import (  # noqa: E402
+    ParTauDETRDataModule,
+    ParticleTransformerDETRDataset,
+)
 
 CONFIG_DIR = Path(__file__).resolve().parents[1] / "mltau" / "config"
 
@@ -85,6 +89,37 @@ def check_batches(loader, batch_size: int, name: str):
     )
 
 
+def check_tau_daughter_sorting():
+    p4 = ak.Array(
+        [
+            [
+                {"pt": 4.0, "eta": 0.1, "phi": 0.2, "mass": 0.14},
+                {"pt": 12.0, "eta": 0.2, "phi": 0.3, "mass": 0.14},
+                {"pt": 7.0, "eta": 0.3, "phi": 0.4, "mass": 0.14},
+            ]
+        ]
+    )
+    pdg = ak.Array([[11, 22, 33]])
+    charge = ak.Array([[-1, 0, 1]])
+
+    sorted_p4, sorted_pdg, sorted_charge = (
+        ParticleTransformerDETRDataset._sort_tau_daughters_by_pt(p4, pdg, charge)
+    )
+
+    assert ak.to_list(sorted_p4.pt) == [[12.0, 7.0, 4.0]]
+    assert ak.to_list(sorted_pdg) == [[22, 33, 11]]
+    assert ak.to_list(sorted_charge) == [[0, 1, -1]]
+    assert ParticleTransformerDETRDataset._pad_jagged(
+        sorted_p4.pt, 2
+    ).tolist() == [[12.0, 7.0]]
+    assert ParticleTransformerDETRDataset._pad_jagged(
+        sorted_pdg, 2
+    ).tolist() == [[22, 33]]
+    assert ParticleTransformerDETRDataset._pad_jagged(
+        sorted_charge, 2
+    ).tolist() == [[0, 1]]
+
+
 def run(main: str, dataset: str, module_cls, label: str, batch_size: int = 256):
     print(f"[{label}]")
     cfg = compose(main, dataset, batch_size)
@@ -99,6 +134,7 @@ def run(main: str, dataset: str, module_cls, label: str, batch_size: int = 256):
 
 if __name__ == "__main__":
     torch.manual_seed(0)
+    check_tau_daughter_sorting()
     run("main.yaml", "dataset.yaml", ParTDataModule, "ParT data module")
     run("main_ParTauDETR.yaml", "dataset_ParTauDETR.yaml", ParTauDETRDataModule, "DETR data module")
     print("\nAll dataloader tests passed.")

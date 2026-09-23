@@ -94,6 +94,13 @@ class ParticleTransformerDETRDataset(ParticleTransformerDataset):
             return 0
         return int(np.max(n_daughters))
 
+    @staticmethod
+    def _sort_tau_daughters_by_pt(daughter_p4, daughter_pdg, daughter_charge):
+        if len(daughter_p4.fields) == 0:
+            return daughter_p4, daughter_pdg, daughter_charge
+        order = ak.argsort(p4_field(daughter_p4, "pt"), axis=-1, ascending=False)
+        return daughter_p4[order], daughter_pdg[order], daughter_charge[order]
+
     @classmethod
     def _charges_to_class_indices(cls, raw_charge: np.ndarray) -> np.ndarray:
         out = np.full(raw_charge.shape, -1, dtype=np.int64)
@@ -237,6 +244,12 @@ class ParticleTransformerDETRDataset(ParticleTransformerDataset):
         daughter_p4 = daughter_p4[supported_pdg]
         daughter_pdg_jag = daughter_pdg_jag[supported_pdg]
         daughter_charge_jag = daughter_charge_jag[supported_pdg]
+
+        daughter_p4, daughter_pdg_jag, daughter_charge_jag = (
+            self._sort_tau_daughters_by_pt(
+                daughter_p4, daughter_pdg_jag, daughter_charge_jag
+            )
+        )
 
         daughter_counts = ak.to_numpy(ak.num(daughter_pdg_jag)).astype(np.int64)
         max_tau_daughters = self._get_max_tau_daughters(daughter_counts)
