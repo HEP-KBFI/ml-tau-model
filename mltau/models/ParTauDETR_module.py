@@ -412,6 +412,10 @@ class SetCriterion(nn.Module):
         loss_parent_kinematics_weight: float = 0.0,
         loss_parent_charge_weight: float = 0.0,
         loss_parent_decay_mode_weight: float = 0.0,
+        loss_soft_parent_kinematics_weight: float = 0.0,
+        loss_soft_parent_charge_weight: float = 0.0,
+        loss_soft_parent_decay_mode_weight: float = 0.0,
+        parent_objectness_temperature: float = 0.1,
         no_object_class_index: int = 1,
         object_class_index: int = 0,
         eos_coef: float = 0.1,
@@ -430,6 +434,12 @@ class SetCriterion(nn.Module):
         self.loss_parent_kinematics_weight = loss_parent_kinematics_weight
         self.loss_parent_charge_weight = loss_parent_charge_weight
         self.loss_parent_decay_mode_weight = loss_parent_decay_mode_weight
+        self.loss_soft_parent_kinematics_weight = loss_soft_parent_kinematics_weight
+        self.loss_soft_parent_charge_weight = loss_soft_parent_charge_weight
+        self.loss_soft_parent_decay_mode_weight = loss_soft_parent_decay_mode_weight
+        if not 0.0 < parent_objectness_temperature < 1.0:
+            raise ValueError("parent_objectness_temperature must be between 0 and 1.")
+        self.parent_objectness_temperature = parent_objectness_temperature
         self.no_object_class_index = no_object_class_index
         self.object_class_index = object_class_index
         self.eos_coef = eos_coef
@@ -455,6 +465,164 @@ class SetCriterion(nn.Module):
             return values.mean()
         return (values * weights).sum() / (weights.sum() + 1e-8)
 
+    def _soft_objectness_gate(
+        self, pred_logits: torch.Tensor, threshold: torch.Tensor | float
+    ) -> torch.Tensor:
+        """
+        Turn each objectness score into a smooth approximation of a threshold cut.
+
+        A query at the threshold receives weight 0.5. Scores above and below it
+        are pushed towards one and zero, respectively. The temperature controls
+        how closely this follows a hard cut while keeping the result differentiable.
+        """
+        probabilities = F.softmax(pred_logits.float(), dim=-1)[
+            ..., self.object_class_index
+        ]
+        eps = torch.finfo(probabilities.dtype).eps
+        threshold_tensor = torch.as_tensor(
+            threshold, dtype=probabilities.dtype, device=probabilities.device
+        ).clamp(eps, 1.0 - eps)
+        return torch.sigmoid(
+            (
+                torch.logit(probabilities.clamp(eps, 1.0 - eps))
+                - torch.logit(threshold_tensor)
+            )
+            / self.parent_objectness_temperature
+        )
+
+    def _compute_parent_kinematics_loss(
+        self,
+        pred_parent_p4: torch.Tensor,
+        target_parent_p4: dict[str, torch.Tensor],
+        parent_weights: torch.Tensor,
+    ) -> torch.Tensor:
+        """
+        Compare a reconstructed parent four-momentum with the true tau.
+
+        The daughter momenta have already been combined before entering this
+        helper. Their total is expressed in the same relative kinematic form as
+        the daughter loss, then compared with the parent tau target.
+        """
+        device = pred_parent_p4.device
+        pred_px, pred_py, pred_pz, pred_energy = pred_parent_p4.unbind(dim=-1)
+        pred_pt = torch.sqrt((pred_px**2 + pred_py**2).clamp_min(1e-12))
+        pred_eta = torch.asinh(pred_pz / pred_pt.clamp_min(1e-6))
+        pred_phi = torch.atan2(pred_py, pred_px)
+        pred_mass = torch.sqrt(
+            torch.clamp(
+                pred_energy**2 - pred_px**2 - pred_py**2 - pred_pz**2,
+                min=1e-12,
+            )
+        )
+
+        true_pt = target_parent_p4["pt"].to(dtype=pred_pt.dtype, device=device)
+        true_eta = target_parent_p4["eta"].to(dtype=pred_eta.dtype, device=device)
+        true_phi = target_parent_p4["phi"].to(dtype=pred_phi.dtype, device=device)
+        true_energy = target_parent_p4["energy"].to(
+            dtype=pred_energy.dtype, device=device
+        )
+        true_mass = torch.sqrt(
+            torch.clamp(
+                true_energy**2 - (true_pt * torch.cosh(true_eta)) ** 2,
+                min=1e-12,
+            )
+        )
+        delta_phi = pred_phi - true_phi
+        pred_parent_kinematics = torch.stack(
+            [
+                torch.log(
+                    pred_pt.clamp_min(1e-6) / true_pt.clamp_min(1e-6)
+                ).clamp(-5.0, 5.0),
+                pred_eta - true_eta,
+                torch.sin(delta_phi),
+                torch.cos(delta_phi),
+                torch.log(
+                    pred_mass.clamp_min(1e-6) / true_mass.clamp_min(1e-6)
+                ).clamp(-5.0, 5.0),
+            ],
+            dim=-1,
+        )
+        target_parent_kinematics = torch.zeros_like(pred_parent_kinematics)
+        target_parent_kinematics[:, 3] = 1.0
+        loss, _ = self.tau_loss.compute_kinematics_loss(
+            pred_parent_kinematics,
+            target_parent_kinematics,
+            parent_weights,
+        )
+        return loss
+
+    @staticmethod
+    def _decode_predicted_p4(
+        pred_kinematics: torch.Tensor,
+        kinematics_reference_p4: dict[str, torch.Tensor],
+        batch_indices: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        """
+        Convert predicted daughter kinematics into physical four-momenta.
+
+        Predictions are stored relative to each reconstructed jet. This helper
+        restores their absolute momenta so selected or softly weighted daughters
+        can be summed to reconstruct the parent tau.
+        """
+        references = {}
+        for name in ("pt", "eta", "phi", "energy"):
+            reference = kinematics_reference_p4[name].to(
+                dtype=pred_kinematics.dtype, device=pred_kinematics.device
+            )
+            if batch_indices is not None:
+                reference = reference[batch_indices]
+            references[name] = reference
+        return decode_kinematics(
+            pred_kinematics,
+            references["pt"],
+            references["eta"],
+            references["phi"],
+            references["energy"],
+            clamp_log_ratios=True,
+        )
+
+    def _compute_parent_charge_loss(
+        self,
+        charge_probabilities: torch.Tensor,
+        target_parent_charge: torch.Tensor,
+        signal_mask: torch.Tensor,
+        parent_weights: torch.Tensor,
+    ) -> torch.Tensor:
+        """
+        Compare the possible total daughter charges with the true tau charge.
+
+        Each query supplies probabilities for negative, neutral, and positive
+        charge. These are combined into a probability distribution for the sum
+        over all queries, which is then supervised by the parent tau charge.
+        """
+        batch_size, num_queries, _ = charge_probabilities.shape
+        parent_charge_probabilities = charge_probabilities.new_zeros(
+            (batch_size, 2 * num_queries + 1)
+        )
+        parent_charge_probabilities[:, num_queries] = 1.0
+        for query_index in range(num_queries):
+            probability = charge_probabilities[:, query_index]
+            parent_charge_probabilities = (
+                F.pad(parent_charge_probabilities[:, 1:], (0, 1))
+                * probability[:, 0, None]
+                + parent_charge_probabilities * probability[:, 1, None]
+                + F.pad(parent_charge_probabilities[:, :-1], (1, 0))
+                * probability[:, 2, None]
+            )
+
+        charge_loss = F.cross_entropy(
+            parent_charge_probabilities.clamp_min(1e-8).log(),
+            (
+                target_parent_charge.to(
+                    device=charge_probabilities.device, dtype=torch.long
+                )
+                + num_queries
+            ).masked_fill(~signal_mask, self.ignore_index),
+            reduction="none",
+            ignore_index=self.ignore_index,
+        )
+        return self._weighted_mean(charge_loss, parent_weights)
+
     def forward(
         self,
         outputs: dict,
@@ -468,6 +636,7 @@ class SetCriterion(nn.Module):
         kinematics_reference_p4: dict[str, torch.Tensor],
         target_is_tau: torch.Tensor | None = None,
         jet_weights: torch.Tensor | None = None,
+        objectness_threshold: torch.Tensor | float = 0.5,
     ) -> dict[str, torch.Tensor]:
         pred_logits = outputs["pred_logits"]
         pred_kinematics = outputs["pred_kinematics"]
@@ -608,6 +777,9 @@ class SetCriterion(nn.Module):
         loss_parent_kinematics = pred_logits.new_zeros(())
         loss_parent_charge = pred_logits.new_zeros(())
         loss_parent_decay_mode = pred_logits.new_zeros(())
+        loss_soft_parent_kinematics = pred_logits.new_zeros(())
+        loss_soft_parent_charge = pred_logits.new_zeros(())
+        loss_soft_parent_decay_mode = pred_logits.new_zeros(())
 
         with torch.set_grad_enabled(
             torch.is_grad_enabled() and self.loss_consistency_weight > 0
@@ -654,53 +826,28 @@ class SetCriterion(nn.Module):
         if self.loss_charge_count_weight > 0:
             total_loss = total_loss + self.loss_charge_count_weight * loss_charge_count
 
-        # Parent constraints are reconstruction terms: signal jets only and
-        # unweighted, like the daughter losses (class docstring).
+        # Parent constraints ask the predicted daughters to reconstruct the
+        # known parent tau. Kinematics compares the summed daughter momentum to
+        # the tau momentum, charge compares the summed daughter charge to the
+        # tau charge, and decay mode compares the charged/neutral daughter
+        # counts to the tau decay mode. They are signal-only and unweighted,
+        # like the daughter losses (class docstring).
         parent_weights = signal_mask.to(dtype=pred_logits.dtype)
 
+        # Matched constraints use only queries assigned to true daughters by
+        # the Hungarian matcher. Other queries do not contribute to the parent.
         with torch.set_grad_enabled(
             torch.is_grad_enabled() and self.loss_parent_kinematics_weight > 0
         ):
-            reference_pt = kinematics_reference_p4["pt"].to(dtype=pred_kinematics.dtype, device=device)[pair_b]
-            reference_eta = kinematics_reference_p4["eta"].to(dtype=pred_kinematics.dtype, device=device)[pair_b]
-            reference_phi = kinematics_reference_p4["phi"].to(dtype=pred_kinematics.dtype, device=device)[pair_b]
-            reference_energy = kinematics_reference_p4["energy"].to(dtype=pred_kinematics.dtype, device=device)[pair_b]
-            pred_p4 = decode_kinematics(
+            pred_p4 = self._decode_predicted_p4(
                 pred_kinematics[pair_b, pair_q],
-                reference_pt,
-                reference_eta,
-                reference_phi,
-                reference_energy,
-                clamp_log_ratios=True,
+                kinematics_reference_p4,
+                pair_b,
             )
             pred_parent_p4 = pred_p4.new_zeros((batch_size, 4)).index_add(0, pair_b, pred_p4)
-            pred_px, pred_py, pred_pz, pred_energy = pred_parent_p4.unbind(dim=-1)
-            pred_pt = torch.sqrt((pred_px**2 + pred_py**2).clamp_min(1e-12))
-            pred_eta = torch.asinh(pred_pz / pred_pt.clamp_min(1e-6))
-            pred_phi = torch.atan2(pred_py, pred_px)
-            pred_mass = torch.sqrt(torch.clamp(pred_energy**2 - pred_px**2 - pred_py**2 - pred_pz**2, min=1e-12))
-
-            true_pt = target_parent_p4["pt"].to(dtype=pred_pt.dtype, device=device)
-            true_eta = target_parent_p4["eta"].to(dtype=pred_eta.dtype, device=device)
-            true_phi = target_parent_p4["phi"].to(dtype=pred_phi.dtype, device=device)
-            true_energy = target_parent_p4["energy"].to(dtype=pred_energy.dtype, device=device)
-            true_mass = torch.sqrt(torch.clamp(true_energy**2 - (true_pt * torch.cosh(true_eta)) ** 2, min=1e-12))
-            delta_phi = pred_phi - true_phi
-            pred_parent_kinematics = torch.stack(
-                [
-                    torch.log(pred_pt.clamp_min(1e-6) / true_pt.clamp_min(1e-6)).clamp(-5.0, 5.0),
-                    pred_eta - true_eta,
-                    torch.sin(delta_phi),
-                    torch.cos(delta_phi),
-                    torch.log(pred_mass.clamp_min(1e-6) / true_mass.clamp_min(1e-6)).clamp(-5.0, 5.0),
-                ],
-                dim=-1,
-            )
-            target_parent_kinematics = torch.zeros_like(pred_parent_kinematics)
-            target_parent_kinematics[:, 3] = 1.0
-            loss_parent_kinematics, _ = self.tau_loss.compute_kinematics_loss(
-                pred_parent_kinematics,
-                target_parent_kinematics,
+            loss_parent_kinematics = self._compute_parent_kinematics_loss(
+                pred_parent_p4,
+                target_parent_p4,
                 parent_weights,
             )
         if self.loss_parent_kinematics_weight > 0:
@@ -720,28 +867,12 @@ class SetCriterion(nn.Module):
                 charge_probabilities,
                 unmatched_charge,
             )
-
-            parent_charge_probabilities = charge_probabilities.new_zeros(
-                (batch_size, 2 * num_queries + 1)
+            loss_parent_charge = self._compute_parent_charge_loss(
+                charge_probabilities,
+                target_parent_charge,
+                signal_mask,
+                parent_weights,
             )
-            parent_charge_probabilities[:, num_queries] = 1.0
-            for query_index in range(num_queries):
-                probability = charge_probabilities[:, query_index]
-                parent_charge_probabilities = (
-                    F.pad(parent_charge_probabilities[:, 1:], (0, 1)) * probability[:, 0, None]
-                    + parent_charge_probabilities * probability[:, 1, None]
-                    + F.pad(parent_charge_probabilities[:, :-1], (1, 0)) * probability[:, 2, None]
-                )
-
-            charge_loss = F.cross_entropy(
-                parent_charge_probabilities.clamp_min(1e-8).log(),
-                (target_parent_charge.to(device=device, dtype=torch.long) + num_queries).masked_fill(
-                    ~signal_mask, self.ignore_index
-                ),
-                reduction="none",
-                ignore_index=self.ignore_index,
-            )
-            loss_parent_charge = self._weighted_mean(charge_loss, parent_weights)
         if self.loss_parent_charge_weight > 0:
             total_loss = total_loss + self.loss_parent_charge_weight * loss_parent_charge
 
@@ -796,6 +927,129 @@ class SetCriterion(nn.Module):
         if self.loss_parent_decay_mode_weight > 0:
             total_loss = total_loss + self.loss_parent_decay_mode_weight * loss_parent_decay_mode
 
+        # Soft constraints use every query, weighted by a smooth version of the
+        # objectness threshold. Queries well above the threshold contribute
+        # almost fully, queries well below it contribute almost nothing, and
+        # queries near it change smoothly so gradients can pass through.
+        use_soft_parent_constraints = any(
+            weight > 0
+            for weight in (
+                self.loss_soft_parent_kinematics_weight,
+                self.loss_soft_parent_charge_weight,
+                self.loss_soft_parent_decay_mode_weight,
+            )
+        )
+        with torch.set_grad_enabled(
+            torch.is_grad_enabled() and use_soft_parent_constraints
+        ):
+            soft_query_weights = self._soft_objectness_gate(
+                pred_logits, objectness_threshold
+            )
+
+        with torch.set_grad_enabled(
+            torch.is_grad_enabled() and self.loss_soft_parent_kinematics_weight > 0
+        ):
+            pred_p4 = self._decode_predicted_p4(
+                pred_kinematics,
+                kinematics_reference_p4,
+            )
+            pred_parent_p4 = (pred_p4 * soft_query_weights.unsqueeze(-1)).sum(dim=1)
+            loss_soft_parent_kinematics = self._compute_parent_kinematics_loss(
+                pred_parent_p4,
+                target_parent_p4,
+                parent_weights,
+            )
+        if self.loss_soft_parent_kinematics_weight > 0:
+            total_loss = (
+                total_loss
+                + self.loss_soft_parent_kinematics_weight
+                * loss_soft_parent_kinematics
+            )
+
+        with torch.set_grad_enabled(
+            torch.is_grad_enabled() and self.loss_soft_parent_charge_weight > 0
+        ):
+            charge_probabilities = F.softmax(pred_charge_logits.float(), dim=-1)
+            absent_charge = charge_probabilities.new_tensor([0.0, 1.0, 0.0])
+            charge_probabilities = (
+                charge_probabilities * soft_query_weights.unsqueeze(-1)
+                + absent_charge * (torch.ones_like(soft_query_weights) - soft_query_weights).unsqueeze(-1)
+            )
+            loss_soft_parent_charge = self._compute_parent_charge_loss(
+                charge_probabilities,
+                target_parent_charge,
+                signal_mask,
+                parent_weights,
+            )
+        if self.loss_soft_parent_charge_weight > 0:
+            total_loss = (
+                total_loss
+                + self.loss_soft_parent_charge_weight * loss_soft_parent_charge
+            )
+
+        with torch.set_grad_enabled(
+            torch.is_grad_enabled() and self.loss_soft_parent_decay_mode_weight > 0
+        ):
+            charge_probabilities = F.softmax(pred_charge_logits.float(), dim=-1)
+            neutral_probability = (
+                soft_query_weights * charge_probabilities[..., 1]
+            )
+            charged_probability = soft_query_weights * (
+                charge_probabilities[..., 0] + charge_probabilities[..., 2]
+            )
+            absent_probability = torch.ones_like(soft_query_weights) - soft_query_weights
+
+            count_probabilities = charge_probabilities.new_zeros(
+                (batch_size, num_queries + 1, num_queries + 1)
+            )
+            count_probabilities[:, 0, 0] = 1.0
+            for query_index in range(num_queries):
+                count_probabilities = (
+                    count_probabilities
+                    * absent_probability[:, query_index, None, None]
+                    + F.pad(count_probabilities[:, :-1, :], (0, 0, 1, 0))
+                    * charged_probability[:, query_index, None, None]
+                    + F.pad(count_probabilities[:, :, :-1], (1, 0, 0, 0))
+                    * neutral_probability[:, query_index, None, None]
+                )
+
+            num_charged = torch.arange(num_queries + 1, device=device).view(-1, 1)
+            num_neutral = torch.arange(num_queries + 1, device=device).view(1, -1)
+            decay_mode_stride = 5
+            decay_modes = decay_mode_stride * (num_charged - 1) + num_neutral
+            invalid_decay_mode_index = decay_mode_stride * num_queries + 1
+            decay_mode_indices = torch.where(
+                (num_charged > 0)
+                & (num_charged + num_neutral <= num_queries),
+                decay_modes + decay_mode_stride,
+                invalid_decay_mode_index,
+            ).flatten()
+            decay_mode_probabilities = count_probabilities.new_zeros(
+                (batch_size, 5 * num_queries + 2)
+            ).scatter_add(
+                1,
+                decay_mode_indices.unsqueeze(0).expand(batch_size, -1),
+                count_probabilities.flatten(1),
+            )
+            decay_mode_loss = F.cross_entropy(
+                decay_mode_probabilities.clamp_min(1e-8).log(),
+                (
+                    target_parent_decay_mode.to(device=device, dtype=torch.long)
+                    + decay_mode_stride
+                ).masked_fill(~signal_mask, self.ignore_index),
+                reduction="none",
+                ignore_index=self.ignore_index,
+            )
+            loss_soft_parent_decay_mode = self._weighted_mean(
+                decay_mode_loss, parent_weights
+            )
+        if self.loss_soft_parent_decay_mode_weight > 0:
+            total_loss = (
+                total_loss
+                + self.loss_soft_parent_decay_mode_weight
+                * loss_soft_parent_decay_mode
+            )
+
         return {
             "loss": total_loss,
             "loss_objectness": loss_objectness,
@@ -812,6 +1066,9 @@ class SetCriterion(nn.Module):
             "loss_parent_kinematics": loss_parent_kinematics,
             "loss_parent_charge": loss_parent_charge,
             "loss_parent_decay_mode": loss_parent_decay_mode,
+            "loss_soft_parent_kinematics": loss_soft_parent_kinematics,
+            "loss_soft_parent_charge": loss_soft_parent_charge,
+            "loss_soft_parent_decay_mode": loss_soft_parent_decay_mode,
             "num_matched": pred_logits.new_tensor(float(num_matched)),
             "num_charge_supervised": num_charge_supervised.to(pred_logits.dtype),
             "num_meson_class_supervised": num_meson_class_supervised.to(
@@ -965,6 +1222,10 @@ class ParTauDETRModule(L.LightningModule):
             loss_parent_kinematics_weight=float(detr_cfg.loss.weight_parent_kinematics),
             loss_parent_charge_weight=float(detr_cfg.loss.weight_parent_charge),
             loss_parent_decay_mode_weight=float(detr_cfg.loss.weight_parent_decay_mode),
+            loss_soft_parent_kinematics_weight=float(detr_cfg.loss.weight_soft_parent_kinematics),
+            loss_soft_parent_charge_weight=float(detr_cfg.loss.weight_soft_parent_charge),
+            loss_soft_parent_decay_mode_weight=float(detr_cfg.loss.weight_soft_parent_decay_mode),
+            parent_objectness_temperature=float(detr_cfg.loss.parent_objectness_temperature),
             no_object_class_index=1,
             object_class_index=0,
             eos_coef=float(detr_cfg.loss.eos_coef),
@@ -1212,6 +1473,7 @@ class ParTauDETRModule(L.LightningModule):
             kinematics_reference_p4=kinematics_reference_p4,
             target_is_tau=target_is_tau,
             jet_weights=weights,
+            objectness_threshold=self.score_threshold_calibrated,
         )
 
         # A non-finite loss must not reach the optimizer: one backward of a NaN
@@ -1313,6 +1575,24 @@ class ParTauDETRModule(L.LightningModule):
         self.log(
             "train_losses/parent_decay_mode",
             losses["loss_parent_decay_mode"],
+            on_step=False,
+            on_epoch=True,
+        )
+        self.log(
+            "train_losses/soft_parent_kinematics",
+            losses["loss_soft_parent_kinematics"],
+            on_step=False,
+            on_epoch=True,
+        )
+        self.log(
+            "train_losses/soft_parent_charge",
+            losses["loss_soft_parent_charge"],
+            on_step=False,
+            on_epoch=True,
+        )
+        self.log(
+            "train_losses/soft_parent_decay_mode",
+            losses["loss_soft_parent_decay_mode"],
             on_step=False,
             on_epoch=True,
         )
@@ -1576,6 +1856,7 @@ class ParTauDETRModule(L.LightningModule):
             kinematics_reference_p4=kinematics_reference_p4,
             target_is_tau=target_is_tau,
             jet_weights=weights,
+            objectness_threshold=self.score_threshold_calibrated,
         )
 
         self.log("val_losses/loss", losses["loss"], on_step=False, on_epoch=True)
@@ -1657,6 +1938,24 @@ class ParTauDETRModule(L.LightningModule):
         self.log(
             "val_losses/parent_decay_mode",
             losses["loss_parent_decay_mode"],
+            on_step=False,
+            on_epoch=True,
+        )
+        self.log(
+            "val_losses/soft_parent_kinematics",
+            losses["loss_soft_parent_kinematics"],
+            on_step=False,
+            on_epoch=True,
+        )
+        self.log(
+            "val_losses/soft_parent_charge",
+            losses["loss_soft_parent_charge"],
+            on_step=False,
+            on_epoch=True,
+        )
+        self.log(
+            "val_losses/soft_parent_decay_mode",
+            losses["loss_soft_parent_decay_mode"],
             on_step=False,
             on_epoch=True,
         )

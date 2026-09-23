@@ -134,6 +134,15 @@ model:
             weight_parent_kinematics: 0.0
             weight_parent_charge: 0.0
             weight_parent_decay_mode: 0.0
+            # Differentiable alternatives to the matched-query parent losses.
+            # All queries contribute after their objectness probability p is
+            # sharpened around the calibrated inference threshold t as
+            # sigmoid((logit(p) - logit(t)) / temperature). Keep the temperature
+            # between 0 and 1.
+            weight_soft_parent_kinematics: 0.0
+            weight_soft_parent_charge: 0.0
+            weight_soft_parent_decay_mode: 0.0
+            parent_objectness_temperature: 0.1
             # Loss weight of the "no object" class of the objectness head; the
             # object class has weight 1. With n_obj real daughters among Q
             # queries the two sides carry equal total weight at
