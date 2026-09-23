@@ -7,7 +7,7 @@ dataset:
     # 5 daughters (DM 4 and DM 12 reach exactly 5), so 6 is one slot of margin,
     # not a requirement. Fewer queries make each one count more; see
     # model.detr.loss.eos_coef before changing this.
-    max_tau_daughters: 6
+    max_tau_daughters: 5
      # Negative value disables the pT cut
      # NB! When enabling the cut, the charge, DM and 4-momentum that is
      # obtained by aggregating generator-level constituents passing the pT
@@ -17,19 +17,17 @@ dataset:
      # generator-level tau after the pT cut. Note that this is only an issue if
      # the pT cut is enabled and weight_parent_* weights are positive.
     tau_daughter_pt_cut: -1.0
-    # data_dir: /scratch/project_465001293/0914_ParTauDETR_dataset/
-    # data_dir: /scratch/persistent/laurits/ml-tau/0914_ParTauDETR_dataset/
-    data_dir: /scratch/persistent/karl/ml-tau/0915_ParTauDETR_dataset/
+    data_dir: /scratch/persistent/karl/ml-tau/0921_ParTauDETR_dataset/
 
     # Meson classes for daughter one-hot encoding. Mapping order defines class
     # indices and charges defines valid charge-head combinations. All unlisted
     # decay products are discarded before target padding/truncation.
     tau_daughter_pdg_ids:
         charged:
-            pdg_ids: [211, 321]
+            pdg_ids: [211, 321] # pi+/-, K+/-
             charges: [-1, 1]
         neutral:
-            pdg_ids: [111, 221, 311, 130, 310] # includes only 221 -> 22 22
+            pdg_ids: [111, 221, 130] # pi0, eta -> yy, K_L0
             charges: [0]
 
     # Cap how many jets each sample contributes to train+val. Keys are the
@@ -40,7 +38,7 @@ dataset:
     # the test set.
     max_jets_per_sample:
         z: null
-        qq: 5000000
+        qq: 10_000_000
     selection_seed: 42
 
     relative_sizes:

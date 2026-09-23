@@ -86,7 +86,7 @@ def construct_jet_level_predictions(
 
 
 def construct_prediction_file_content(
-    data, pred_daughters, true_daughters, tau_daughter_pdg_ids
+    data, pred_daughters, true_daughters, tau_daughter_pdg_ids, debug = False,
 ):
     fields_of_interest = [
         "reco_jet_p4",
@@ -103,6 +103,11 @@ def construct_prediction_file_content(
         "gen_jet_tau_vis_daughter_charges",
         "gen_jet_tau_p4",
     ]
+    if debug:
+        fields_of_interest.extend([
+            "file_id",
+            "event_id",
+        ])
     data_of_interest = ak.Array(data[fields_of_interest])
     pred_tau_daughter_data = ak.Array(
         {
