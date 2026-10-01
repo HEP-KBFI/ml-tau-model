@@ -55,7 +55,7 @@ kinematics:
             nticks: 7
         response_plot:
             ylabel: "$\\phi^{vis}\\ scale\\ (q_{50})$"
-            ylim: [-0.1, 0.1]
+            ylim: [-0.05, 0.05]
             xlabel: "$\\phi^{gen-vis}$ [deg]"
             xscale: "linear"
             yscale: "linear"
@@ -74,7 +74,7 @@ kinematics:
             nticks: 7
         response_plot:
             ylabel: "$\\eta^{vis}\\ scale\\ (q_{50})$"
-            ylim: [-0.05, 0.05]
+            ylim: [-0.005, 0.005]
             xlabel: "$\\eta^{gen-vis}$"
             xscale: "linear"
             yscale: "linear"
