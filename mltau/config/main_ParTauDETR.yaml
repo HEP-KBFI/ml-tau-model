@@ -129,8 +129,8 @@ model:
             weight_kinematics: 5.0
             weight_charge: 1.0
             weight_meson_class: 1.0
-            weight_consistency: 0.1
-            weight_charge_count: 0.1
+            weight_consistency: 1.0
+            weight_charge_count: 0.0
             weight_parent_kinematics: 0.0
             weight_parent_charge: 0.0
             weight_parent_decay_mode: 0.0
@@ -140,8 +140,8 @@ model:
             # sigmoid((logit(p) - logit(t)) / temperature). Keep the temperature
             # between 0 and 1.
             weight_soft_parent_kinematics: 0.0
-            weight_soft_parent_charge: 0.0
-            weight_soft_parent_decay_mode: 0.0
+            weight_soft_parent_charge: 1.0
+            weight_soft_parent_decay_mode: 1.0
             parent_objectness_temperature: 0.1
             # Loss weight of the "no object" class of the objectness head; the
             # object class has weight 1. With n_obj real daughters among Q
@@ -186,17 +186,18 @@ model:
         # can all be 1.
         #
         # Measured on the daughter targets of z_train (47k daughters):
-        #   log_pt_ratio  sigma 0.875
-        #   delta_eta     sigma 0.077
-        #   sin_dphi      sigma 0.071   (the chord is ~|dphi| for collimated daughters)
-        #   log_mass_ratio sigma 1.064
+        #   log_pt_ratio  sigma 0.877
+        #   delta_eta     sigma 0.072
+        #   sin_dphi      sigma 0.070   (the chord is ~|dphi| for collimated daughters)
+        #   log_mass_ratio sigma 1.046
         # Recompute these if the target parameterisation or the sample changes;
-        # they are properties of the data, not tuning knobs.
+        # they are properties of the data, not tuning knobs. To reproduce the numbers:
+        # ./run.sh python mltau/scripts/measure_kinematics_scales.py --model DETR
         kinematics_scales:
-            log_pt: 0.88
-            delta_eta: 0.077
-            phi_chord: 0.080
-            log_mass: 1.06
+            log_pt: 0.877
+            delta_eta: 0.072
+            phi_chord: 0.070
+            log_mass: 1.046
         # With the residuals scaled, equal weights give each component an equal
         # share. log_mass is the one worth reconsidering rather than reweighting:
         # only 4.8% of the variance of log(m_dau/m_jet) comes from the daughter's
