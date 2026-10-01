@@ -142,16 +142,20 @@ def construct_hps_confusion_matrix(truth, predicted, categories):
         predicted,
         labels=categories,
     )
-    # Add the unclassified prediction column
-    unclassified_counts = np.array(
-        [np.sum((truth == category) & (predicted == -1)) for category in categories]
-    )[:, None]
-
-    confusion_matrix_counts = np.hstack([confusion_matrix_counts, unclassified_counts])
+    if -1 not in categories:
+        unclassified_counts = np.array(
+            [np.sum((truth == category) & (predicted == -1)) for category in categories]
+        )[:, None]
+        confusion_matrix_counts = np.hstack(
+            [confusion_matrix_counts, unclassified_counts]
+        )
 
     # Normalize each true-class row
-    confusion_matrix_normalized = confusion_matrix_counts / confusion_matrix_counts.sum(
-        axis=1, keepdims=True
+    confusion_matrix_normalized = np.divide(
+        confusion_matrix_counts,
+        confusion_matrix_counts.sum(axis=1, keepdims=True),
+        out=np.zeros_like(confusion_matrix_counts, dtype=float),
+        where=confusion_matrix_counts.sum(axis=1, keepdims=True) != 0,
     )
     return confusion_matrix_normalized
 
@@ -160,9 +164,12 @@ def evaluate_hps_decaymode_classification(truth, predicted, categories):
     confusion_matrix_normalized = construct_hps_confusion_matrix(
         truth, predicted, categories
     )
+    predicted_categories = list(categories)
+    if -1 not in predicted_categories:
+        predicted_categories.append(-1)
     fig, ax = visualize_hps_confusion_matrix(
         histogram=confusion_matrix_normalized,
         categories=categories,
-        predicted_categories=list(categories) + [-1],
+        predicted_categories=predicted_categories,
     )
     return fig, ax
