@@ -138,6 +138,11 @@ class ParticleTransformerDETRDataset(ParticleTransformerDataset):
         cand_dxy = pad_cand(data.reco_cand_dxy)
         cand_dxy_err = pad_cand(data.reco_cand_dxy_error)
 
+        # Reset sentinel values of track parameters to zero for neutral particles
+        neutral_mask = cand_charge == 0
+        for track_parameter in (cand_dz, cand_dz_err, cand_dxy, cand_dxy_err):
+            track_parameter[neutral_mask] = 0.0
+
         lengths = np.minimum(ak.to_numpy(ak.num(data.reco_cand_pdgs)), max_cands)
         mask_np = np.arange(max_cands)[None, :] < lengths[:, None]
 
