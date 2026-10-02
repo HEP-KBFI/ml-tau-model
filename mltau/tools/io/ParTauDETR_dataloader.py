@@ -163,9 +163,9 @@ class ParticleTransformerDETRDataset(ParticleTransformerDataset):
         jphi = jet_phi[:, None]
         jen = jet_en[:, None]
 
-        cand_deta = np.abs(cand_eta - jeta)
+        cand_deta = cand_eta - jeta
         dphi_raw = cand_phi - jphi
-        cand_dphi = np.abs(np.arctan2(np.sin(dphi_raw), np.cos(dphi_raw)))
+        cand_dphi = np.arctan2(np.sin(dphi_raw), np.cos(dphi_raw))
         cand_logpt = np.log(np.maximum(cand_pt, eps))
         cand_loge = np.log(np.maximum(cand_en, eps))
         cand_logptrel = np.log(np.maximum(cand_pt / np.maximum(jpt, eps), eps))
