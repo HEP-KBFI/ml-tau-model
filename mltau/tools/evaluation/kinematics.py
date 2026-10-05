@@ -272,6 +272,7 @@ class RangeContentPlot:
         return fig, axes
 
     def add_line(self, evaluator):
+        self.fig.suptitle(evaluator.algorithm, fontsize=16, fontweight="bold")
         if self.mode == "ratio":
             bins = np.linspace(0.5, 1.5, 101)
         else:
@@ -398,6 +399,7 @@ class LinePlot:
         finite_y = finite_y[np.isfinite(finite_y)]
         if finite_y.size > 0:
             self._y_values.append(finite_y)
+            self._autoscale_y()
         self.ax.legend()
 
     def _autoscale_y(self):
@@ -413,11 +415,12 @@ class LinePlot:
         else:
             pad = max((y_max - y_min) * 0.15, 1e-3)
 
-        lower = y_min - pad
-        upper = y_max + pad
+        current_lower, current_upper = self.ax.get_ylim()
+        lower = min(current_lower, y_min - pad)
+        upper = max(current_upper, y_max + pad)
 
         # Keep positive-only metrics anchored at zero when appropriate.
-        if y_min >= 0 and lower < 0:
+        if y_min >= 0 and current_lower >= 0 and lower < 0:
             lower = 0.0
 
         self.ax.set_ylim((lower, upper))
@@ -475,7 +478,7 @@ class Resolution2DPlot:
             cmap="Greys",
             y_label=f"Predicted {self.xlabel}",
             x_label=f"True {self.xlabel}",
-            title=None,
+            title=self.evaluator.algorithm,
         )
         return fig, ax
 
@@ -509,7 +512,7 @@ class RegressionMultiEvaluator:
             nticks=var_cfg.response_plot.nticks,
             axhline_loc=axhline_loc,
         )
-        self.d_lineplot = LinePlot(
+        self.resolution_lineplot = LinePlot(
             cfg=self.cfg,
             xlabel=var_cfg.resolution_plot.xlabel,
             ylabel=var_cfg.resolution_plot.ylabel,
