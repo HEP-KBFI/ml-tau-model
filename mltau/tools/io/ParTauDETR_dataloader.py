@@ -40,9 +40,9 @@ class ParticleTransformerDETRDataset(ParticleTransformerDataset):
         "reco_cand_p4s",
         "reco_cand_charges",
         "reco_cand_pdgs",
-        "reco_cand_dz",
+        "reco_cand_signed_dz",
         "reco_cand_dz_error",
-        "reco_cand_dxy",
+        "reco_cand_signed_dxy",
         "reco_cand_dxy_error",
         "reco_jet_p4",
         "gen_jet_tau_p4",
@@ -133,10 +133,42 @@ class ParticleTransformerDETRDataset(ParticleTransformerDataset):
         cand_en = pad_cand(p4_field(data.reco_cand_p4s, "energy"))
         cand_charge = pad_cand(data.reco_cand_charges)
         cand_pdg_abs = pad_cand(abs(data.reco_cand_pdgs))
-        cand_dz = pad_cand(data.reco_cand_dz)
+        cand_dz = pad_cand(data.reco_cand_signed_dz)
         cand_dz_err = pad_cand(data.reco_cand_dz_error)
-        cand_dxy = pad_cand(data.reco_cand_dxy)
+        cand_dxy = pad_cand(data.reco_cand_signed_dxy)
         cand_dxy_err = pad_cand(data.reco_cand_dxy_error)
+
+        # Reset sentinel values of track parameters to zero for neutral particles
+        neutral_mask = cand_charge == 0
+        charged_mask = ~neutral_mask
+        for track_parameter in (cand_dz, cand_dz_err, cand_dxy, cand_dxy_err):
+            track_parameter[neutral_mask] = 0.0
+
+        impact_parameter_cfg = self.cfg.dataset.impact_parameter_features
+        if impact_parameter_cfg.use_log_significance:
+            cand_dz_err[charged_mask] = np.log(
+                np.maximum(
+                    np.abs(cand_dz[charged_mask])
+                    / np.maximum(cand_dz_err[charged_mask], eps),
+                    eps,
+                )
+            )
+            cand_dxy_err[charged_mask] = np.log(
+                np.maximum(
+                    np.abs(cand_dxy[charged_mask])
+                    / np.maximum(cand_dxy_err[charged_mask], eps),
+                    eps,
+                )
+            )
+
+        scale = float(impact_parameter_cfg.transform_scale)
+        if scale > 0.0:
+            cand_dz[charged_mask] = (
+                2.0 * np.arctan(scale * cand_dz[charged_mask]) / np.pi
+            )
+            cand_dxy[charged_mask] = (
+                2.0 * np.arctan(scale * cand_dxy[charged_mask]) / np.pi
+            )
 
         lengths = np.minimum(ak.to_numpy(ak.num(data.reco_cand_pdgs)), max_cands)
         mask_np = np.arange(max_cands)[None, :] < lengths[:, None]
@@ -163,9 +195,9 @@ class ParticleTransformerDETRDataset(ParticleTransformerDataset):
         jphi = jet_phi[:, None]
         jen = jet_en[:, None]
 
-        cand_deta = np.abs(cand_eta - jeta)
+        cand_deta = cand_eta - jeta
         dphi_raw = cand_phi - jphi
-        cand_dphi = np.abs(np.arctan2(np.sin(dphi_raw), np.cos(dphi_raw)))
+        cand_dphi = np.arctan2(np.sin(dphi_raw), np.cos(dphi_raw))
         cand_logpt = np.log(np.maximum(cand_pt, eps))
         cand_loge = np.log(np.maximum(cand_en, eps))
         cand_logptrel = np.log(np.maximum(cand_pt / np.maximum(jpt, eps), eps))
