@@ -36,7 +36,12 @@ from torch.utils.data import DataLoader
 from omegaconf import DictConfig
 from tqdm.auto import tqdm
 
-from mltau.tools.general import reinitialize_p4, one_hot_decoding
+from mltau.tools.general import (
+    reinitialize_p4,
+    one_hot_decoding,
+    DECAY_MODE_CLASS_SCHEMES,
+    STANDARD_DECAY_MODE_CLASSES,
+)
 from mltau.tools.io.general import BatchInputs
 from mltau.tools.io import general as ig
 from mltau.tools.io.ParT_dataloader import ParticleTransformerDataset
@@ -89,12 +94,11 @@ def decode_kinematic_predictions(predictions: dict, reco_jet_p4s: ak.Array) -> a
     return pred_p4
 
 
-def decode_decay_mode_predictions(predictions):
+def decode_decay_mode_predictions(predictions, decay_mode_classes=STANDARD_DECAY_MODE_CLASSES):
     # --- decode decay mode ---
-    dm_probs = to_np(predictions)  # (N, 6)
-    # dm_probs = softmax(to_np(predictions["decay_mode"]))  # (N, 6)
-    dm_idx = np.argmax(dm_probs, axis=-1)  # (N,) indices 0-5
-    dm_class = one_hot_decoding(dm_idx)  # (N,) e.g. {0,1,2,10,11,15}
+    dm_probs = to_np(predictions)  # (N, n_classes)
+    dm_idx = np.argmax(dm_probs, axis=-1)  # (N,) indices 0..n_classes-1
+    dm_class = one_hot_decoding(dm_idx, classes=decay_mode_classes)  # (N,) physical DM codes
     return dm_class, dm_probs
 
 
@@ -135,14 +139,18 @@ def postprocess_multi_predictions(
     )
 
 
-def postprocess_single_predictions(predictions, reco_jet_p4s, task):
+def postprocess_single_predictions(
+    predictions, reco_jet_p4s, task, decay_mode_classes=STANDARD_DECAY_MODE_CLASSES
+):
     if task == "kinematics":
         pred_p4 = decode_kinematic_predictions(
             predictions[task], reco_jet_p4s=reco_jet_p4s
         )
         ret = ak.Array({"tau_p4": pred_p4})
     elif task == "decay_mode":
-        dm_class, dm_probs = decode_decay_mode_predictions(predictions[task])
+        dm_class, dm_probs = decode_decay_mode_predictions(
+            predictions[task], decay_mode_classes=decay_mode_classes
+        )
         ret = ak.Array(
             {
                 "tau_decay_mode": dm_class,
@@ -173,8 +181,12 @@ def postprocess_predictions(
             predictions=predictions, reco_jet_p4s=reco_jet_p4s
         )
     elif model_name == "SingleParTau":
+        decay_mode_scheme = cfg.training.model.get("decay_mode_scheme", "standard")
         ret = postprocess_single_predictions(
-            predictions, reco_jet_p4s, cfg.training.model.task
+            predictions,
+            reco_jet_p4s,
+            cfg.training.model.task,
+            decay_mode_classes=DECAY_MODE_CLASS_SCHEMES[decay_mode_scheme],
         )
     else:
         raise NotImplementedError(f"No such model as {model_name}")
@@ -182,7 +194,11 @@ def postprocess_predictions(
 
 
 def create_predictions_files(
-    best_model, cfg: DictConfig, model_name: str, test_only: bool = True
+    best_model,
+    cfg: DictConfig,
+    model_name: str,
+    test_only: bool = True,
+    dataset_cls: type = ParticleTransformerDataset,
 ):
     split = "test" if test_only else "*"
     # Match the training-time sample routing:
@@ -201,15 +217,19 @@ def create_predictions_files(
     for input_path in paths_to_process:
         print(" -", input_path)
     for input_path in paths_to_process:
-        create_predictions_file(best_model, input_path, model_name, cfg)
+        create_predictions_file(best_model, input_path, model_name, cfg, dataset_cls)
 
 
 def create_predictions_file(
-    best_model, input_path: str, model_name: str, cfg: DictConfig
+    best_model,
+    input_path: str,
+    model_name: str,
+    cfg: DictConfig,
+    dataset_cls: type = ParticleTransformerDataset,
 ):
     # Read the parquet directly: the dataset builds the tensors per row group in
     # file order, so predictions line up with the input rows.
-    dataset = ParticleTransformerDataset(
+    dataset = dataset_cls(
         row_groups=ig.get_row_groups(input_paths=[input_path]),
         cfg=cfg,
         batch_size=cfg.training.dataloader.batch_size,
@@ -314,9 +334,18 @@ def create_predictions_file(
     is_tau_target = np.concatenate(all_is_tau).astype(bool)
 
     # Convert stored training targets back into physical truth labels for output.
+    decay_mode_scheme = (
+        cfg.training.model.get("decay_mode_scheme", "standard")
+        if model_name == "SingleParTau"
+        else "standard"
+    )
     decay_mode_indices = np.argmax(decay_mode_target, axis=-1)
     gen_jet_tau_decaymode = np.where(
-        is_tau_target, one_hot_decoding(decay_mode_indices), -1
+        is_tau_target,
+        one_hot_decoding(
+            decay_mode_indices, classes=DECAY_MODE_CLASS_SCHEMES[decay_mode_scheme]
+        ),
+        -1,
     )
     gen_jet_tau_charge = np.where(
         is_tau_target,

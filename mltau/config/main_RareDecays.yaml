@@ -1,0 +1,38 @@
+output_dir: /home/laurits/tmp/RareDecays_training
+# Loss configuration shared by MultiParTau and SingleParTau; see main.yaml /
+# TauLoss.from_config for what each key means.
+tau_loss:
+    l_m: 0.2
+    label_smoothing: 0.1
+    kinematics_scales: null
+    kinematics_weights:
+        log_pt: 1.0
+        delta_eta: 1.0
+        phi_chord: 1.0
+        log_mass: 0.2
+
+# SingleParTau decay-mode classification on the fine-grained
+# gen_jet_tau_decaymode_rare scheme (13 classes: see
+# mltau.tools.general.RARE_DECAY_MODE_CLASSES), read from the
+# 0923_ParTauDETR_dataset_rares production via dataset_RareDecays.yaml and
+# RareDecaysDataModule (training.datamodule below).
+training:
+    datamodule: RareDecays
+    # These runs have crashed mid-training before; resubmitting the same
+    # output_dir continues from last.ckpt.
+    resume: true
+    model:
+        name: SingleParTau
+        task: decay_mode
+        num_dm_classes: 13
+        decay_mode_scheme: rare
+
+# `_self_` last: this file's `training:` block above overrides the matching
+# leaf keys of training.yaml (model.name/task/num_dm_classes/decay_mode_scheme,
+# datamodule) while keeping everything else training.yaml sets (lr, trainer,
+# optimizer, dataloader, ...) unchanged.
+defaults:
+    - metrics/metrics
+    - dataset_RareDecays
+    - training
+    - _self_

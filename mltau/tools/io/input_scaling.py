@@ -23,7 +23,9 @@ import torch
 from omegaconf import DictConfig, OmegaConf
 
 
-# Metadata for recording the input features order in the .npz file
+# Metadata for recording the input features order in the .npz file. Indices
+# 14/16 are significances (d / sigma_d), not the raw errors: see
+# ParT_dataloader.impact_parameter_features.
 _CAND_FEATURE_NAMES = np.array(
     [
         "cand_deta",
@@ -40,9 +42,9 @@ _CAND_FEATURE_NAMES = np.array(
         "isChargedHadron",
         "isNeutralHadron",
         "cand_dz",
-        "cand_dz_error",
+        "cand_dz_significance",
         "cand_dxy",
-        "cand_dxy_error",
+        "cand_dxy_significance",
     ]
 )
 
@@ -231,6 +233,35 @@ def load_saved_scaler(cfg: DictConfig) -> dict:
     }
 
 
+def _identity_scaler(tensors):
+    return tensors
+
+
+class FeatureScaler:
+    """
+    Picklable `tensors -> tensors` callable wrapping `_apply_feature_scaler`.
+
+    `make_input_scaler` used to return a local closure, which works fine for
+    num_workers=0 or a "fork" multiprocessing_context (the dataset carrying it
+    is inherited via COW memory), but `ParT_dataloader.loader_kwargs` selects
+    "forkserver" once num_workers > 1: that context is a genuinely separate
+    process, so the Dataset -- and this scaler stored on it via
+    `set_input_scaler` -- has to be pickled to reach the worker. `pickle`
+    cannot serialize a function defined inside another function, so with a
+    closure here every worker failed to start, silently (surfacing only as
+    Lightning's fetcher never getting a working iterator). A plain,
+    module-level class with plain-array attributes pickles fine.
+    """
+
+    def __init__(self, mean, std, feature_indices):
+        self.mean = mean
+        self.std = std
+        self.feature_indices = feature_indices
+
+    def __call__(self, tensors):
+        return _apply_feature_scaler(tensors, self.mean, self.std, self.feature_indices)
+
+
 def make_input_scaler(cfg: DictConfig):
     """
     Return a `tensors -> tensors` callable, reading the scaler .npz once.
@@ -241,7 +272,7 @@ def make_input_scaler(cfg: DictConfig):
     to a whole split at once.
     """
     if not scaling_enabled(cfg):
-        return lambda tensors: tensors
+        return _identity_scaler
 
     path = scaler_path(cfg)
     if not os.path.exists(path):
@@ -254,7 +285,4 @@ def make_input_scaler(cfg: DictConfig):
     _warn_on_foreign_scaler(scaler, cfg, path)
     print(f"[input scaling] Loaded scaler from {path}", flush=True)
 
-    def scale(tensors):
-        return _apply_feature_scaler(tensors, mean, std, feature_indices)
-
-    return scale
+    return FeatureScaler(mean, std, feature_indices)

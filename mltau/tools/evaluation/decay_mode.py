@@ -13,23 +13,49 @@ hep.style.use(hep.styles.CMS)
 plt.rcParams["mathtext.fontset"] = "stix"
 
 
+# The (12, 12) figsize / 30pt-tick / 26pt-bin-text layout below was tuned for
+# the 6-class standard scheme. Categories are laid out one per
+# INCHES_PER_CATEGORY inch of figure side, so the 6-class case reproduces that
+# exact layout (12 / 6 = 2in/category) while a scheme with more classes (e.g.
+# the 13-class rare scheme) gets a proportionally larger figure instead of
+# cramming the same fixed-size labels into smaller cells.
+INCHES_PER_CATEGORY = 12.0 / 6.0
+# Margins as a fraction of the 6-class figure's 12in side, so the absolute
+# inch space reserved for axis labels/ticks stays constant as the figure
+# grows and the fractional margins around the (bigger) plot area shrink.
+BASE_MARGINS_IN = {
+    "left": 0.20 * 12.0,
+    "bottom": 0.22 * 12.0,
+    "right": (1 - 0.90) * 12.0,
+    "top": (1 - 0.95) * 12.0,
+}
+
+
 def visualize_confusion_matrix(
     histogram: np.array,
     categories: list,
+    y_categories: list = None,
     cmap: str = "GnBu",
     bin_text_color: str = "black",
     y_label: str = "Predicted decay modes",
     x_label: str = "True decay modes",
-    figsize: tuple = (12, 12),
+    figsize: tuple = None,
 ):
     """Plots the confusion matrix for the classification task. Confusion
     matrix functions has the categories in the other way in order to have the
     truth on the x-axis.
     Args:
         histogram : np.array
-            Histogram produced by the sklearn.metrics.confusion_matrix.
+            Histogram produced by the sklearn.metrics.confusion_matrix, shape
+            (len(categories), len(y_categories)).
         categories : list
-            Category labels in the correct order.
+            True-axis (x) category labels in the correct order.
+        y_categories : list
+            Predicted-axis (y) category labels, if different from
+            `categories` -- e.g. a true axis split into extra sub-categories
+            (K0_S/K0_L) that the model was never trained to predict, so the
+            predicted axis keeps the coarser label set. Defaults to
+            `categories` (the square case).
         cmap : str
             [default: "gray"] The colormap to be used.
         bin_text_color : str
@@ -39,20 +65,34 @@ def visualize_confusion_matrix(
         x_label : str
             [default: "Truth"] The label for the x-axis.
         figsize : tuple
-            The size of the figure drawn.
+            The size of the figure drawn. Defaults to a size scaled by the
+            number of categories on each axis (see INCHES_PER_CATEGORY) so
+            tick and bin text keep a constant absolute size instead of
+            shrinking to fit more classes.
     """
+    if y_categories is None:
+        y_categories = categories
+    nx = len(categories)
+    ny = len(y_categories)
+    if figsize is None:
+        figsize = (
+            max(12.0, nx * INCHES_PER_CATEGORY),
+            max(12.0, ny * INCHES_PER_CATEGORY),
+        )
     fig, ax = plt.subplots(figsize=figsize)
-    xbins = ybins = np.arange(len(categories) + 1)
-    tick_values = np.arange(len(categories)) + 0.5
+    xbins = np.arange(nx + 1)
+    ybins = np.arange(ny + 1)
+    x_tick_values = np.arange(nx) + 0.5
+    y_tick_values = np.arange(ny) + 0.5
     hep.hist2dplot(histogram, xbins, ybins, cmap=cmap, cbar=False, flow=None)
     ax.grid(False)
-    plt.xticks(tick_values, categories, fontsize=30, rotation=45, ha="right")
-    plt.yticks(tick_values + 0.2, categories, fontsize=30, rotation=45, va="top")
+    plt.xticks(x_tick_values, categories, fontsize=30, rotation=45, ha="right")
+    plt.yticks(y_tick_values + 0.2, y_categories, fontsize=30, rotation=45, va="top")
     plt.xlabel(f"{x_label}", fontdict={"size": 36})
     plt.ylabel(f"{y_label}", fontdict={"size": 36})
     ax.tick_params(axis="both", which="both", length=0)
-    for i in range(len(ybins) - 1):
-        for j in range(len(xbins) - 1):
+    for i in range(ny):
+        for j in range(nx):
             bin_value = histogram.T[i, j]
             ax.text(
                 float(xbins[j] + 0.5),
@@ -64,8 +104,54 @@ def visualize_confusion_matrix(
                 fontsize=26,
                 fontweight="bold",
             )
-    fig.subplots_adjust(left=0.20, bottom=0.22, right=0.90, top=0.95)
+    fig.subplots_adjust(
+        left=BASE_MARGINS_IN["left"] / figsize[0],
+        bottom=BASE_MARGINS_IN["bottom"] / figsize[1],
+        right=1 - BASE_MARGINS_IN["right"] / figsize[0],
+        top=1 - BASE_MARGINS_IN["top"] / figsize[1],
+    )
     return fig, ax
+
+
+# The 6-class reduction of gen_jet_tau_decaymode (see
+# mltau.tools.general.get_reduced_decaymodes): everything past 3 prongs, or off
+# the HPS grid, is lumped into "Rare".
+STANDARD_DECAY_MODE_NAME_MAPPING = {
+    0: r"$h^{\pm}$",
+    1: r"$h^{\pm}\pi^0$",
+    2: r"$h^\pm+\geq2\pi^0$",
+    10: r"$h^{\pm}h^{\mp}h^{\pm}$",
+    11: r"$h^\pm h^\mp h^\pm$" "\n" r"$+\geq\pi^0$",
+    15: "Rare",
+}
+
+# The 13-class gen_jet_tau_decaymode_rare scheme (see
+# mltau.tools.general.RARE_DECAY_MODE_CLASSES and
+# ntupelizer.tools.tau_decaymode.classify_rare_decay_mode): keeps the
+# kaon-bearing and other sub-modes that STANDARD_DECAY_MODE_NAME_MAPPING lumps
+# under "Rare" as their own classes. Order matches RARE_DECAY_MODE_CLASSES,
+# which is the one-hot index order the rare-decays dataloader encodes targets
+# in.
+RARE_DECAY_MODE_NAME_MAPPING = {
+    0: r"$\pi\pi^0$",
+    1: r"$\pi$",
+    2: r"$3\pi$",
+    3: r"$\pi 2\pi^0$",
+    4: r"$3\pi\pi^0$",
+    5: r"$\pi 3\pi^0$",
+    6: r"$\pi K^0$",
+    7: r"$K$",
+    8: r"$3\pi 2\pi^0$",
+    9: r"$K\pi^0$",
+    10: r"$\pi\pi^0 K^0$",
+    11: r"$2\pi K$",
+    15: "Other",
+}
+
+DECAY_MODE_NAME_MAPPINGS = {
+    "standard": STANDARD_DECAY_MODE_NAME_MAPPING,
+    "rare": RARE_DECAY_MODE_NAME_MAPPING,
+}
 
 
 class BaseDecayModeEvaluator:
@@ -83,6 +169,7 @@ class BaseDecayModeEvaluator:
         output_dir: str = "",
         sample: str = "all",
         algorithm: str = "all",
+        decay_mode_name_mapping: dict = None,
     ):
         self.output_dir = output_dir
         if output_dir != "":
@@ -91,14 +178,9 @@ class BaseDecayModeEvaluator:
         self.algorithm = algorithm
         self.pred_proba = np.asarray(pred_proba)
         self.predicted = np.asarray(predicted)
-        self._decay_mode_name_mapping = {
-            0: r"$h^{\pm}$",
-            1: r"$h^{\pm}\pi^0$",
-            2: r"$h^\pm+\geq2\pi^0$",
-            10: r"$h^{\pm}h^{\mp}h^{\pm}$",
-            11: r"$h^\pm h^\mp h^\pm$" "\n" r"$+\geq\pi^0$",
-            15: "Rare",
-        }
+        self._decay_mode_name_mapping = (
+            decay_mode_name_mapping or STANDARD_DECAY_MODE_NAME_MAPPING
+        )
         self.inverse_mapping = {
             i: key for i, key in enumerate(self._decay_mode_name_mapping.keys())
         }
@@ -119,17 +201,47 @@ class BaseDecayModeEvaluator:
                 self.truth = truth
         else:
             self.truth = np.argmax(truth, axis=-1)
-        self.confusion_matrix = metrics.confusion_matrix(self.truth, self.predicted)
-        self.normalized_confusion_matrix = metrics.confusion_matrix(
-            self.truth, self.predicted, normalize="true"
+        # Explicit labels: sklearn otherwise infers them from the union of
+        # truth/predicted in THIS batch, so a rare class absent from a small
+        # batch silently shrinks the matrix below len(categories) and breaks
+        # the plot's fixed-size axes.
+        class_labels = list(range(len(self._decay_mode_name_mapping)))
+        self.confusion_matrix = metrics.confusion_matrix(
+            self.truth, self.predicted, labels=class_labels
         )
+        # "true": each true-class row sums to 1 -- how that true decay mode is
+        # distributed over predictions (a recall/efficiency view). "pred": each
+        # predicted-class column sums to 1 -- what true decay modes a given
+        # prediction is made of (a precision/purity view). Both are useful and
+        # answer different questions, so both are kept rather than picking one.
+        self.normalized_confusion_matrix_true = metrics.confusion_matrix(
+            self.truth, self.predicted, labels=class_labels, normalize="true"
+        )
+        self.normalized_confusion_matrix_pred = metrics.confusion_matrix(
+            self.truth, self.predicted, labels=class_labels, normalize="pred"
+        )
+        # Back-compat alias for existing callers that only know about "the"
+        # normalized matrix: the true-normalized (per-truth) one, since that
+        # was the only one that existed before.
+        self.normalized_confusion_matrix = self.normalized_confusion_matrix_true
         self.categories = list(self._decay_mode_name_mapping.values())
         self.general_metrics, self.class_metrics = self._calculate_performance_metrics()
         self.class_performances = self.calculate_class_wise_metrics()
 
-    def plot_confusion_matrix(self, output_path: str = ""):
+    def plot_confusion_matrix(self, output_path: str = "", normalize: str = "true"):
+        """
+        Args:
+            normalize : "true" (default) plots the per-truth-row normalized
+                matrix (each true class sums to 1: a recall/efficiency view);
+                "pred" plots the per-prediction-column normalized matrix (each
+                predicted class sums to 1: a precision/purity view).
+        """
+        histogram = {
+            "true": self.normalized_confusion_matrix_true,
+            "pred": self.normalized_confusion_matrix_pred,
+        }[normalize]
         fig, ax = visualize_confusion_matrix(
-            histogram=self.normalized_confusion_matrix,
+            histogram=histogram,
             categories=self.categories,
         )
         if output_path != "":
@@ -218,16 +330,37 @@ class BaseDecayModeEvaluator:
         )
         with open(class_metrics_output_path, "wt") as out_file:
             json.dump(self.class_metrics, out_file, indent=4, cls=NpEncoder)
+        # Name unchanged from before the "pred" normalization existed, so
+        # existing consumers of this exact path keep working.
         confusion_matrix_output_path = os.path.join(
             self.output_dir, f"{self.sample}_{self.algorithm}_confusion_matrix.pdf"
         )
-        self.plot_confusion_matrix(output_path=confusion_matrix_output_path)
+        self.plot_confusion_matrix(output_path=confusion_matrix_output_path, normalize="true")
+        confusion_matrix_pred_output_path = os.path.join(
+            self.output_dir,
+            f"{self.sample}_{self.algorithm}_confusion_matrix_normPred.pdf",
+        )
+        self.plot_confusion_matrix(output_path=confusion_matrix_pred_output_path, normalize="pred")
 
     def calculate_class_wise_metrics(self):
+        # Explicit labels for the same reason as the confusion matrix above:
+        # without them, a class missing from this batch's truth/predicted
+        # shrinks the returned array below len(categories).
+        class_labels = list(range(len(self._decay_mode_name_mapping)))
         return {
-            "F1": f1_score(y_true=self.truth, y_pred=self.predicted, average=None),
+            "F1": f1_score(
+                y_true=self.truth,
+                y_pred=self.predicted,
+                labels=class_labels,
+                average=None,
+                zero_division=0,
+            ),
             "precision": precision_score(
-                y_true=self.truth, y_pred=self.predicted, average=None
+                y_true=self.truth,
+                y_pred=self.predicted,
+                labels=class_labels,
+                average=None,
+                zero_division=0,
             ),
         }
 
@@ -242,10 +375,19 @@ class DecayModeEvaluator(BaseDecayModeEvaluator):
         output_dir: str = "",
         sample: str = "all",
         algorithm: str = "all",
+        decay_mode_name_mapping: dict = None,
     ):
         pred_proba = np.asarray(pred_proba)
         predicted = np.argmax(pred_proba, axis=-1)
-        super().__init__(predicted, pred_proba, truth, output_dir, sample, algorithm)
+        super().__init__(
+            predicted,
+            pred_proba,
+            truth,
+            output_dir,
+            sample,
+            algorithm,
+            decay_mode_name_mapping,
+        )
 
 
 class HardLabelDecayModeEvaluator(BaseDecayModeEvaluator):
@@ -278,20 +420,34 @@ class HardLabelDecayModeEvaluator(BaseDecayModeEvaluator):
 
 
 class ConfusionMatrix:
-    def __init__(self, evaluator: DecayModeEvaluator):
+    def __init__(self, evaluator: DecayModeEvaluator, normalize: str = "true"):
+        """
+        Args:
+            normalize : "true" (per-truth-row, recall/efficiency view) or
+                "pred" (per-prediction-column, precision/purity view). See
+                BaseDecayModeEvaluator.plot_confusion_matrix.
+        """
         self.evaluator = evaluator
+        self.normalize = normalize
         self.fig, self.ax = self.plot()
 
     def plot(self):
+        histogram = {
+            "true": self.evaluator.normalized_confusion_matrix_true,
+            "pred": self.evaluator.normalized_confusion_matrix_pred,
+        }[self.normalize]
         fig, ax = visualize_confusion_matrix(
-            histogram=self.evaluator.normalized_confusion_matrix,
+            histogram=histogram,
             categories=self.evaluator.categories,
         )
         return fig, ax
 
     def save(self, output_dir):
+        # Suffix only for "pred", so the default "true" matrix keeps the
+        # filename it had before "pred" existed.
+        suffix = "" if self.normalize == "true" else f"_norm{self.normalize.capitalize()}"
         output_path = os.path.join(
-            output_dir, f"decay_mode_cm_{self.evaluator.algorithm}.pdf"
+            output_dir, f"decay_mode_cm_{self.evaluator.algorithm}{suffix}.pdf"
         )
         self.fig.tight_layout(pad=1.5)
         self.fig.savefig(output_path, format="pdf")
@@ -491,7 +647,8 @@ class DecayModeMultiEvaluator:
     def combine_results(self, evaluators: list):
         offsets = get_offsets(len(evaluators))
         for i, evaluator in enumerate(evaluators):
-            self.cms.append(ConfusionMatrix(evaluator=evaluator))
+            self.cms.append(ConfusionMatrix(evaluator=evaluator, normalize="true"))
+            self.cms.append(ConfusionMatrix(evaluator=evaluator, normalize="pred"))
             self.dmrps.append(DecayModeROCPlot(evaluator=evaluator))
             # self.dmcp.add_line(evaluator=evaluator, offset=offsets[i])
             self.dmcp.add_line(evaluator=evaluator, offset=offsets[i], annotation_offset=annotation_offsets[i % len(annotation_offsets)])

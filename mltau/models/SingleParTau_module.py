@@ -23,6 +23,12 @@ class ParTauModule(L.LightningModule):
         self.cfg = cfg
         self.task = task
         m_cfg = cfg.training.model
+        # Which class scheme decay_mode is trained on: "standard" (6-class
+        # reduction of gen_jet_tau_decaymode, the default) or "rare" (13-class
+        # gen_jet_tau_decaymode_rare, produced by RareDecaysDataModule). Only
+        # affects how the confusion matrix / ROC plot label their classes;
+        # num_dm_classes above must match what the dataloader one-hot encodes.
+        self.decay_mode_scheme = m_cfg.get("decay_mode_scheme", "standard")
         # Two backbones behind one switch (training.model.backbone), so a Mixer
         # and a ParT run differ in exactly that key and nothing else.
         if m_cfg.get("backbone", "ParT") == "Mixer":
@@ -293,7 +299,9 @@ class ParTauModule(L.LightningModule):
                 **kwargs,
             )
         elif self.task == "decay_mode":
-            decay_mode.log_all_decay_mode_metrics(**kwargs)
+            decay_mode.log_all_decay_mode_metrics(
+                decay_mode_scheme=self.decay_mode_scheme, **kwargs
+            )
         elif self.task == "kinematics":
             kinematics.log_all_kinematics_metrics(
                 reco_jet_p4s=reco_jet_p4s,

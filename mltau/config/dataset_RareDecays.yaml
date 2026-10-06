@@ -4,8 +4,7 @@ dataset:
     # ParT encoder is permutation invariant and does not care; the MLP-Mixer is
     # not and needs it (recommended 'true' for training.model.backbone: Mixer).
     sort_by_pt: false
-    # data_dir: /scratch/persistent/laurits/ml-tau/0509_dsinphi_to_sindphi/
-    data_dir: /scratch/persistent/laurits/ml-tau/0528_Large_stats/
+    data_dir: /scratch/persistent/laurits/ml-tau/0923_ParTauDETR_dataset_rares/
     # Impact-parameter inputs: dz and dxy plus their significances d / sigma_d
     # (ParT_dataloader.impact_parameter_features). Neutral and track-less
     # candidates get 0 in all four. significance_transform compresses the

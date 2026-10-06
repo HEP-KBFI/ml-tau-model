@@ -24,17 +24,39 @@ torch.set_float32_matmul_precision("high")
 from mltau.models import MultiParTau_module, SingleParTau_module
 from mltau.tools.evaluation import inference
 from mltau.tools.io import ParT_dataloader as dl
+from mltau.tools.io import RareDecays_dataloader as rare_dl
+
+# DataModule to use, selected by training.datamodule (default "ParT"). A
+# subclass swaps in a dataset with different targets while reusing all of
+# ParTDataModule's file discovery, splitting and batching; see
+# RareDecaysDataModule for the decay_mode.decay_mode_scheme: rare case.
+DATAMODULE_REGISTRY = {
+    "ParT": dl.ParTDataModule,
+    "RareDecays": rare_dl.RareDecaysDataModule,
+}
 
 
 @hydra.main(config_path="../config", config_name="main", version_base=None)
 def train(cfg: DictConfig):
-    datamodule = dl.ParTDataModule(cfg=cfg, debug_run=cfg.training.debug_run)
+    datamodule_name = cfg.training.get("datamodule", "ParT")
+    if datamodule_name not in DATAMODULE_REGISTRY:
+        raise ValueError(
+            f"Unknown training.datamodule '{datamodule_name}'. Choose one of "
+            f"{sorted(DATAMODULE_REGISTRY)}."
+        )
+    datamodule = DATAMODULE_REGISTRY[datamodule_name](
+        cfg=cfg, debug_run=cfg.training.debug_run
+    )
     model_name = cfg.training.model.name
+    num_dm_classes = cfg.training.model.get("num_dm_classes", 6)
     if model_name == "MultiParTau":
         model = MultiParTau_module.ParTauModule(cfg=cfg, input_dim=17, num_dm_classes=6)
     elif model_name == "SingleParTau":
         model = SingleParTau_module.ParTauModule(
-            cfg=cfg, input_dim=17, num_dm_classes=6, task=cfg.training.model.task
+            cfg=cfg,
+            input_dim=17,
+            num_dm_classes=num_dm_classes,
+            task=cfg.training.model.task,
         )
     else:
         raise ValueError(
@@ -76,6 +98,18 @@ def train(cfg: DictConfig):
             save_weights_only=True,
             filename="ParT-model_best",
         ),
+        # last.ckpt with optimizer and scheduler state (see ParTauDETR_module's
+        # equivalent in train_ParTauDETR.py), so a run killed by a dataloader
+        # worker crash, preemption or a wall clock can resume instead of losing
+        # everything. Kept apart from the best-model checkpoint above because a
+        # ModelCheckpoint has one save_weights_only flag for both its top-k and
+        # its last file.
+        ModelCheckpoint(
+            dirpath=models_dir,
+            save_top_k=0,
+            save_last=True,
+            save_weights_only=False,
+        ),
     ]
 
     trainer = L.Trainer(
@@ -95,7 +129,17 @@ def train(cfg: DictConfig):
         enable_progress_bar=True,
     )
 
-    trainer.fit(model=model, datamodule=datamodule)
+    # With training.resume, continue from this output_dir's last.ckpt if it has
+    # one -- e.g. a resubmission after a dataloader worker crash or a preempted
+    # job -- instead of restarting from epoch 0. Off by default, so a new run
+    # in a reused output_dir does not silently pick up an old run's state.
+    last_ckpt_path = os.path.join(models_dir, "last.ckpt")
+    ckpt_path = None
+    if cfg.training.get("resume", False) and os.path.exists(last_ckpt_path):
+        ckpt_path = last_ckpt_path
+    if ckpt_path is not None:
+        print(f"[INFO] Resuming from {ckpt_path}")
+    trainer.fit(model=model, datamodule=datamodule, ckpt_path=ckpt_path)
     # --- Inference on test set using best checkpoint ---
     best_ckpt_path = os.path.join(models_dir, "ParT-model_best.ckpt")
     if os.path.exists(best_ckpt_path):
@@ -110,7 +154,7 @@ def train(cfg: DictConfig):
                 best_ckpt_path,
                 cfg=cfg,
                 input_dim=17,
-                num_dm_classes=6,
+                num_dm_classes=num_dm_classes,
                 task=cfg.training.model.task,
                 weights_only=False,
             )
@@ -118,7 +162,10 @@ def train(cfg: DictConfig):
             raise ValueError(f"Unknown model '{model_name}' for prediction.")
 
         inference.create_predictions_files(
-            best_model=best_model, model_name=model_name, cfg=cfg
+            best_model=best_model,
+            model_name=model_name,
+            cfg=cfg,
+            dataset_cls=DATAMODULE_REGISTRY[datamodule_name].dataset_cls,
         )
 
     else:
