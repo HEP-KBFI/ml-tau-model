@@ -131,9 +131,9 @@ _CANDIDATE_FIELDS = (
     "reco_cand_p4s",
     "reco_cand_charges",
     "reco_cand_pdgs",
-    "reco_cand_dz",
+    "reco_cand_signed_dz",
     "reco_cand_dz_error",
-    "reco_cand_dxy",
+    "reco_cand_signed_dxy",
     "reco_cand_dxy_error",
 )
 
@@ -234,9 +234,9 @@ class ParticleTransformerDataset(IterableDataset):
         "reco_cand_p4s",
         "reco_cand_charges",
         "reco_cand_pdgs",
-        "reco_cand_dz",
+        "reco_cand_signed_dz",
         "reco_cand_dz_error",
-        "reco_cand_dxy",
+        "reco_cand_signed_dxy",
         "reco_cand_dxy_error",
         "reco_jet_p4",
         "gen_jet_tau_p4",
@@ -535,9 +535,9 @@ class ParticleTransformerDataset(IterableDataset):
         cand_en = pad_cand(p4_field(data.reco_cand_p4s, "energy"))  # energy
         cand_charge = pad_cand(data.reco_cand_charges)
         cand_pdg_abs = pad_cand(abs(data.reco_cand_pdgs))
-        cand_dz = pad_cand(data.reco_cand_dz)
+        cand_dz = pad_cand(data.reco_cand_signed_dz)
         cand_dz_err = pad_cand(data.reco_cand_dz_error)
-        cand_dxy = pad_cand(data.reco_cand_dxy)
+        cand_dxy = pad_cand(data.reco_cand_signed_dxy)
         cand_dxy_err = pad_cand(data.reco_cand_dxy_error)
         ip_cfg = self.cfg.dataset.get("impact_parameter_features", None) or {}
         cand_dz, cand_dz_sig, cand_dxy, cand_dxy_sig = impact_parameter_features(
