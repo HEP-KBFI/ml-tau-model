@@ -14,7 +14,7 @@ from mltau.tools.io.general import BatchInputs
 from mltau.tools.logging import set_to_set as s2s
 from mltau.tools.losses import TauLoss
 from mltau.tools.meson_classes import MesonClass, get_meson_classes
-from mltau.tools.partau_detr import decode_kinematics
+from mltau.models.ParTauDETR import decode_kinematics
 
 try:  # scipy's LAPJVsp solver is ~10x faster than the pure-python fallback below
     from scipy.optimize import linear_sum_assignment as _scipy_lsa
@@ -415,6 +415,8 @@ class SetCriterion(nn.Module):
         loss_soft_parent_kinematics_weight: float = 0.0,
         loss_soft_parent_charge_weight: float = 0.0,
         loss_soft_parent_decay_mode_weight: float = 0.0,
+        loss_aux_weight: float = 0.0,
+        mass_from_meson_class: bool = False,
         parent_objectness_temperature: float = 0.1,
         no_object_class_index: int = 1,
         object_class_index: int = 0,
@@ -437,6 +439,7 @@ class SetCriterion(nn.Module):
         self.loss_soft_parent_kinematics_weight = loss_soft_parent_kinematics_weight
         self.loss_soft_parent_charge_weight = loss_soft_parent_charge_weight
         self.loss_soft_parent_decay_mode_weight = loss_soft_parent_decay_mode_weight
+        self.loss_aux_weight = loss_aux_weight
         if not 0.0 < parent_objectness_temperature < 1.0:
             raise ValueError("parent_objectness_temperature must be between 0 and 1.")
         self.parent_objectness_temperature = parent_objectness_temperature
@@ -454,6 +457,25 @@ class SetCriterion(nn.Module):
                 valid[charge + 1, meson_class_index] = 1.0
         self.charge_meson_class_valid: torch.Tensor
         self.register_buffer("charge_meson_class_valid", valid)
+
+        # Physical mass per meson class, for decoding daughter p4 from the
+        # predicted class instead of the regressed log-mass channel
+        # (mass_from_meson_class). A charged class is overwhelmingly pi+-
+        # (139.57 MeV), a neutral one pi0 (134.98 MeV); the handful of
+        # kaons/etas this misassigns shift a daughter's energy by well under
+        # a per mille at these momenta.
+        self.mass_from_meson_class = bool(mass_from_meson_class)
+        self.register_buffer(
+            "meson_class_mass",
+            torch.tensor(
+                [
+                    0.13498 if set(c.charges) == {0} else 0.13957
+                    for c in meson_classes
+                ],
+                dtype=torch.float32,
+            ),
+            persistent=False,
+        )
 
     @staticmethod
     def _weighted_mean(
@@ -556,6 +578,7 @@ class SetCriterion(nn.Module):
         pred_kinematics: torch.Tensor,
         kinematics_reference_p4: dict[str, torch.Tensor],
         batch_indices: torch.Tensor | None = None,
+        fixed_mass: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """
         Convert predicted daughter kinematics into physical four-momenta.
@@ -579,6 +602,7 @@ class SetCriterion(nn.Module):
             references["phi"],
             references["energy"],
             clamp_log_ratios=True,
+            fixed_mass=fixed_mass,
         )
 
     @torch.no_grad()
@@ -681,6 +705,128 @@ class SetCriterion(nn.Module):
         )
         return self._weighted_mean(charge_loss, parent_weights)
 
+    def _set_prediction_losses(
+        self,
+        pred_logits: torch.Tensor,
+        pred_kinematics: torch.Tensor,
+        pred_charge_logits: torch.Tensor,
+        pred_meson_class_logits: torch.Tensor,
+        target_kinematics: torch.Tensor,
+        target_charge_cls: torch.Tensor,
+        target_meson_class: torch.Tensor,
+        match_mask: torch.Tensor,
+        signal_mask: torch.Tensor,
+    ):
+        """
+        Hungarian matching plus the per-query set losses (objectness and the
+        matched kinematics/charge/meson-class terms) for ONE head output.
+
+        Shared by the final decoder layer and, with loss_aux_weight > 0, every
+        intermediate decoder layer (deep supervision). Each call re-matches, as
+        in DETR: an intermediate layer is supervised towards the assignment its
+        own predictions support, not the final layer's.
+        """
+        batch_size, num_queries, _ = pred_logits.shape
+        device = pred_logits.device
+
+        pair_b, pair_q, pair_t = self.matcher(
+            pred_logits=pred_logits,
+            pred_kinematics=pred_kinematics,
+            pred_charge_logits=pred_charge_logits,
+            pred_meson_class_logits=pred_meson_class_logits,
+            target_kinematics=target_kinematics,
+            target_charge_cls=target_charge_cls,
+            target_meson_class=target_meson_class,
+            target_mask=match_mask,
+        )
+        num_matched = pair_b.numel()
+
+        tgt_classes = torch.full(
+            (batch_size, num_queries),
+            self.no_object_class_index,
+            dtype=torch.long,
+            device=device,
+        )
+        tgt_classes[pair_b, pair_q] = self.object_class_index
+
+        # objectness over all queries
+        class_weight = pred_logits.new_tensor([1.0, self.eos_coef])
+        ce_per_query = F.cross_entropy(
+            pred_logits.transpose(1, 2),
+            tgt_classes,
+            weight=class_weight,
+            reduction="none",
+        )
+        # Signal jets only, unweighted (class docstring).
+        sig_w = signal_mask.to(dtype=ce_per_query.dtype)
+        loss_objectness = (ce_per_query * sig_w[:, None]).sum() / (
+            sig_w.sum() * num_queries + 1e-8
+        )
+
+        if num_matched > 0:
+            # Unweighted on purpose (class docstring): cls_weight is the
+            # tagger's decorrelation weight, not a reconstruction weight.
+            pair_w = pred_logits.new_ones(num_matched)
+
+            kin_pred_cat = pred_kinematics[pair_b, pair_q]
+            kin_tgt_cat = target_kinematics[pair_b, pair_t]
+
+            tgt_charge_sel = target_charge_cls[pair_b, pair_t]
+            valid_charge = tgt_charge_sel != self.ignore_index
+            # cross_entropy zeroes the ignored entries, so folding the validity
+            # flag into the weights reproduces the mean over valid pairs only.
+            ce_charge = F.cross_entropy(
+                pred_charge_logits[pair_b, pair_q],
+                tgt_charge_sel,
+                reduction="none",
+                ignore_index=self.ignore_index,
+            )
+            charge_w = pair_w * valid_charge.to(pair_w.dtype)
+
+            target_meson_class_sel = target_meson_class[pair_b, pair_t]
+            valid_meson_class = target_meson_class_sel != self.ignore_index
+            ce_meson_class = F.cross_entropy(
+                pred_meson_class_logits[pair_b, pair_q],
+                target_meson_class_sel,
+                reduction="none",
+                ignore_index=self.ignore_index,
+            )
+            meson_class_w = pair_w * valid_meson_class.to(pair_w.dtype)
+
+            loss_kinematics, kin_components = self.tau_loss.compute_kinematics_loss(
+                kin_pred_cat,
+                kin_tgt_cat,
+                pair_w,
+            )
+            loss_charge = self._weighted_mean(ce_charge, charge_w)
+            loss_meson_class = self._weighted_mean(ce_meson_class, meson_class_w)
+            num_charge_supervised = valid_charge.sum()
+            num_meson_class_supervised = valid_meson_class.sum()
+        else:
+            loss_kinematics = pred_logits.new_zeros(())
+            kin_components = {
+                "log_pt": pred_logits.new_zeros(()),
+                "delta_eta": pred_logits.new_zeros(()),
+                "phi_chord": pred_logits.new_zeros(()),
+                "log_mass": pred_logits.new_zeros(()),
+            }
+            loss_charge = pred_logits.new_zeros(())
+            loss_meson_class = pred_logits.new_zeros(())
+            num_charge_supervised = pred_logits.new_zeros(())
+            num_meson_class_supervised = pred_logits.new_zeros(())
+
+        losses = {
+            "loss_objectness": loss_objectness,
+            "loss_kinematics": loss_kinematics,
+            "kin_components": kin_components,
+            "loss_charge": loss_charge,
+            "loss_meson_class": loss_meson_class,
+            "num_matched": num_matched,
+            "num_charge_supervised": num_charge_supervised,
+            "num_meson_class_supervised": num_meson_class_supervised,
+        }
+        return losses, (pair_b, pair_q, pair_t)
+
     def forward(
         self,
         outputs: dict,
@@ -718,7 +864,7 @@ class SetCriterion(nn.Module):
         # actual mix is set by dataset.max_jets_per_sample and, for the tauID
         # loss, by cls_weight; do not assume a ratio here.)
         match_mask = target_mask & signal_mask.unsqueeze(1)
-        pair_b, pair_q, pair_t = self.matcher(
+        set_losses, (pair_b, pair_q, pair_t) = self._set_prediction_losses(
             pred_logits=pred_logits,
             pred_kinematics=pred_kinematics,
             pred_charge_logits=pred_charge_logits,
@@ -726,61 +872,20 @@ class SetCriterion(nn.Module):
             target_kinematics=target_kinematics,
             target_charge_cls=target_charge_cls,
             target_meson_class=target_meson_class,
-            target_mask=match_mask,
+            match_mask=match_mask,
+            signal_mask=signal_mask,
         )
-        num_matched = pair_b.numel()
-
-        tgt_classes = torch.full(
-            (batch_size, num_queries),
-            self.no_object_class_index,
-            dtype=torch.long,
-            device=device,
-        )
-        tgt_classes[pair_b, pair_q] = self.object_class_index
-
-        if num_matched > 0:
-            # Unweighted on purpose (class docstring): cls_weight is the
-            # tagger's decorrelation weight, not a reconstruction weight.
-            pair_w = pred_logits.new_ones(num_matched)
-
-            kin_pred_cat = pred_kinematics[pair_b, pair_q]
-            kin_tgt_cat = target_kinematics[pair_b, pair_t]
-
-            tgt_charge_sel = target_charge_cls[pair_b, pair_t]
-            valid_charge = tgt_charge_sel != self.ignore_index
-            # cross_entropy zeroes the ignored entries, so folding the validity
-            # flag into the weights reproduces the mean over valid pairs only.
-            ce_charge = F.cross_entropy(
-                pred_charge_logits[pair_b, pair_q],
-                tgt_charge_sel,
-                reduction="none",
-                ignore_index=self.ignore_index,
-            )
-            charge_w = pair_w * valid_charge.to(pair_w.dtype)
-
-            target_meson_class_sel = target_meson_class[pair_b, pair_t]
-            valid_meson_class = target_meson_class_sel != self.ignore_index
-            ce_meson_class = F.cross_entropy(
-                pred_meson_class_logits[pair_b, pair_q],
-                target_meson_class_sel,
-                reduction="none",
-                ignore_index=self.ignore_index,
-            )
-            meson_class_w = pair_w * valid_meson_class.to(pair_w.dtype)
-
-        # objectness over all queries
-        class_weight = pred_logits.new_tensor([1.0, self.eos_coef])
-        ce_per_query = F.cross_entropy(
-            pred_logits.transpose(1, 2),
-            tgt_classes,
-            weight=class_weight,
-            reduction="none",
-        )
-        # Signal jets only, unweighted (class docstring).
-        sig_w = signal_mask.to(dtype=ce_per_query.dtype)
-        loss_objectness = (ce_per_query * sig_w[:, None]).sum() / (
-            sig_w.sum() * num_queries + 1e-8
-        )
+        num_matched = set_losses["num_matched"]
+        loss_objectness = set_losses["loss_objectness"]
+        loss_kinematics = set_losses["loss_kinematics"]
+        kin_components = set_losses["kin_components"]
+        loss_charge = set_losses["loss_charge"]
+        loss_meson_class = set_losses["loss_meson_class"]
+        num_charge_supervised = set_losses["num_charge_supervised"]
+        num_meson_class_supervised = set_losses["num_meson_class_supervised"]
+        # The matcher stores the cost shares of its LAST call; keep the final
+        # layer's before any aux-layer re-matching overwrites them.
+        final_cost_terms = dict(self.matcher.last_cost_terms)
 
         # jet-level tau-tagging loss: the ONLY term that sees cls_weight, and the
         # only one background jets contribute to.
@@ -795,32 +900,6 @@ class SetCriterion(nn.Module):
         else:
             loss_tau_id = pred_logits.new_zeros(())
 
-        # matched losses
-        if num_matched > 0:
-            loss_kinematics, kin_components = self.tau_loss.compute_kinematics_loss(
-                kin_pred_cat,
-                kin_tgt_cat,
-                pair_w,
-            )
-            loss_charge = self._weighted_mean(ce_charge, charge_w)
-            loss_meson_class = self._weighted_mean(
-                ce_meson_class, meson_class_w
-            )
-            num_charge_supervised = valid_charge.sum()
-            num_meson_class_supervised = valid_meson_class.sum()
-        else:
-            loss_kinematics = pred_logits.new_zeros(())
-            kin_components = {
-                "log_pt": pred_logits.new_zeros(()),
-                "delta_eta": pred_logits.new_zeros(()),
-                "phi_chord": pred_logits.new_zeros(()),
-                "log_mass": pred_logits.new_zeros(()),
-            }
-            loss_charge = pred_logits.new_zeros(())
-            loss_meson_class = pred_logits.new_zeros(())
-            num_charge_supervised = pred_logits.new_zeros(())
-            num_meson_class_supervised = pred_logits.new_zeros(())
-
         total_loss = (
             self.loss_objectness_weight * loss_objectness
             + self.loss_tau_id_weight * loss_tau_id
@@ -828,6 +907,32 @@ class SetCriterion(nn.Module):
             + self.loss_charge_weight * loss_charge
             + self.loss_meson_class_weight * loss_meson_class
         )
+
+        # Deep supervision: the same set losses on every intermediate decoder
+        # layer's predictions (model emits aux_outputs only in training mode and
+        # only when model.detr.aux_loss is true).
+        loss_aux = pred_logits.new_zeros(())
+        aux_outputs = outputs.get("aux_outputs") or []
+        if self.loss_aux_weight > 0 and aux_outputs:
+            for aux in aux_outputs:
+                aux_losses, _ = self._set_prediction_losses(
+                    pred_logits=aux["pred_logits"],
+                    pred_kinematics=aux["pred_kinematics"],
+                    pred_charge_logits=aux["pred_charge_logits"],
+                    pred_meson_class_logits=aux["pred_meson_class_logits"],
+                    target_kinematics=target_kinematics,
+                    target_charge_cls=target_charge_cls,
+                    target_meson_class=target_meson_class,
+                    match_mask=match_mask,
+                    signal_mask=signal_mask,
+                )
+                loss_aux = loss_aux + (
+                    self.loss_objectness_weight * aux_losses["loss_objectness"]
+                    + self.loss_kinematics_weight * aux_losses["loss_kinematics"]
+                    + self.loss_charge_weight * aux_losses["loss_charge"]
+                    + self.loss_meson_class_weight * aux_losses["loss_meson_class"]
+                )
+            total_loss = total_loss + self.loss_aux_weight * loss_aux
 
         # ---- Auxiliary penalties ----
         loss_consistency = pred_logits.new_zeros(())
@@ -894,6 +999,12 @@ class SetCriterion(nn.Module):
 
         # Matched constraints use only queries assigned to true daughters by
         # the Hungarian matcher. Other queries do not contribute to the parent.
+        class_mass = (
+            self.meson_class_mass[pred_meson_class_logits.argmax(-1)]
+            if self.mass_from_meson_class
+            else None
+        )
+
         with torch.set_grad_enabled(
             torch.is_grad_enabled() and self.loss_parent_kinematics_weight > 0
         ):
@@ -901,6 +1012,7 @@ class SetCriterion(nn.Module):
                 pred_kinematics[pair_b, pair_q],
                 kinematics_reference_p4,
                 pair_b,
+                fixed_mass=None if class_mass is None else class_mass[pair_b, pair_q],
             )
             pred_parent_p4 = pred_p4.new_zeros((batch_size, 4)).index_add(0, pair_b, pred_p4)
             loss_parent_kinematics = self._compute_parent_kinematics_loss(
@@ -1012,7 +1124,12 @@ class SetCriterion(nn.Module):
             >= objectness_threshold
         )
         with torch.no_grad():
-            matched_query_mask = tgt_classes == self.object_class_index
+            # Queries the final layer's Hungarian matching assigned to a true
+            # daughter (the same set _set_prediction_losses labels as objects).
+            matched_query_mask = torch.zeros(
+                pred_logits.shape[:2], dtype=torch.bool, device=pred_logits.device
+            )
+            matched_query_mask[pair_b, pair_q] = True
             matching_diagnostics = self._matching_diagnostics(
                 pred_kinematics, matched_query_mask, hard_query_mask,
                 soft_query_weights, target_mask, signal_mask,
@@ -1030,6 +1147,7 @@ class SetCriterion(nn.Module):
             pred_p4 = self._decode_predicted_p4(
                 pred_kinematics,
                 kinematics_reference_p4,
+                fixed_mass=class_mass,
             )
             pred_parent_p4 = (pred_p4 * soft_query_weights.unsqueeze(-1)).sum(dim=1)
             loss_soft_parent_kinematics = self._compute_parent_kinematics_loss(
@@ -1148,13 +1266,14 @@ class SetCriterion(nn.Module):
             "soft_parent_kinematics_count_match_fraction": count_match_fraction,
             "loss_soft_parent_charge": loss_soft_parent_charge,
             "loss_soft_parent_decay_mode": loss_soft_parent_decay_mode,
+            "loss_aux": loss_aux,
             "num_matched": pred_logits.new_tensor(float(num_matched)),
             "num_charge_supervised": num_charge_supervised.to(pred_logits.dtype),
             "num_meson_class_supervised": num_meson_class_supervised.to(
                 pred_logits.dtype
             ),
             **matching_diagnostics,
-            **{k: pred_logits.new_tensor(v) for k, v in self.matcher.last_cost_terms.items()},
+            **{k: pred_logits.new_tensor(v) for k, v in final_cost_terms.items()},
         }
 
 
@@ -1264,6 +1383,7 @@ class ParTauDETRModule(L.LightningModule):
             append_global_token=bool(detr_cfg.append_global_token),
             tau_id_head=bool(detr_cfg.tau_id_head),
             head_dropout=float(detr_cfg.head_dropout),
+            aux_loss=bool(detr_cfg.get("aux_loss", False)),
             for_inference=False,
             use_amp=False,
         )
@@ -1305,6 +1425,8 @@ class ParTauDETRModule(L.LightningModule):
             loss_soft_parent_kinematics_weight=float(detr_cfg.loss.weight_soft_parent_kinematics),
             loss_soft_parent_charge_weight=float(detr_cfg.loss.weight_soft_parent_charge),
             loss_soft_parent_decay_mode_weight=float(detr_cfg.loss.weight_soft_parent_decay_mode),
+            loss_aux_weight=float(detr_cfg.loss.weight_aux),
+            mass_from_meson_class=bool(detr_cfg.loss.get("mass_from_meson_class", False)),
             parent_objectness_temperature=float(detr_cfg.loss.parent_objectness_temperature),
             no_object_class_index=1,
             object_class_index=0,
@@ -1679,6 +1801,12 @@ class ParTauDETRModule(L.LightningModule):
         self.log(
             "train_losses/soft_parent_decay_mode",
             losses["loss_soft_parent_decay_mode"],
+            on_step=False,
+            on_epoch=True,
+        )
+        self.log(
+            "train_losses/aux",
+            losses["loss_aux"],
             on_step=False,
             on_epoch=True,
         )
