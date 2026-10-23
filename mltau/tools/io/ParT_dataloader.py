@@ -350,6 +350,12 @@ class ParticleTransformerDataset(IterableDataset):
         process_seed = int(torch.initial_seed() % (2**31 - 1))
         return np.random.default_rng([cfg_seed, process_seed, self._epochs_started])
 
+    @classmethod
+    def cand_feature_names(cls, cfg) -> list[str]:
+        """Names (and so definitions) of the cand_features channels; see
+        input_scaling.cand_feature_names, which this defaults to."""
+        return scaling.cand_feature_names(cfg)
+
     def set_input_scaler(self, scaler) -> None:
         """Attach a `tensors -> tensors` callable, or None to disable scaling."""
         self.input_scaler = scaler
@@ -373,7 +379,9 @@ class ParticleTransformerDataset(IterableDataset):
         dataset = cls(row_groups=[], cfg=cfg, batch_size=1)
         # Inference must standardise exactly as training did; reading the scaler
         # here means a caller cannot forget to.
-        dataset.set_input_scaler(scaling.make_input_scaler(cfg))
+        dataset.set_input_scaler(
+            scaling.make_checked_input_scaler(cfg, cls.cand_feature_names(cfg))
+        )
         return dataset
 
 
@@ -1187,9 +1195,14 @@ class ParTDataModule(LightningDataModule):
                 flush=True,
             )
             scaling.fit_scaler(
-                iter(self.make_fit_dataset(row_groups)), self.cfg, max_jets=fit_jets
+                iter(self.make_fit_dataset(row_groups)),
+                self.cfg,
+                max_jets=fit_jets,
+                feature_names=self.dataset_cls.cand_feature_names(self.cfg),
             )
-        return scaling.make_input_scaler(self.cfg)
+        return scaling.make_checked_input_scaler(
+            self.cfg, self.dataset_cls.cand_feature_names(self.cfg)
+        )
 
 
     def setup(self, stage: str) -> None:

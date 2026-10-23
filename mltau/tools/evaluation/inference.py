@@ -45,7 +45,7 @@ from mltau.tools.general import (
 from mltau.tools.io.general import BatchInputs
 from mltau.tools.io import general as ig
 from mltau.tools.io.ParT_dataloader import ParticleTransformerDataset
-from mltau.tools.io.input_scaling import make_input_scaler
+from mltau.tools.io.input_scaling import make_checked_input_scaler
 
 # def softmax(x):
 #     # x shape: (N, 6)
@@ -237,7 +237,7 @@ def create_predictions_file(
     dataloader = DataLoader(dataset, batch_size=None)
     # Read once, apply per batch: the scaler is a per-feature affine map, so this
     # matches what scaling a whole split at once used to do.
-    scale_inputs = make_input_scaler(cfg)
+    scale_inputs = make_checked_input_scaler(cfg, dataset_cls.cand_feature_names(cfg))
 
     # --- Postprocess and save as {sample}_test.parquet ---
 
