@@ -71,13 +71,69 @@ def p4_field(record_array, quantity: str):
         ) from exc
 
 
+SIGNIFICANCE_TRANSFORMS = ("none", "log", "tanh")
+
+
+def impact_parameter_features(
+    dz, dz_err, dxy, dxy_err, charge=None, transform="none", tanh_scale=5.0
+):
+    """
+    Impact-parameter inputs (dz, dz significance, dxy, dxy significance).
+
+    The significance d / sigma_d is used instead of the raw error: it says how
+    displaced a track is relative to how well it is measured, which is what
+    separates tau daughters from prompt tracks, and it is far less detector
+    specific than sigma_d alone.
+
+    Neutral candidates (charge 0), candidates without a track (ml-tau-data
+    writes lifetime.INVALID_VALUE = -1000 for them) and padded slots get 0 in
+    all four. Fed through unmasked, -1000 dominated the input normalisation,
+    and as a significance it becomes -1000 / eps ~ -1e9. They stay
+    identifiable through charge and the PID flags.
+
+    `transform` compresses the long tail of the significance, keeping its
+    sign and 0 for neutrals:
+        "none": d / sigma_d (default)
+        "log":  sign(s) * log(1 + |s|)
+        "tanh": tanh(s / tanh_scale)
+    """
+    if transform not in SIGNIFICANCE_TRANSFORMS:
+        raise ValueError(
+            f"Unknown impact-parameter significance transform '{transform}'. "
+            f"Choose one of {SIGNIFICANCE_TRANSFORMS}."
+        )
+    dz, dz_err, dxy, dxy_err = (
+        np.asarray(a, dtype=np.float32) for a in (dz, dz_err, dxy, dxy_err)
+    )
+    # INVALID_VALUE is -1000; any real impact parameter is far above -999.
+    valid = (dz_err > 0) & (dxy_err > 0) & (dz > -999.0) & (dxy > -999.0)
+    if charge is not None:
+        valid &= np.asarray(charge) != 0
+    dz_sig = np.divide(dz, dz_err, out=np.zeros_like(dz), where=valid)
+    dxy_sig = np.divide(dxy, dxy_err, out=np.zeros_like(dxy), where=valid)
+    if transform == "log":
+        dz_sig = np.sign(dz_sig) * np.log1p(np.abs(dz_sig))
+        dxy_sig = np.sign(dxy_sig) * np.log1p(np.abs(dxy_sig))
+    elif transform == "tanh":
+        if not tanh_scale > 0:
+            raise ValueError("tanh_scale must be positive.")
+        dz_sig = np.tanh(dz_sig / tanh_scale)
+        dxy_sig = np.tanh(dxy_sig / tanh_scale)
+    return (
+        np.where(valid, dz, 0.0).astype(np.float32),
+        dz_sig.astype(np.float32),
+        np.where(valid, dxy, 0.0).astype(np.float32),
+        dxy_sig.astype(np.float32),
+    )
+
+
 _CANDIDATE_FIELDS = (
     "reco_cand_p4s",
     "reco_cand_charges",
     "reco_cand_pdgs",
-    "reco_cand_dz",
+    "reco_cand_signed_dz",
     "reco_cand_dz_error",
-    "reco_cand_dxy",
+    "reco_cand_signed_dxy",
     "reco_cand_dxy_error",
 )
 
@@ -178,9 +234,9 @@ class ParticleTransformerDataset(IterableDataset):
         "reco_cand_p4s",
         "reco_cand_charges",
         "reco_cand_pdgs",
-        "reco_cand_dz",
+        "reco_cand_signed_dz",
         "reco_cand_dz_error",
-        "reco_cand_dxy",
+        "reco_cand_signed_dxy",
         "reco_cand_dxy_error",
         "reco_jet_p4",
         "gen_jet_tau_p4",
@@ -294,6 +350,17 @@ class ParticleTransformerDataset(IterableDataset):
         process_seed = int(torch.initial_seed() % (2**31 - 1))
         return np.random.default_rng([cfg_seed, process_seed, self._epochs_started])
 
+    @classmethod
+    def cand_feature_names(cls, cfg) -> list[str]:
+        """Names (and so definitions) of the cand_features channels; see
+        input_scaling.cand_feature_names. deta/dphi are signed (named as in
+        ParTauDETR_dataloader), so a scaler fitted on |deta|/|dphi| is
+        refused instead of silently mis-standardising them."""
+        names = scaling.cand_feature_names(cfg)
+        names[0] = "cand_deta_signed"
+        names[1] = "cand_dphi_signed"
+        return names
+
     def set_input_scaler(self, scaler) -> None:
         """Attach a `tensors -> tensors` callable, or None to disable scaling."""
         self.input_scaler = scaler
@@ -317,7 +384,9 @@ class ParticleTransformerDataset(IterableDataset):
         dataset = cls(row_groups=[], cfg=cfg, batch_size=1)
         # Inference must standardise exactly as training did; reading the scaler
         # here means a caller cannot forget to.
-        dataset.set_input_scaler(scaling.make_input_scaler(cfg))
+        dataset.set_input_scaler(
+            scaling.make_checked_input_scaler(cfg, cls.cand_feature_names(cfg))
+        )
         return dataset
 
 
@@ -479,10 +548,20 @@ class ParticleTransformerDataset(IterableDataset):
         cand_en = pad_cand(p4_field(data.reco_cand_p4s, "energy"))  # energy
         cand_charge = pad_cand(data.reco_cand_charges)
         cand_pdg_abs = pad_cand(abs(data.reco_cand_pdgs))
-        cand_dz = pad_cand(data.reco_cand_dz)
+        cand_dz = pad_cand(data.reco_cand_signed_dz)
         cand_dz_err = pad_cand(data.reco_cand_dz_error)
-        cand_dxy = pad_cand(data.reco_cand_dxy)
+        cand_dxy = pad_cand(data.reco_cand_signed_dxy)
         cand_dxy_err = pad_cand(data.reco_cand_dxy_error)
+        ip_cfg = self.cfg.dataset.get("impact_parameter_features", None) or {}
+        cand_dz, cand_dz_sig, cand_dxy, cand_dxy_sig = impact_parameter_features(
+            cand_dz,
+            cand_dz_err,
+            cand_dxy,
+            cand_dxy_err,
+            charge=cand_charge,
+            transform=ip_cfg.get("significance_transform", "none"),
+            tanh_scale=float(ip_cfg.get("tanh_scale", 5.0)),
+        )
 
         # Mask: True = real particle, False = padding  [N, max_cands]
         lengths = np.minimum(ak.to_numpy(ak.num(data.reco_cand_pdgs)), max_cands)
@@ -514,9 +593,12 @@ class ParticleTransformerDataset(IterableDataset):
         jphi = jet_phi[:, None]
         jen = jet_en[:, None]
 
-        cand_deta = np.abs(cand_eta - jeta)
+        # Signed, as in the ParTauDETR: |deta| and |dphi| cannot say on which
+        # side of the jet axis a candidate lies, while the visible-tau
+        # delta_eta / delta_phi targets are signed.
+        cand_deta = cand_eta - jeta
         dphi_raw = cand_phi - jphi
-        cand_dphi = np.abs(np.arctan2(np.sin(dphi_raw), np.cos(dphi_raw)))
+        cand_dphi = np.arctan2(np.sin(dphi_raw), np.cos(dphi_raw))
         cand_logpt = np.log(np.maximum(cand_pt, eps))
         cand_loge = np.log(np.maximum(cand_en, eps))
         cand_logptrel = np.log(np.maximum(cand_pt / np.maximum(jpt, eps), eps))
@@ -546,9 +628,9 @@ class ParticleTransformerDataset(IterableDataset):
                 isChargedHadron,
                 isNeutralHadron,
                 cand_dz,
-                cand_dz_err,
+                cand_dz_sig,
                 cand_dxy,
-                cand_dxy_err,
+                cand_dxy_sig,
             ],
             axis=1,
         )  # [N, 17, max_cands]
@@ -743,9 +825,27 @@ class ParticleTransformerDataset(IterableDataset):
 
         samples = {sample_name(unit[0]) for unit in reads_to_process}
         if self.stratify_samples and len(samples) > 1:
-            yield from self._iter_stratified(reads_to_process)
+            source = self._iter_stratified(reads_to_process)
         else:
-            yield from self._iter_chunked(reads_to_process)
+            source = self._iter_chunked(reads_to_process)
+
+        if worker_info is None:
+            yield from source
+        else:
+            # The DataLoader worker puts each batch on a multiprocessing.Queue,
+            # whose background feeder thread lazily moves it to shared memory
+            # (torch.multiprocessing.reductions.reduce_storage calls the raw
+            # _share_filename_cpu_, bypassing share_memory_'s lock) while THIS
+            # thread is already building the next batch with torch.cat. That
+            # race segfaulted workers at the epoch->validation transition.
+            # Sharing eagerly here, before the batch is queued, turns the
+            # feeder's later call into a no-op metadata read.
+            for batch in source:
+                for item in batch:
+                    values = item.values() if isinstance(item, dict) else (item,)
+                    for tensor in values:
+                        tensor.share_memory_()
+                yield batch
 
     def _iter_stratified(self, reads_to_process):
         """
@@ -1103,9 +1203,14 @@ class ParTDataModule(LightningDataModule):
                 flush=True,
             )
             scaling.fit_scaler(
-                iter(self.make_fit_dataset(row_groups)), self.cfg, max_jets=fit_jets
+                iter(self.make_fit_dataset(row_groups)),
+                self.cfg,
+                max_jets=fit_jets,
+                feature_names=self.dataset_cls.cand_feature_names(self.cfg),
             )
-        return scaling.make_input_scaler(self.cfg)
+        return scaling.make_checked_input_scaler(
+            self.cfg, self.dataset_cls.cand_feature_names(self.cfg)
+        )
 
 
     def setup(self, stage: str) -> None:

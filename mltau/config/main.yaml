@@ -19,7 +19,16 @@ tau_loss:
     # and paste the printed block here. While this is null the loss runs in its
     # legacy unscaled form (Huber in raw units, linear phi chord) and warns at
     # start-up.
-    kinematics_scales: null
+    # Measured on 20261022_FullVertexFix (visible taus of signal jets, train,
+    # 1M entries, estimator std) with
+    #   ./run.sh python3 mltau/scripts/measure_kinematics_scales.py --model ParT
+    # The targets have narrow cores and wide tails: the robust sigma (half the
+    # 16-84% range) is 0.030 / 0.0015 / 0.0019 / 0.714 for these four.
+    kinematics_scales:
+        log_pt: 0.149
+        delta_eta: 0.0218
+        phi_chord: 0.0228 # spread of dphi; chord ~ |dphi| for collimated targets
+        log_mass: 0.877
     # kinematics_scales:
     #     log_pt: <sigma of log(pt_vis / pt_jet)>
     #     delta_eta: <sigma of eta_vis - eta_jet>

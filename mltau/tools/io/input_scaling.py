@@ -23,7 +23,9 @@ import torch
 from omegaconf import DictConfig, OmegaConf
 
 
-# Metadata for recording the input features order in the .npz file
+# Metadata for recording the input features order in the .npz file. Indices
+# 14/16 are significances (d / sigma_d), not the raw errors: see
+# ParT_dataloader.impact_parameter_features.
 _CAND_FEATURE_NAMES = np.array(
     [
         "cand_deta",
@@ -40,11 +42,43 @@ _CAND_FEATURE_NAMES = np.array(
         "isChargedHadron",
         "isNeutralHadron",
         "cand_dz",
-        "cand_dz_error",
+        "cand_dz_significance",
         "cand_dxy",
-        "cand_dxy_error",
+        "cand_dxy_significance",
     ]
 )
+
+
+def cand_feature_names(cfg: DictConfig) -> list[str]:
+    """
+    Feature names of ParT_dataloader.ParticleTransformerDataset under `cfg`.
+
+    The names also encode each feature's DEFINITION: _check_feature_definitions
+    refuses a scaler whose saved names differ, because its constants belong to
+    differently defined inputs. Here that is the impact-parameter significance
+    transform (dataset.impact_parameter_features.significance_transform);
+    "none" keeps the plain names, so scalers fitted before it existed still
+    load. Datasets with other definitions override
+    `ParticleTransformerDataset.cand_feature_names`.
+    """
+    ip_cfg = cfg.dataset.get("impact_parameter_features", None) or {}
+    suffix = significance_name_suffix(
+        ip_cfg.get("significance_transform", "none"),
+        float(ip_cfg.get("tanh_scale", 5.0)),
+    )
+    names = [str(n) for n in _CAND_FEATURE_NAMES]
+    names[14] += suffix
+    names[16] += suffix
+    return names
+
+
+def significance_name_suffix(transform: str, tanh_scale: float) -> str:
+    """Name suffix of a significance feature for a significance transform."""
+    if transform == "none":
+        return ""
+    if transform == "tanh":
+        return f"_tanh{tanh_scale:g}"
+    return f"_{transform}"
 
 
 def scaling_enabled(cfg: DictConfig) -> bool:
@@ -110,7 +144,12 @@ class ScalerFitter:
         return mean.numpy(), std.numpy()
 
 
-def fit_scaler(chunks, cfg: DictConfig, max_jets: int | None = None) -> str:
+def fit_scaler(
+    chunks,
+    cfg: DictConfig,
+    max_jets: int | None = None,
+    feature_names: list[str] | None = None,
+) -> str:
     """
     Fit a scaler over `chunks` -- an iterable of build_tensors outputs -- and save it.
 
@@ -137,7 +176,9 @@ def fit_scaler(chunks, cfg: DictConfig, max_jets: int | None = None) -> str:
         mean=mean,
         std=std,
         feature_indices=np.asarray(feature_indices, dtype=np.int64),
-        feature_names=_CAND_FEATURE_NAMES,
+        feature_names=np.asarray(
+            feature_names if feature_names is not None else cand_feature_names(cfg)
+        ),
         jets_fit=np.asarray(jets, dtype=np.int64),
         data_dir=np.asarray(str(cfg.dataset.data_dir)),
     )
@@ -187,7 +228,53 @@ def _warn_on_foreign_scaler(scaler, cfg: DictConfig, path: str) -> None:
         )
 
 
-def apply_saved_input_scaling_from_cfg(tensors, cfg: DictConfig):
+def _check_feature_definitions(
+    scaler, cfg: DictConfig, path: str, feature_names: list[str] | None = None
+) -> None:
+    """
+    Refuse a scaler fitted on differently defined features.
+
+    Unlike a different data_dir, this is never legitimate: the constants belong
+    to other inputs (e.g. |deta| instead of the signed deta, or raw IP errors
+    instead of significances), and applying them shifts those features without
+    any visible error. `feature_names` are the names the dataset in use
+    produces, defaulting to cand_feature_names(cfg).
+    """
+    if "feature_names" not in scaler.files:
+        return
+    saved = [str(n) for n in scaler["feature_names"]]
+    current = (
+        [str(n) for n in feature_names]
+        if feature_names is not None
+        else cand_feature_names(cfg)
+    )
+    if saved != current:
+        changed = [f"{a} -> {b}" for a, b in zip(saved, current) if a != b]
+        raise RuntimeError(
+            f"Input scaler {path} was fitted on differently defined features "
+            f"({', '.join(changed) or 'different feature list'}). "
+            "Delete it to refit on the current definitions."
+        )
+
+
+def make_checked_input_scaler(cfg: DictConfig, feature_names: list[str] | None = None):
+    """
+    `make_input_scaler`, after refusing a scaler fitted on differently defined
+    features (_check_feature_definitions). `feature_names` are the names the
+    dataset in use produces (ParticleTransformerDataset.cand_feature_names),
+    defaulting to cand_feature_names(cfg).
+    """
+    if scaling_enabled(cfg):
+        path = scaler_path(cfg)
+        if os.path.exists(path):
+            _check_feature_definitions(np.load(path), cfg, path, feature_names)
+    return make_input_scaler(cfg)
+
+
+
+def apply_saved_input_scaling_from_cfg(
+    tensors, cfg: DictConfig, feature_names: list[str] | None = None
+):
     """This is the test/inference-time entry point:
     1. If scaling is disabled, return tensors unchanged.
     2. Load the saved .npz.
@@ -207,12 +294,13 @@ def apply_saved_input_scaling_from_cfg(tensors, cfg: DictConfig):
     std = scaler["std"]
     feature_indices = scaler["feature_indices"].astype(np.int64).tolist()
     _warn_on_foreign_scaler(scaler, cfg, path)
+    _check_feature_definitions(scaler, cfg, path, feature_names)
     print(f"[input scaling] Loaded scaler from {path}", flush=True)
 
     return _apply_feature_scaler(tensors, mean, std, feature_indices)
 
 
-def load_saved_scaler(cfg: DictConfig) -> dict:
+def load_saved_scaler(cfg: DictConfig, feature_names: list[str] | None = None) -> dict:
     """
     The fitted constants as a dict: mean, std (per selected feature) and
     feature_indices. For code that needs the numbers themselves rather than a
@@ -224,11 +312,41 @@ def load_saved_scaler(cfg: DictConfig) -> dict:
         raise RuntimeError(f"Input scaling is enabled, but scaler was not found: {path}")
     scaler = np.load(path)
     _warn_on_foreign_scaler(scaler, cfg, path)
+    _check_feature_definitions(scaler, cfg, path, feature_names)
     return {
         "mean": scaler["mean"],
         "std": scaler["std"],
         "feature_indices": scaler["feature_indices"].astype(np.int64).tolist(),
     }
+
+
+def _identity_scaler(tensors):
+    return tensors
+
+
+class FeatureScaler:
+    """
+    Picklable `tensors -> tensors` callable wrapping `_apply_feature_scaler`.
+
+    `make_input_scaler` used to return a local closure, which works fine for
+    num_workers=0 or a "fork" multiprocessing_context (the dataset carrying it
+    is inherited via COW memory), but `ParT_dataloader.loader_kwargs` selects
+    "forkserver" once num_workers > 1: that context is a genuinely separate
+    process, so the Dataset -- and this scaler stored on it via
+    `set_input_scaler` -- has to be pickled to reach the worker. `pickle`
+    cannot serialize a function defined inside another function, so with a
+    closure here every worker failed to start, silently (surfacing only as
+    Lightning's fetcher never getting a working iterator). A plain,
+    module-level class with plain-array attributes pickles fine.
+    """
+
+    def __init__(self, mean, std, feature_indices):
+        self.mean = mean
+        self.std = std
+        self.feature_indices = feature_indices
+
+    def __call__(self, tensors):
+        return _apply_feature_scaler(tensors, self.mean, self.std, self.feature_indices)
 
 
 def make_input_scaler(cfg: DictConfig):
@@ -241,7 +359,7 @@ def make_input_scaler(cfg: DictConfig):
     to a whole split at once.
     """
     if not scaling_enabled(cfg):
-        return lambda tensors: tensors
+        return _identity_scaler
 
     path = scaler_path(cfg)
     if not os.path.exists(path):
@@ -254,7 +372,4 @@ def make_input_scaler(cfg: DictConfig):
     _warn_on_foreign_scaler(scaler, cfg, path)
     print(f"[input scaling] Loaded scaler from {path}", flush=True)
 
-    def scale(tensors):
-        return _apply_feature_scaler(tensors, mean, std, feature_indices)
-
-    return scale
+    return FeatureScaler(mean, std, feature_indices)

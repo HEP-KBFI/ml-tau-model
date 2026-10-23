@@ -1,0 +1,20 @@
+dataset:
+    max_cands: 20
+    # Order the candidates of every jet by descending pT before padding. The
+    # ParT encoder is permutation invariant and does not care; the MLP-Mixer is
+    # not and needs it (recommended 'true' for training.model.backbone: Mixer).
+    sort_by_pt: false
+    # data_dir: /scratch/persistent/laurits/ml-tau/0923_ParTauDETR_dataset_rares/
+    data_dir: /scratch/persistent/laurits/ml-tau/20261022_FullVertexFix/
+    # Impact-parameter inputs: dz and dxy plus their significances d / sigma_d
+    # (ParT_dataloader.impact_parameter_features). Neutral and track-less
+    # candidates get 0 in all four. significance_transform compresses the
+    # significance tail, keeping its sign: none (d / sigma_d) |
+    # log (sign(s) * log(1 + |s|)) | tanh (tanh(s / tanh_scale)).
+    impact_parameter_features:
+        significance_transform: none
+        tanh_scale: 5.0
+    relative_sizes:
+        train: 0.7
+        val: 0.1
+        test: 0.2
