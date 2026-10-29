@@ -1,9 +1,81 @@
 import contextlib
+import math
 
 import torch
 from torch import nn
 
 from mltau.models.ParticleTransformer import ParticleTransformer
+
+
+def decode_kinematics(
+    kinematics: torch.Tensor,
+    reference_pt: torch.Tensor,
+    reference_eta: torch.Tensor,
+    reference_phi: torch.Tensor,
+    reference_energy: torch.Tensor,
+    *,
+    clamp_log_ratios: bool = False,
+    fixed_mass: torch.Tensor | None = None,
+) -> torch.Tensor:
+    """Decode ParTauDETR kinematics into Cartesian four-momenta.
+
+    ``kinematics`` has final dimension
+    ``[log_pt_ratio, delta_eta, sin_dphi, cos_dphi, log_mass_ratio]``.
+    Reference tensors may omit trailing object dimensions, such as a ``[B]``
+    jet reference used with ``[B, Q, 5]`` kinematics.
+
+    ``fixed_mass`` (same shape as the decoded pt) replaces the regressed
+    log-mass-ratio channel entirely: a daughter's mass is set by its identity
+    (a charged pion's 139.6 MeV, a neutral's 135 MeV), so when the mass channel
+    is unsupervised (kinematics_weights.log_mass = 0) the physical mass comes
+    from the predicted meson class instead of an untrained head output.
+    """
+    for reference in (reference_pt, reference_eta, reference_phi, reference_energy):
+        if reference.device != kinematics.device:
+            raise ValueError("Kinematics and reference tensors must share a device.")
+
+    def expand_reference(reference: torch.Tensor) -> torch.Tensor:
+        while reference.ndim < kinematics.ndim - 1:
+            reference = reference.unsqueeze(-1)
+        return reference
+
+    reference_pt = expand_reference(reference_pt)
+    reference_eta = expand_reference(reference_eta)
+    reference_phi = expand_reference(reference_phi)
+    reference_energy = expand_reference(reference_energy)
+
+    reference_mass = torch.sqrt(
+        torch.clamp(
+            reference_energy**2 - (reference_pt * torch.cosh(reference_eta)) ** 2,
+            min=1e-12,
+        )
+    )
+    log_pt_ratio = kinematics[..., 0]
+    log_mass_ratio = kinematics[..., 4]
+    if clamp_log_ratios:
+        log_pt_ratio = log_pt_ratio.clamp(-5.0, 5.0)
+        log_mass_ratio = log_mass_ratio.clamp(-5.0, 5.0)
+
+    pt = torch.exp(log_pt_ratio) * reference_pt
+    eta = kinematics[..., 1] + reference_eta
+    if clamp_log_ratios:
+        max_abs_eta = math.acosh(math.sqrt(torch.finfo(kinematics.dtype).max))
+        eta = eta.clamp(-max_abs_eta, max_abs_eta)
+    phi = reference_phi + torch.atan2(kinematics[..., 2], kinematics[..., 3])
+    if fixed_mass is not None:
+        mass = fixed_mass.to(dtype=kinematics.dtype, device=kinematics.device)
+    else:
+        mass = torch.exp(log_mass_ratio) * reference_mass
+
+    return torch.stack(
+        [
+            pt * torch.cos(phi),
+            pt * torch.sin(phi),
+            pt * torch.sinh(eta),
+            torch.sqrt((pt * torch.cosh(eta)) ** 2 + mass**2),
+        ],
+        dim=-1,
+    )
 
 
 class ParTauDETR(ParticleTransformer):
@@ -65,6 +137,7 @@ class ParTauDETR(ParticleTransformer):
         append_global_token: bool = True,
         return_memory: bool = False,
         return_cls: bool = False,
+        aux_loss: bool = False,
         **kwargs,
     ):
         super().__init__(
@@ -96,6 +169,7 @@ class ParTauDETR(ParticleTransformer):
         self.return_memory = return_memory
         self.return_cls = return_cls
         self.tau_id_head = tau_id_head
+        self.aux_loss = aux_loss
 
         embed_dim = embed_dims[-1] if len(embed_dims) > 0 else input_dim
         decoder_heads = (
@@ -238,7 +312,9 @@ class ParTauDETR(ParticleTransformer):
             )
 
             need_global_token = (
-                self.append_global_token or self.tau_id_head or self.return_cls
+                self.append_global_token
+                or self.tau_id_head
+                or self.return_cls
             )
             global_token = (
                 self.compute_global_token(particle_memory, padding_mask)
@@ -256,11 +332,29 @@ class ParTauDETR(ParticleTransformer):
             query_pos = self.query_embed.weight.unsqueeze(1).expand(-1, batch_size, -1)
 
             tgt = torch.zeros_like(query_pos)
-            hs = self.decoder(
-                tgt=tgt + query_pos,
-                memory=memory,
-                memory_key_padding_mask=memory_padding_mask,
-            )
+            if self.aux_loss and self.training:
+                # Per-layer outputs for deep supervision: run the decoder stack
+                # by hand (nn.TransformerDecoder only returns the last layer)
+                # and normalise every intermediate with the SAME shared final
+                # LayerNorm, as in DETR, so all layers feed identically scaled
+                # activations to the shared heads.
+                decoded = tgt + query_pos
+                intermediate = []
+                for layer in self.decoder.layers:
+                    decoded = layer(
+                        decoded,
+                        memory,
+                        memory_key_padding_mask=memory_padding_mask,
+                    )
+                    intermediate.append(self.decoder.norm(decoded))
+                hs = intermediate[-1]
+            else:
+                intermediate = None
+                hs = self.decoder(
+                    tgt=tgt + query_pos,
+                    memory=memory,
+                    memory_key_padding_mask=memory_padding_mask,
+                )
 
             hs = hs.transpose(0, 1).contiguous()  # (N, Q, C)
 
@@ -270,6 +364,22 @@ class ParTauDETR(ParticleTransformer):
                 "pred_charge_logits": self.charge_head(hs),
                 "pred_meson_class_logits": self.meson_class_head(hs),
             }
+
+            if intermediate is not None and len(intermediate) > 1:
+                aux_outputs = []
+                for layer_hs in intermediate[:-1]:
+                    layer_hs = layer_hs.transpose(0, 1).contiguous()
+                    aux_outputs.append(
+                        {
+                            "pred_logits": self.objectness_head(layer_hs),
+                            "pred_kinematics": self.kinematics_head(layer_hs),
+                            "pred_charge_logits": self.charge_head(layer_hs),
+                            "pred_meson_class_logits": self.meson_class_head(
+                                layer_hs
+                            ),
+                        }
+                    )
+                output["aux_outputs"] = aux_outputs
 
             # Jet-level tau-tagging logits from the pooled global token.
             if self.tau_head is not None and global_token is not None:

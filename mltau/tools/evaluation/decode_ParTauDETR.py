@@ -11,7 +11,7 @@ from scipy.optimize import linear_sum_assignment
 from mltau.models.ParTauDETR_module import ParTauDETRModule
 from mltau.tools.general import reinitialize_p4
 from mltau.tools.io.ParTauDETR_dataloader import ParticleTransformerDETRDataset
-from mltau.tools.partau_detr import decode_kinematics as decode_kinematics_p4
+from mltau.models.ParTauDETR import decode_kinematics as decode_kinematics_p4
 
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 
@@ -101,13 +101,18 @@ def _assign(
     return pred_idx[valid].astype(np.int64), true_idx[valid].astype(np.int64)
 
 
-def _predicted_components(outputs, reco_jet_p4s):
+def _predicted_components(outputs, reco_jet_p4s, mass_from_class: bool = False):
     """
     Dense [N, Q] predictions, before any objectness threshold is applied.
 
     Split out because none of it depends on the threshold: a scan would
     otherwise redo the softmaxes, the argmaxes and the kinematics decode once
     per point.
+
+    `mass_from_class` decodes each daughter's mass from its predicted meson
+    class (0 = charged -> pi+-, 1 = neutral -> pi0) instead of the regressed
+    log-mass channel; required for models trained with
+    tau_loss.kinematics_weights.log_mass = 0, whose mass channel is untrained.
     """
     object_probs = torch.softmax(outputs["pred_logits"], dim=-1)
     pred_scores = object_probs[..., 0]
@@ -119,12 +124,18 @@ def _predicted_components(outputs, reco_jet_p4s):
 
     pred_meson_class = outputs["pred_meson_class_logits"].argmax(dim=-1)
 
+    fixed_mass = None
+    if mass_from_class:
+        mass_lut = outputs["pred_kinematics"].new_tensor([0.13957, 0.13498])
+        fixed_mass = mass_lut[pred_meson_class]
+
     pred_p4_tensor = decode_kinematics_p4(
         outputs["pred_kinematics"],
         reco_jet_p4s["pt"],
         reco_jet_p4s["eta"],
         reco_jet_p4s["phi"],
         reco_jet_p4s["energy"],
+        fixed_mass=fixed_mass,
     )
     pred_p4 = p4_from_components(pred_p4_tensor)
     return pred_scores, pred_p4, pred_charge, pred_meson_class
@@ -143,6 +154,7 @@ def get_predicted_particles(
     obj_cls_trsh: float = 0.5,
     tau_scores=None,
     tau_threshold: float | None = None,
+    mass_from_class: bool = False,
 ):
     """
     Predicted daughters per jet: the queries whose objectness passes
@@ -156,7 +168,7 @@ def get_predicted_particles(
     restricted to true tau jets, where the tagger has nothing to add.
     """
     pred_scores, pred_p4, pred_charge, pred_meson_class = _predicted_components(
-        outputs, reco_jet_p4s
+        outputs, reco_jet_p4s, mass_from_class=mass_from_class
     )
     pred_mask = pred_scores >= obj_cls_trsh
     if tau_scores is not None and tau_threshold is not None:
@@ -405,15 +417,24 @@ def create_predictions(
     cfg,
     obj_cls_trsh=0.885,
     tau_threshold: float | None = None,
+    mass_from_class: bool | None = None,
 ):
     """
     True and predicted daughter sets.
+
+    `mass_from_class` defaults to cfg's model.detr.loss.mass_from_meson_class,
+    i.e. to how the model was trained (see _predicted_components). Pass it
+    explicitly for a checkpoint trained with a different setting than cfg.
 
     `tau_threshold` gates the predicted set with the tauID head (see
     get_predicted_particles). Set it whenever the sample contains background
     jets; on a signal-only sample it only removes the true taus the tagger
     misses, which is a tagging inefficiency and not a reconstruction one.
     """
+    if mass_from_class is None:
+        mass_from_class = bool(
+            cfg.model.detr.loss.get("mass_from_meson_class", False)
+        )
     targets = get_true_particles(targets, reco_jet_p4s)
     predictions = get_predicted_particles(
         outputs,
@@ -421,6 +442,7 @@ def create_predictions(
         obj_cls_trsh=obj_cls_trsh,
         tau_scores=tau_scores(outputs) if tau_threshold is not None else None,
         tau_threshold=tau_threshold,
+        mass_from_class=mass_from_class,
     )
     true_daughters = TauDaughter(*targets)
     pred_daughters = TauDaughter(*predictions)

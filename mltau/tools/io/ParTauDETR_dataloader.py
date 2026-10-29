@@ -7,9 +7,11 @@ from mltau.tools.io.ParT_dataloader import (
     ParTDataModule,
     ParticleTransformerDataset,
     has_p4_field,
+    impact_parameter_features,
     p4_field,
     sort_candidates_by_pt,
 )
+from mltau.tools.io import input_scaling as scaling
 from mltau.tools.meson_classes import (
     get_meson_class_groups,
     pdg_to_meson_class_indices,
@@ -35,6 +37,34 @@ class ParticleTransformerDETRDataset(ParticleTransformerDataset):
     where T = cfg.dataset.max_tau_daughters if provided, otherwise inferred from
     the currently loaded row-group.
     """
+
+    @classmethod
+    def cand_feature_names(cls, cfg) -> list[str]:
+        """
+        Names (and so definitions, see input_scaling._check_feature_definitions)
+        of this dataset's cand_features: signed deta/dphi, the signed impact
+        parameters, and whichever second/fourth lifetime feature
+        dataset.impact_parameter_features selects.
+        """
+        ip_cfg = cfg.dataset.impact_parameter_features
+        names = scaling.cand_feature_names(cfg)
+        names[0] = "cand_deta_signed"
+        names[1] = "cand_dphi_signed"
+        ip_suffix = "_signed"
+        transform_scale = float(ip_cfg.get("transform_scale", 0.0))
+        if transform_scale > 0.0:
+            ip_suffix += f"_arctan{transform_scale:g}"
+        if ip_cfg.get("use_log_significance", False):
+            error_names = ("cand_dz_log_abs_significance", "cand_dxy_log_abs_significance")
+        elif ip_cfg.get("significance_transform", "none") == "raw_error":
+            error_names = ("cand_dz_error", "cand_dxy_error")
+        else:
+            error_names = (names[14], names[16])
+        names[13] = "cand_dz" + ip_suffix
+        names[14] = error_names[0]
+        names[15] = "cand_dxy" + ip_suffix
+        names[16] = error_names[1]
+        return names
 
     _NEEDED_COLUMNS = [
         "reco_cand_p4s",
@@ -144,8 +174,16 @@ class ParticleTransformerDETRDataset(ParticleTransformerDataset):
         for track_parameter in (cand_dz, cand_dz_err, cand_dxy, cand_dxy_err):
             track_parameter[neutral_mask] = 0.0
 
+        # Second and fourth lifetime features: the significance d / sigma_d by
+        # default (optionally log- or tanh-compressed, see
+        # ParT_dataloader.impact_parameter_features); "raw_error" and
+        # use_log_significance reproduce the earlier definitions, for
+        # checkpoints trained with them.
         impact_parameter_cfg = self.cfg.dataset.impact_parameter_features
-        if impact_parameter_cfg.use_log_significance:
+        significance_transform = impact_parameter_cfg.get(
+            "significance_transform", "none"
+        )
+        if impact_parameter_cfg.get("use_log_significance", False):
             cand_dz_err[charged_mask] = np.log(
                 np.maximum(
                     np.abs(cand_dz[charged_mask])
@@ -159,6 +197,16 @@ class ParticleTransformerDETRDataset(ParticleTransformerDataset):
                     / np.maximum(cand_dxy_err[charged_mask], eps),
                     eps,
                 )
+            )
+        elif significance_transform != "raw_error":
+            cand_dz, cand_dz_err, cand_dxy, cand_dxy_err = impact_parameter_features(
+                cand_dz,
+                cand_dz_err,
+                cand_dxy,
+                cand_dxy_err,
+                charge=cand_charge,
+                transform=significance_transform,
+                tanh_scale=float(impact_parameter_cfg.get("tanh_scale", 5.0)),
             )
 
         scale = float(impact_parameter_cfg.transform_scale)

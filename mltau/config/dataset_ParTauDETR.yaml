@@ -1,14 +1,21 @@
 dataset:
     max_cands: 20
     num_features: 17
-    # Lifetime input features remain [signed dz, dz error, signed dxy, dxy
-    # error] by default. Set use_log_significance=true to replace each error
-    # with log(abs(IP) / IP_error). A positive transform_scale replaces each
-    # signed IP with 2 * arctan(transform_scale * IP) / pi; zero or a negative
-    # value leaves it unchanged. For example:
-    #   dataset.impact_parameter_features.use_log_significance=true
+    # Lifetime input features: [signed dz, dz significance, signed dxy, dxy
+    # significance], with significance = IP / IP_error and all four 0 for
+    # neutral candidates. significance_transform compresses the significance
+    # tail, keeping its sign: none (IP / IP_error) | log (sign(s) * log(1 +
+    # |s|)) | tanh (tanh(s / tanh_scale)). Earlier definitions, for checkpoints
+    # trained with them: raw_error (the plain IP_error) or
+    # use_log_significance=true (log(abs(IP) / IP_error), overrides
+    # significance_transform). A positive transform_scale replaces each signed
+    # IP with 2 * arctan(transform_scale * IP) / pi; zero or a negative value
+    # leaves it unchanged. For example:
+    #   dataset.impact_parameter_features.significance_transform=log
     #   dataset.impact_parameter_features.transform_scale=30
     impact_parameter_features:
+        significance_transform: none # none | log | tanh | raw_error
+        tanh_scale: 5.0
         use_log_significance: false
         transform_scale: 0.0
     # Target slots per jet, and (by interpolation) the number of decoder
