@@ -80,11 +80,42 @@ def get_reduced_decaymodes(decaymodes: np.array):
     return np.vectorize(target_mapping.get)(decaymodes)
 
 
-def prepare_one_hot_encoding(values, classes=[0, 1, 2, 10, 11, 15]):
+# Class order for the 6-class reduction of `gen_jet_tau_decaymode` that
+# get_reduced_decaymodes produces; the default of prepare_one_hot_encoding /
+# one_hot_decoding below.
+STANDARD_DECAY_MODE_CLASSES = [0, 1, 2, 10, 11, 15]
+
+# Class order for `gen_jet_tau_decaymode_rare` (see
+# ntupelizer.tools.tau_decaymode.classify_rare_decay_mode): the fine-grained
+# scheme that keeps kaon-bearing and other sub-modes separate instead of
+# lumping them into "Rare" (as get_reduced_decaymodes does for the standard
+# gen_jet_tau_decaymode). Order matters: it fixes the one-hot index of every
+# class, so it must not change independently of a trained model's head.
+RARE_DECAY_MODE_CLASSES = [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 15]
+
+
+def get_decaymodes_rare_for_ohe(decaymodes_rare: np.array):
+    """Maps -1 (no genuine tau, i.e. a background jet) onto 15 ("other"), so
+    `gen_jet_tau_decaymode_rare` can be one-hot encoded without -1 crashing
+    `prepare_one_hot_encoding`. The decay-mode loss is only ever computed on
+    the is_tau mask, so what a background jet maps to here never reaches it.
+    """
+    return np.where(decaymodes_rare == -1, 15, decaymodes_rare)
+
+
+# Looked up by `training.model.decay_mode_scheme` wherever a decay-mode class
+# list has to be picked from config (e.g. mltau.tools.evaluation.inference).
+DECAY_MODE_CLASS_SCHEMES = {
+    "standard": STANDARD_DECAY_MODE_CLASSES,
+    "rare": RARE_DECAY_MODE_CLASSES,
+}
+
+
+def prepare_one_hot_encoding(values, classes=STANDARD_DECAY_MODE_CLASSES):
     mapping = {class_: i for i, class_ in enumerate(classes)}
     return np.vectorize(mapping.get)(values)
 
 
-def one_hot_decoding(values, classes=[0, 1, 2, 10, 11, 15]):
+def one_hot_decoding(values, classes=STANDARD_DECAY_MODE_CLASSES):
     mapping = {i: class_ for i, class_ in enumerate(classes)}
     return np.vectorize(mapping.get)(values)

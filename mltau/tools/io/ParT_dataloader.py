@@ -131,9 +131,9 @@ _CANDIDATE_FIELDS = (
     "reco_cand_p4s",
     "reco_cand_charges",
     "reco_cand_pdgs",
-    "reco_cand_dz",
+    "reco_cand_signed_dz",
     "reco_cand_dz_error",
-    "reco_cand_dxy",
+    "reco_cand_signed_dxy",
     "reco_cand_dxy_error",
 )
 
@@ -234,9 +234,9 @@ class ParticleTransformerDataset(IterableDataset):
         "reco_cand_p4s",
         "reco_cand_charges",
         "reco_cand_pdgs",
-        "reco_cand_dz",
+        "reco_cand_signed_dz",
         "reco_cand_dz_error",
-        "reco_cand_dxy",
+        "reco_cand_signed_dxy",
         "reco_cand_dxy_error",
         "reco_jet_p4",
         "gen_jet_tau_p4",
@@ -353,8 +353,13 @@ class ParticleTransformerDataset(IterableDataset):
     @classmethod
     def cand_feature_names(cls, cfg) -> list[str]:
         """Names (and so definitions) of the cand_features channels; see
-        input_scaling.cand_feature_names, which this defaults to."""
-        return scaling.cand_feature_names(cfg)
+        input_scaling.cand_feature_names. deta/dphi are signed (named as in
+        ParTauDETR_dataloader), so a scaler fitted on |deta|/|dphi| is
+        refused instead of silently mis-standardising them."""
+        names = scaling.cand_feature_names(cfg)
+        names[0] = "cand_deta_signed"
+        names[1] = "cand_dphi_signed"
+        return names
 
     def set_input_scaler(self, scaler) -> None:
         """Attach a `tensors -> tensors` callable, or None to disable scaling."""
@@ -543,10 +548,20 @@ class ParticleTransformerDataset(IterableDataset):
         cand_en = pad_cand(p4_field(data.reco_cand_p4s, "energy"))  # energy
         cand_charge = pad_cand(data.reco_cand_charges)
         cand_pdg_abs = pad_cand(abs(data.reco_cand_pdgs))
-        cand_dz = pad_cand(data.reco_cand_dz)
+        cand_dz = pad_cand(data.reco_cand_signed_dz)
         cand_dz_err = pad_cand(data.reco_cand_dz_error)
-        cand_dxy = pad_cand(data.reco_cand_dxy)
+        cand_dxy = pad_cand(data.reco_cand_signed_dxy)
         cand_dxy_err = pad_cand(data.reco_cand_dxy_error)
+        ip_cfg = self.cfg.dataset.get("impact_parameter_features", None) or {}
+        cand_dz, cand_dz_sig, cand_dxy, cand_dxy_sig = impact_parameter_features(
+            cand_dz,
+            cand_dz_err,
+            cand_dxy,
+            cand_dxy_err,
+            charge=cand_charge,
+            transform=ip_cfg.get("significance_transform", "none"),
+            tanh_scale=float(ip_cfg.get("tanh_scale", 5.0)),
+        )
 
         # Mask: True = real particle, False = padding  [N, max_cands]
         lengths = np.minimum(ak.to_numpy(ak.num(data.reco_cand_pdgs)), max_cands)
@@ -578,9 +593,12 @@ class ParticleTransformerDataset(IterableDataset):
         jphi = jet_phi[:, None]
         jen = jet_en[:, None]
 
-        cand_deta = np.abs(cand_eta - jeta)
+        # Signed, as in the ParTauDETR: |deta| and |dphi| cannot say on which
+        # side of the jet axis a candidate lies, while the visible-tau
+        # delta_eta / delta_phi targets are signed.
+        cand_deta = cand_eta - jeta
         dphi_raw = cand_phi - jphi
-        cand_dphi = np.abs(np.arctan2(np.sin(dphi_raw), np.cos(dphi_raw)))
+        cand_dphi = np.arctan2(np.sin(dphi_raw), np.cos(dphi_raw))
         cand_logpt = np.log(np.maximum(cand_pt, eps))
         cand_loge = np.log(np.maximum(cand_en, eps))
         cand_logptrel = np.log(np.maximum(cand_pt / np.maximum(jpt, eps), eps))
@@ -610,9 +628,9 @@ class ParticleTransformerDataset(IterableDataset):
                 isChargedHadron,
                 isNeutralHadron,
                 cand_dz,
-                cand_dz_err,
+                cand_dz_sig,
                 cand_dxy,
-                cand_dxy_err,
+                cand_dxy_sig,
             ],
             axis=1,
         )  # [N, 17, max_cands]
