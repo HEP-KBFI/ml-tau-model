@@ -60,8 +60,6 @@ class ParticleTransformerDETRDataset(ParticleTransformerDataset):
             ip_suffix += f"_arctan{transform_scale:g}"
         if ip_cfg.get("use_log_significance", False):
             error_names = ("cand_dz_log_abs_significance", "cand_dxy_log_abs_significance")
-        elif ip_cfg.get("significance_transform", "none") == "raw_error":
-            error_names = ("cand_dz_error", "cand_dxy_error")
         else:
             error_names = (names[14], names[16])
         names[13] = "cand_dz" + ip_suffix
@@ -179,14 +177,8 @@ class ParticleTransformerDETRDataset(ParticleTransformerDataset):
             track_parameter[neutral_mask] = 0.0
 
         # Second and fourth lifetime features: the significance d / sigma_d by
-        # default (optionally log- or tanh-compressed, see
-        # ParT_dataloader.impact_parameter_features); "raw_error" and
-        # use_log_significance reproduce the earlier definitions, for
-        # checkpoints trained with them.
+        # default, or the earlier log(abs(d) / sigma_d) definition.
         impact_parameter_cfg = self.cfg.dataset.impact_parameter_features
-        significance_transform = impact_parameter_cfg.get(
-            "significance_transform", "none"
-        )
         if impact_parameter_cfg.get("use_log_significance", False):
             cand_dz_err[charged_mask] = np.log(
                 np.maximum(
@@ -202,15 +194,13 @@ class ParticleTransformerDETRDataset(ParticleTransformerDataset):
                     eps,
                 )
             )
-        elif significance_transform != "raw_error":
+        else:
             cand_dz, cand_dz_err, cand_dxy, cand_dxy_err = impact_parameter_features(
                 cand_dz,
                 cand_dz_err,
                 cand_dxy,
                 cand_dxy_err,
                 charge=cand_charge,
-                transform=significance_transform,
-                tanh_scale=float(impact_parameter_cfg.get("tanh_scale", 5.0)),
             )
 
         scale = float(impact_parameter_cfg.transform_scale)
