@@ -211,7 +211,7 @@ class HungarianMatcher(nn.Module):
         self.cost_objectness = cost_objectness
         self.cost_kinematics_l1 = cost_kinematics_l1
         # Per-component weights for the kinematics matching cost, over
-        # [log_pt_ratio, delta_eta, sin_dphi, cos_dphi, log_mass_ratio].
+        # [log_p_ratio, delta_theta, delta_phi, log_mass_ratio].
         #
         # Unweighted, the log ratios (sigma ~1) dominate and the angular offsets
         # of collimated daughters (sigma ~0.07) barely count. Weighting the
@@ -223,7 +223,7 @@ class HungarianMatcher(nn.Module):
         # without letting it override pt and identity: 94% / 10%. See
         # _classification_cost_matrix for the measurement.
         if kinematics_component_weights is None:
-            kinematics_component_weights = [1.0, 1.0, 1.0, 1.0, 1.0]
+            kinematics_component_weights = [1.0, 1.0, 1.0, 1.0]
         self.register_buffer(
             "kinematics_component_weights",
             torch.tensor([float(w) for w in kinematics_component_weights]),
@@ -529,6 +529,7 @@ class SetCriterion(nn.Module):
         device = pred_parent_p4.device
         pred_px, pred_py, pred_pz, pred_energy = pred_parent_p4.unbind(dim=-1)
         pred_pt = torch.sqrt((pred_px**2 + pred_py**2).clamp_min(1e-12))
+        pred_p = torch.sqrt((pred_px**2 + pred_py**2 + pred_pz**2).clamp_min(1e-12))
         pred_eta = torch.asinh(pred_pz / pred_pt.clamp_min(1e-6))
         pred_phi = torch.atan2(pred_py, pred_px)
         pred_mass = torch.sqrt(
@@ -540,6 +541,7 @@ class SetCriterion(nn.Module):
 
         true_pt = target_parent_p4["pt"].to(dtype=pred_pt.dtype, device=device)
         true_eta = target_parent_p4["eta"].to(dtype=pred_eta.dtype, device=device)
+        true_p = true_pt * torch.cosh(true_eta)
         true_phi = target_parent_p4["phi"].to(dtype=pred_phi.dtype, device=device)
         true_energy = target_parent_p4["energy"].to(
             dtype=pred_energy.dtype, device=device
@@ -550,15 +552,19 @@ class SetCriterion(nn.Module):
                 min=1e-12,
             )
         )
-        delta_phi = pred_phi - true_phi
+        pred_theta = 2.0 * torch.atan(torch.exp(-pred_eta))
+        true_theta = 2.0 * torch.atan(torch.exp(-true_eta))
+        delta_theta = (pred_theta - true_theta).clamp(-math.pi / 2, math.pi / 2)
+        delta_phi = torch.atan2(
+            torch.sin(pred_phi - true_phi), torch.cos(pred_phi - true_phi)
+        ).clamp(-math.pi / 2, math.pi / 2)
         pred_parent_kinematics = torch.stack(
             [
                 torch.log(
-                    pred_pt.clamp_min(1e-6) / true_pt.clamp_min(1e-6)
+                    pred_p.clamp_min(1e-6) / true_p.clamp_min(1e-6)
                 ).clamp(-5.0, 5.0),
-                pred_eta - true_eta,
-                torch.sin(delta_phi),
-                torch.cos(delta_phi),
+                delta_theta,
+                delta_phi,
                 torch.log(
                     pred_mass.clamp_min(1e-6) / true_mass.clamp_min(1e-6)
                 ).clamp(-5.0, 5.0),
@@ -566,7 +572,6 @@ class SetCriterion(nn.Module):
             dim=-1,
         )
         target_parent_kinematics = torch.zeros_like(pred_parent_kinematics)
-        target_parent_kinematics[:, 3] = 1.0
         loss, _ = self.tau_loss.compute_kinematics_loss(
             pred_parent_kinematics,
             target_parent_kinematics,
@@ -649,6 +654,18 @@ class SetCriterion(nn.Module):
         true_pt = target_parent_p4["pt"].float().clamp_min(1e-8)
         true_momentum = true_pt * torch.cosh(target_parent_p4["eta"].float())
         true_energy = target_parent_p4["energy"].float().clamp_min(1e-8)
+        true_theta = 2.0 * torch.atan(torch.exp(-target_parent_p4["eta"].float()))
+        true_phi = target_parent_p4["phi"].float()
+
+        def resolution(
+            values: torch.Tensor, ratio: bool = False, valid: torch.Tensor = signal_mask
+        ) -> torch.Tensor:
+            selected = values[valid]
+            if selected.numel() == 0:
+                return values.new_zeros(())
+            spread = torch.quantile(selected, 0.75) - torch.quantile(selected, 0.25)
+            return spread / torch.quantile(selected, 0.5).clamp_min(1e-8) if ratio else spread
+
         selections = {
             "unmatched_gate_weighted": gate * (~matched),
             "selected_unmatched": extra.to(gate.dtype),
@@ -662,9 +679,33 @@ class SetCriterion(nn.Module):
             summed = (pred_p4 * query_weights.unsqueeze(-1)).sum(dim=1)
             momentum = torch.linalg.vector_norm(summed[:, :3], dim=1)
             pt = torch.linalg.vector_norm(summed[:, :2], dim=1)
-            diagnostics[f"momentum/{name}_p_over_parent"] = signal_mean(momentum / true_momentum.clamp_min(1e-8))
-            diagnostics[f"momentum/{name}_energy_over_parent"] = signal_mean(summed[:, 3] / true_energy)
-            diagnostics[f"momentum/{name}_pt_over_parent"] = signal_mean(pt / true_pt)
+            ratios = {
+                "p": momentum / true_momentum.clamp_min(1e-8),
+                "energy": summed[:, 3] / true_energy,
+                "pt": pt / true_pt,
+            }
+            for variable, values in ratios.items():
+                diagnostics[f"momentum/{name}_{variable}_over_parent"] = signal_mean(values)
+                if name not in ("matched_only", "selected_only", "soft_only"):
+                    continue
+                diagnostics[f"momentum/{name}_{variable}_resolution"] = resolution(values, ratio=True)
+
+            if name not in ("matched_only", "selected_only", "soft_only"):
+                continue
+            valid_direction = signal_mask & (momentum > 1e-8)
+            pred_theta = torch.atan2(pt, summed[:, 2])
+            theta_diff = torch.rad2deg(pred_theta - true_theta)
+            pred_phi = torch.atan2(summed[:, 1], summed[:, 0])
+            phi_diff = torch.rad2deg(torch.atan2(
+                torch.sin(pred_phi - true_phi), torch.cos(pred_phi - true_phi)
+            ))
+            for variable, values in (("theta", theta_diff), ("phi", phi_diff)):
+                diagnostics[f"momentum/{name}_{variable}_diff"] = (
+                    values * valid_direction
+                ).sum() / valid_direction.sum().clamp_min(1)
+                diagnostics[f"momentum/{name}_{variable}_resolution"] = resolution(
+                    values, valid=valid_direction
+                )
         return diagnostics
 
     def _compute_parent_charge_loss(
@@ -809,9 +850,9 @@ class SetCriterion(nn.Module):
         else:
             loss_kinematics = pred_logits.new_zeros(())
             kin_components = {
-                "log_pt": pred_logits.new_zeros(()),
-                "delta_eta": pred_logits.new_zeros(()),
-                "phi_chord": pred_logits.new_zeros(()),
+                "log_p": pred_logits.new_zeros(()),
+                "delta_theta": pred_logits.new_zeros(()),
+                "delta_phi": pred_logits.new_zeros(()),
                 "log_mass": pred_logits.new_zeros(()),
             }
             loss_charge = pred_logits.new_zeros(())
@@ -1257,9 +1298,9 @@ class SetCriterion(nn.Module):
             "loss_objectness": loss_objectness,
             "loss_tau_id": loss_tau_id,
             "loss_kinematics": loss_kinematics,
-            "kinematics_log_pt_loss": kin_components["log_pt"],
-            "kinematics_delta_eta_loss": kin_components["delta_eta"],
-            "kinematics_phi_chord_loss": kin_components["phi_chord"],
+            "kinematics_log_p_loss": kin_components["log_p"],
+            "kinematics_delta_theta_loss": kin_components["delta_theta"],
+            "kinematics_delta_phi_loss": kin_components["delta_phi"],
             "kinematics_log_mass_loss": kin_components["log_mass"],
             "loss_charge": loss_charge,
             "loss_meson_class": loss_meson_class,
@@ -1370,6 +1411,10 @@ class ParTauDETRModule(L.LightningModule):
             num_charge_classes=num_charge_classes,
             num_meson_classes=self.num_meson_classes,
             num_kinematics_components=self.num_kinematics_components,
+            angular_scales=(
+                float(arch.tau_loss.kinematics_scales.delta_theta),
+                float(arch.tau_loss.kinematics_scales.delta_phi),
+            ),
             # encoder
             num_layers=int(encoder_cfg.num_layers),
             num_heads=num_heads,
@@ -1725,20 +1770,20 @@ class ParTauDETRModule(L.LightningModule):
             on_epoch=True,
         )
         self.log(
-            "train_losses/kinematics_log_pt_loss",
-            losses["kinematics_log_pt_loss"],
+            "train_losses/kinematics_log_p_loss",
+            losses["kinematics_log_p_loss"],
             on_step=False,
             on_epoch=True,
         )
         self.log(
-            "train_losses/kinematics_delta_eta_loss",
-            losses["kinematics_delta_eta_loss"],
+            "train_losses/kinematics_delta_theta_loss",
+            losses["kinematics_delta_theta_loss"],
             on_step=False,
             on_epoch=True,
         )
         self.log(
-            "train_losses/kinematics_phi_chord_loss",
-            losses["kinematics_phi_chord_loss"],
+            "train_losses/kinematics_delta_phi_loss",
+            losses["kinematics_delta_phi_loss"],
             on_step=False,
             on_epoch=True,
         )
@@ -1881,15 +1926,18 @@ class ParTauDETRModule(L.LightningModule):
             pred_charged = charged_class[outputs["pred_meson_class_logits"].argmax(-1)]
             true_charged = charged_class[targets["particles_meson_class_ohe"][signal].argmax(-1)]
             scores = torch.softmax(outputs["pred_logits"].float(), dim=-1)[..., 0]
-            pred_eta = outputs["pred_kinematics"][..., 1].float() + reco_jet["eta"][:, None]
-            pred_phi = reco_jet["phi"][:, None] + torch.atan2(
-                outputs["pred_kinematics"][..., 2].float(),
-                outputs["pred_kinematics"][..., 3].float(),
+            reco_eta = reco_jet["eta"][:, None]
+            reco_theta = 2.0 * torch.atan(torch.exp(-reco_eta))
+            pred_theta = (
+                reco_theta + outputs["pred_kinematics"][..., 1].float()
+            ).clamp(1e-6, math.pi - 1e-6)
+            true_theta = (reco_theta + target_kinematics[..., 1].float()).clamp(
+                1e-6, math.pi - 1e-6
             )
-            true_eta = target_kinematics[..., 1].float() + reco_jet["eta"][:, None]
-            true_phi = reco_jet["phi"][:, None] + torch.atan2(
-                target_kinematics[..., 2].float(), target_kinematics[..., 3].float()
-            )
+            pred_eta = -torch.log(torch.tan(pred_theta / 2.0))
+            true_eta = -torch.log(torch.tan(true_theta / 2.0))
+            pred_phi = reco_jet["phi"][:, None] + outputs["pred_kinematics"][..., 2].float()
+            true_phi = reco_jet["phi"][:, None] + target_kinematics[..., 2].float()
         destination = self.threshold_buffer if buffer is None else buffer
         destination.add(
             scores, pred_eta, pred_phi, pred_charged, true_eta, true_phi, target_mask, true_charged
@@ -2142,20 +2190,20 @@ class ParTauDETRModule(L.LightningModule):
             on_epoch=True,
         )
         self.log(
-            "val_losses/kinematics_log_pt_loss",
-            losses["kinematics_log_pt_loss"],
+            "val_losses/kinematics_log_p_loss",
+            losses["kinematics_log_p_loss"],
             on_step=False,
             on_epoch=True,
         )
         self.log(
-            "val_losses/kinematics_delta_eta_loss",
-            losses["kinematics_delta_eta_loss"],
+            "val_losses/kinematics_delta_theta_loss",
+            losses["kinematics_delta_theta_loss"],
             on_step=False,
             on_epoch=True,
         )
         self.log(
-            "val_losses/kinematics_phi_chord_loss",
-            losses["kinematics_phi_chord_loss"],
+            "val_losses/kinematics_delta_phi_loss",
+            losses["kinematics_delta_phi_loss"],
             on_step=False,
             on_epoch=True,
         )
@@ -2230,7 +2278,13 @@ class ParTauDETRModule(L.LightningModule):
         )
         for key, value in losses.items():
             if key.startswith(("matching/", "momentum/")):
-                self.log(f"val/{key}", value, on_step=False, on_epoch=True)
+                self.log(
+                    f"val/{key}", value,
+                    on_step=key.startswith("momentum/") and (
+                        key.endswith("_resolution") or key.endswith("_diff")
+                    ),
+                    on_epoch=True,
+                )
 
         if not self.trainer.sanity_checking:
             self._accumulate_jet_level(batch, outputs, targets)

@@ -65,7 +65,7 @@ model:
     # the objectness class balance -- see loss.eos_coef.
     num_queries: ${dataset.max_tau_daughters}
     num_charge_classes: 3
-    num_kinematics_components: 5
+    num_kinematics_components: 4
     # The PDG head width is derived from dataset.tau_daughter_pdg_ids, which is
     # the same list the dataloader one-hot encodes against. Do not duplicate it.
 
@@ -100,27 +100,26 @@ model:
             cost_kinematics_l1: 2.0
             cost_charge: 1.0
             cost_meson_class_ce: 1.0
-            # Per-component weights of the kinematics matching cost, over
-            # [log_pt_ratio, delta_eta, sin_dphi, cos_dphi, log_mass_ratio].
+            # Per-component weights over
+            # [log_p_ratio, delta_theta, delta_phi, log_mass_ratio].
             # These decide WHICH daughter a query is trained towards, so what
             # matters is not that every component counts equally but that the
             # assignment stays stable while the model is still wrong. Tau
-            # daughters are collimated (measured on z_train: sigma =
-            # [0.875, 0.077, 0.071, 0.028, 1.064]), so while the angular error is
-            # of order sigma, position cannot tell two daughters apart and pt
+            # daughters are collimated (angular sigma on z_train =
+            # [0.0372, 0.0749]), so while the angular error is
+            # of order sigma, position cannot tell two daughters apart and momentum
             # and identity -- learned first -- have to carry the decision.
             # Angles at 1/sigma (20) drowned them out: on synthetic daughters
             # with 1-sigma noise the intended assignment was recovered 71% of
             # the time and 46% of assignments changed between two noise draws,
             # against 93% / 11% for the first model's unweighted cost. With 5
             # and the clipped class cost below: 94% / 10% early, 99.4% / 0.9%
-            # late. sin_dphi and cos_dphi MUST share a weight (together they
-            # encode the angle). log_mass_ratio stays low: only ~5% of its
+            # late. log_mass_ratio stays low: only ~5% of its
             # variance is the daughter's own, the rest is the jet mass shared by
             # every query in the jet, so it says little about WHICH daughter.
             # 0 with loss.mass_from_meson_class: the mass channel is then
             # untrained and must not steer the assignment either.
-            kinematics_component_weights: [1.0, 5.0, 5.0, 5.0, 0.2]
+            kinematics_component_weights: [1.0, 5.0, 5.0, 0.2]
             # How the charge and PDG terms enter the MATCHING cost (not the
             # loss). "clipped_nll" is -log p(true class) clamped at
             # classification_cost_clip: sharp enough that identity decides a tie
@@ -217,9 +216,9 @@ model:
         # they are properties of the data, not tuning knobs. To reproduce the numbers:
         # ./run.sh python mltau/scripts/measure_kinematics_scales.py --model DETR
         kinematics_scales:
-            log_pt: 0.868
-            delta_eta: 0.0698
-            phi_chord: 0.0727
+            log_p: 0.869
+            delta_theta: 0.0359
+            delta_phi: 0.0717
             log_mass: 1.01
         # With the residuals scaled, equal weights give each component an equal
         # share. log_mass is the one worth reconsidering rather than reweighting:
@@ -227,9 +226,9 @@ model:
         # identity, the other 95% is the jet mass, which every query in the jet
         # would be re-deriving. See the note in the loss docstring.
         kinematics_weights:
-            log_pt: 1.0
-            delta_eta: 1.0
-            phi_chord: 1.0
+            log_p: 1.0
+            delta_theta: 1.0
+            delta_phi: 1.0
             # 0 with detr.loss.mass_from_meson_class (see there).
             log_mass: 1.0
 
