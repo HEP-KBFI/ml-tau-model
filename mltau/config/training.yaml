@@ -1,5 +1,15 @@
 training:
     debug_run: False
+    # DataModule train.py instantiates: "ParT" (mltau.tools.io.ParT_dataloader.
+    # ParTDataModule, the default) or "RareDecays" (mltau.tools.io.
+    # RareDecays_dataloader.RareDecaysDataModule, whose decay_mode target is
+    # gen_jet_tau_decaymode_rare instead of the standard 6-class reduction;
+    # pair it with model.decay_mode_scheme: rare and num_dm_classes: 13 below).
+    datamodule: ParT # ParT | RareDecays
+    # Continue from <output_dir>/models/last.ckpt (written every epoch) if it
+    # exists, e.g. after a crashed or preempted job. Off by default: a new run
+    # in a reused output_dir would otherwise silently continue the old one.
+    resume: false
     # OneCycleLR's max_lr (see ParTauDETR_module.configure_optimizers). This is
     # the peak, reached at pct_start * total_steps; the schedule starts at
     # lr/25 and anneals to ~0 afterwards. At 1e-3 the 2026-09-20 run was healthy
@@ -12,6 +22,18 @@ training:
         name: MultiParTau # MultiParTau | SingleParTau
         backbone: ParT # ParT | Mixer (SingleParTau only; the Mixer wants dataset.sort_by_pt)
         task: is_tau # SingleParTau only: is_tau | charge | decay_mode | kinematics
+        # SingleParTau task: decay_mode only, below.
+        # decay_mode_scheme selects which gen_jet_tau_decaymode* column the
+        # dataloader's decay_mode target is built from, and must match the
+        # dataset in use: "standard" is the 6-class reduction of
+        # gen_jet_tau_decaymode (mltau.tools.general.get_reduced_decaymodes),
+        # paired with the default ParTDataModule; "rare" is the 13-class
+        # gen_jet_tau_decaymode_rare scheme, paired with training.datamodule:
+        # RareDecays (see main_RareDecays.yaml). num_dm_classes must equal
+        # len(mltau.tools.general.DECAY_MODE_CLASS_SCHEMES[decay_mode_scheme]),
+        # since it fixes the classification head's output width.
+        num_dm_classes: 6
+        decay_mode_scheme: standard # standard | rare
         # ParT encoder architecture. Set explicitly: the modules fall back to
         # their own defaults when a key is missing (num_layers defaults to 8),
         # so an absent key is a silent architecture change, not "the usual".
