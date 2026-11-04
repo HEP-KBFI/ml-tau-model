@@ -12,6 +12,7 @@ from mltau.models.ParTauDETR_module import ParTauDETRModule
 from mltau.tools.general import reinitialize_p4
 from mltau.tools.io.ParTauDETR_dataloader import ParticleTransformerDETRDataset
 from mltau.models.ParTauDETR import decode_kinematics as decode_kinematics_p4
+from mltau.tools.meson_classes import CHARGED_PION_MASS_GEV, NEUTRAL_PION_MASS_GEV
 from mltau.tools.tau_id import TauIDClass
 
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
@@ -127,7 +128,9 @@ def _predicted_components(outputs, reco_jet_p4s, mass_from_class: bool = False):
 
     fixed_mass = None
     if mass_from_class:
-        mass_lut = outputs["pred_kinematics"].new_tensor([0.13957, 0.13498])
+        mass_lut = outputs["pred_kinematics"].new_tensor(
+            [CHARGED_PION_MASS_GEV, NEUTRAL_PION_MASS_GEV]
+        )
         fixed_mass = mass_lut[pred_meson_class]
 
     pred_p4_tensor = decode_kinematics_p4(

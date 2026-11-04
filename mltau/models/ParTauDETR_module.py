@@ -14,7 +14,14 @@ from mltau.tools.tau_id import TauIDClass, tau_id_classes
 from mltau.tools.io.general import BatchInputs
 from mltau.tools.logging import set_to_set as s2s
 from mltau.tools.losses import TauLoss
-from mltau.tools.meson_classes import MesonClass, get_meson_classes
+from mltau.tools.meson_classes import (
+    CHARGED_HADRON_PDG,
+    CHARGED_PION_MASS_GEV,
+    NEUTRAL_HADRON_PDG,
+    NEUTRAL_PION_MASS_GEV,
+    MesonClass,
+    get_meson_classes,
+)
 from mltau.models.ParTauDETR import decode_kinematics
 
 try:  # scipy's LAPJVsp solver is ~10x faster than the pure-python fallback below
@@ -471,7 +478,7 @@ class SetCriterion(nn.Module):
             "meson_class_mass",
             torch.tensor(
                 [
-                    0.13498 if set(c.charges) == {0} else 0.13957
+                    NEUTRAL_PION_MASS_GEV if set(c.charges) == {0} else CHARGED_PION_MASS_GEV
                     for c in meson_classes
                 ],
                 dtype=torch.float32,
@@ -1505,7 +1512,10 @@ class ParTauDETRModule(L.LightningModule):
         self.register_buffer(
             "meson_class_repr_pdg",
             torch.tensor(
-                [130 if set(c.charges) == {0} else 211 for c in meson_classes],
+                [
+                    NEUTRAL_HADRON_PDG if set(c.charges) == {0} else CHARGED_HADRON_PDG
+                    for c in meson_classes
+                ],
                 dtype=torch.long,
             ),
             persistent=False,
@@ -1925,7 +1935,7 @@ class ParTauDETRModule(L.LightningModule):
         with torch.no_grad():
             # Charged or neutral, per predicted and per true daughter: the
             # decay-mode objective of the scan counts prongs and neutrals.
-            charged_class = self.meson_class_repr_pdg.to(self.device) == 211
+            charged_class = self.meson_class_repr_pdg.to(self.device) == CHARGED_HADRON_PDG
             pred_charged = charged_class[outputs["pred_meson_class_logits"].argmax(-1)]
             true_charged = charged_class[targets["particles_meson_class_ohe"][signal].argmax(-1)]
             scores = torch.softmax(outputs["pred_logits"].float(), dim=-1)[..., 0]

@@ -232,21 +232,10 @@ model:
             # 0 with detr.loss.mass_from_meson_class (see there).
             log_mass: 1.0
 
-# ParTauDETR-specific overrides of training.yaml (hence _self_ last below).
-training:
-    # With the signed angular / impact-parameter inputs, peak LR 3e-4 diverged
-    # in 4 runs once the combined losses above were on; 2e-4 was stable over
-    # two seeds and a 120-epoch run.
-    lr: 0.0003
-    # Standardise the continuous candidate inputs (see training.yaml). The
-    # signed impact-parameter significances reach |s| ~ 1e4 unscaled.
-    input_scaling:
-        enabled: false
-
-# `_self_` last so the `training:` block above wins over training.yaml. No
-# other key here overlaps with the files below.
+# Load the shared training settings before the ParTauDETR-specific overrides.
 defaults:
     - metrics/metrics
     - dataset_ParTauDETR
     - training
+    - training_ParTauDETR
     - _self_

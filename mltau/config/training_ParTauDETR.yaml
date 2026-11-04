@@ -1,0 +1,12 @@
+# ParTauDETR-specific overrides of training.yaml.
+training:
+    # With the signed angular / impact-parameter inputs, peak LR 3e-4 diverged
+    # in 4 runs once the combined losses above were on; 2e-4 was stable over
+    # two seeds and a 120-epoch run.
+    lr: 0.0003
+    trainer:
+        max_epochs: 120
+    # Standardise the continuous candidate inputs (see training.yaml). The
+    # signed impact-parameter significances reach |s| ~ 1e4 unscaled.
+    input_scaling:
+        enabled: false
