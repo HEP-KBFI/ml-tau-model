@@ -109,8 +109,10 @@ _CANDIDATE_FIELDS = (
     "reco_cand_charges",
     "reco_cand_pdgs",
     "reco_cand_dz",
+    "reco_cand_signed_dz",
     "reco_cand_dz_error",
     "reco_cand_dxy",
+    "reco_cand_signed_dxy",
     "reco_cand_dxy_error",
 )
 

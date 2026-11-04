@@ -18,7 +18,7 @@ from mltau.tools.meson_classes import (
     pdg_to_meson_class_indices,
 )
 
-from ntupelizer.tools.tau_decaymode import MIXED_DECAY_MODE
+from ntupelizer.tools.tau_decaymode import MIXED_DECAY_MODE, classify_decay_modes
 
 class ParticleTransformerDETRDataset(ParticleTransformerDataset):
     """
@@ -145,6 +145,21 @@ class ParticleTransformerDETRDataset(ParticleTransformerDataset):
         return pdg_to_meson_class_indices(
             raw_pdg, self.cfg.dataset.tau_daughter_pdg_ids
         )
+
+    def _daughter_cut_mask(self, data: ak.Array, cfg=None):
+        cfg = self.cfg if cfg is None else cfg
+        daughter_p4 = data.gen_jet_tau_vis_daughter_p4s
+        daughter_charge = data.gen_jet_tau_vis_daughter_charges
+        if not daughter_p4.fields:
+            return ak.ones_like(daughter_charge, dtype=np.bool_)
+        charged_pt_cut = float(cfg.dataset.get("tau_daughter_charged_pt_cut", -1.0))
+        neutral_p_cut = float(cfg.dataset.get("tau_daughter_neutral_p_cut", -1.0))
+        daughter_pt = p4_field(daughter_p4, "pt")
+        passes_charged = (charged_pt_cut < 0) | (daughter_pt >= charged_pt_cut)
+        passes_neutral = (neutral_p_cut < 0) | (
+            daughter_pt * np.cosh(p4_field(daughter_p4, "eta")) >= neutral_p_cut
+        )
+        return ak.where(daughter_charge == 0, passes_neutral, passes_charged)
 
     def build_tensors(self, data: ak.Array):
         if self.cfg.dataset.get("sort_by_pt", False):
@@ -308,13 +323,10 @@ class ParticleTransformerDETRDataset(ParticleTransformerDataset):
         tau_id[muon_count == 1] = 3
         is_hadronic_tau = tau_id == 1
 
-        daughter_pt_cut = float(self.cfg.dataset.get("tau_daughter_pt_cut", -1.0))
-        if daughter_pt_cut >= 0.0 and len(daughter_p4.fields) > 0:
-            daughter_pt = self._get_record_field(daughter_p4, ["pt", "rho"])
-            passes_pt_cut = daughter_pt >= daughter_pt_cut
-            daughter_p4 = daughter_p4[passes_pt_cut]
-            daughter_pdg_jag = daughter_pdg_jag[passes_pt_cut]
-            daughter_charge_jag = daughter_charge_jag[passes_pt_cut]
+        passes_cut = self._daughter_cut_mask(data)
+        daughter_p4 = daughter_p4[passes_cut]
+        daughter_pdg_jag = daughter_pdg_jag[passes_cut]
+        daughter_charge_jag = daughter_charge_jag[passes_cut]
 
         daughter_pdg_abs = abs(daughter_pdg_jag)
         supported_ids = [
@@ -535,7 +547,27 @@ class ParticleTransformerDETRDataset(ParticleTransformerDataset):
 
 
 class ParticleTransformerDETRTrainingDataset(ParticleTransformerDETRDataset):
-    """Exclude mixed decay mode for train/validation with exact row counts."""
+    """Exclude mixed modes and post-cut charge/decay-mode changes from fit data."""
+
+    def _fit_row_mask(self, data: ak.Array, cfg=None):
+        cfg = self.cfg if cfg is None else cfg
+        keep = data.gen_jet_tau_decaymode != MIXED_DECAY_MODE
+        if (
+            float(cfg.dataset.get("tau_daughter_charged_pt_cut", -1.0)) < 0
+            and float(cfg.dataset.get("tau_daughter_neutral_p_cut", -1.0)) < 0
+        ):
+            return keep
+        daughter_pdgs = data.gen_jet_tau_vis_daughter_pdgs
+        daughter_charges = data.gen_jet_tau_vis_daughter_charges
+        passes_cut = self._daughter_cut_mask(data, cfg)
+        original_modes = classify_decay_modes(daughter_pdgs)
+        retained_modes = classify_decay_modes(daughter_pdgs[passes_cut])
+        retained_charge = ak.sum(daughter_charges[passes_cut], axis=-1)
+        signal = data.gen_jet_tau_decaymode != -1
+        return keep & (~signal | (
+            (original_modes == retained_modes)
+            & (retained_charge == data.gen_jet_tau_charge)
+        ))
 
     def __init__(self, row_groups, cfg, **kwargs):
         import pyarrow.parquet as pq
@@ -549,10 +581,19 @@ class ParticleTransformerDETRTrainingDataset(ParticleTransformerDETRDataset):
         for filename, groups in by_file.items():
             with pq.ParquetFile(filename) as parquet:
                 for group in groups:
-                    data = ak.from_arrow(parquet.read_row_group(
-                        group.row_group, columns=["gen_jet_tau_decaymode"]
-                    ))
-                    retained_rows = int(ak.sum(data.gen_jet_tau_decaymode != MIXED_DECAY_MODE))
+                    columns = ["gen_jet_tau_decaymode"]
+                    if (
+                        float(cfg.dataset.get("tau_daughter_charged_pt_cut", -1.0)) >= 0
+                        or float(cfg.dataset.get("tau_daughter_neutral_p_cut", -1.0)) >= 0
+                    ):
+                        columns += [
+                            "gen_jet_tau_charge",
+                            "gen_jet_tau_vis_daughter_p4s",
+                            "gen_jet_tau_vis_daughter_pdgs",
+                            "gen_jet_tau_vis_daughter_charges",
+                        ]
+                    data = ak.from_arrow(parquet.read_row_group(group.row_group, columns=columns))
+                    retained_rows = int(ak.sum(self._fit_row_mask(data, cfg)))
                     excluded_rows += len(data) - retained_rows
                     if retained_rows:
                         retained_groups.append(
@@ -560,13 +601,13 @@ class ParticleTransformerDETRTrainingDataset(ParticleTransformerDETRDataset):
                         )
 
         print(
-            f"[dataset] Excluded {excluded_rows:,} decay-mode-{MIXED_DECAY_MODE} jets from fit-stage dataset.",
+            f"[dataset] Excluded {excluded_rows:,} mixed-mode or cut-inconsistent jets from fit-stage dataset.",
             flush=True,
         )
         super().__init__(row_groups=retained_groups, cfg=cfg, **kwargs)
 
     def build_tensors(self, data: ak.Array):
-        return super().build_tensors(data[data.gen_jet_tau_decaymode != MIXED_DECAY_MODE])
+        return super().build_tensors(data[self._fit_row_mask(data)])
 
 
 class ParTauDETRDataModule(ParTDataModule):
@@ -575,8 +616,8 @@ class ParTauDETRDataModule(ParTDataModule):
 
     File discovery, the train/val split, the scaler fit and the stratified
     batch composition are all the base class's. Training, validation and scaler
-    fitting exclude mixed leptonic and hadronic decay mode; testing and
-    inference retain all modes.
+    fitting exclude mixed leptonic/hadronic modes and taus whose charge or
+    decay mode changes under daughter cuts; testing and inference retain all modes.
     """
 
     dataset_cls = ParticleTransformerDETRDataset

@@ -33,6 +33,7 @@ from mltau.tools.io.ParT_dataloader import (  # noqa: E402
 from mltau.tools.io.ParTauDETR_dataloader import (  # noqa: E402
     ParTauDETRDataModule,
     ParticleTransformerDETRDataset,
+    ParticleTransformerDETRTrainingDataset,
 )
 
 CONFIG_DIR = Path(__file__).resolve().parents[1] / "mltau" / "config"
@@ -149,6 +150,48 @@ def check_signed_candidate_sorting():
     assert ak.to_list(sorted_data.reco_cand_signed_dxy) == [[0.12, -0.04]]
 
 
+def test_detr_daughter_cuts():
+    cfg = compose("main_ParTauDETR.yaml", "dataset_ParTauDETR.yaml", 2)
+    cfg.dataset.tau_daughter_charged_pt_cut = 1.0
+    cfg.dataset.tau_daughter_neutral_p_cut = 0.5
+    data = ak.Array([
+        {
+            "gen_jet_tau_decaymode": 0, "gen_jet_tau_charge": 1,
+            "gen_jet_tau_vis_daughter_pdgs": [211],
+            "gen_jet_tau_vis_daughter_charges": [1],
+            "gen_jet_tau_vis_daughter_p4s": [
+                {"pt": 0.4, "eta": 0.0, "phi": 0.0, "mass": 0.14}
+            ],
+        },
+        {
+            "gen_jet_tau_decaymode": 1, "gen_jet_tau_charge": 1,
+            "gen_jet_tau_vis_daughter_pdgs": [211, 111],
+            "gen_jet_tau_vis_daughter_charges": [1, 0],
+            "gen_jet_tau_vis_daughter_p4s": [
+                {"pt": 2.0, "eta": 0.0, "phi": 0.0, "mass": 0.14},
+                {"pt": 0.3, "eta": 0.0, "phi": 0.0, "mass": 0.135},
+            ],
+        },
+        {
+            "gen_jet_tau_decaymode": 1, "gen_jet_tau_charge": 1,
+            "gen_jet_tau_vis_daughter_pdgs": [211, 111],
+            "gen_jet_tau_vis_daughter_charges": [1, 0],
+            "gen_jet_tau_vis_daughter_p4s": [
+                {"pt": 2.0, "eta": 0.0, "phi": 0.0, "mass": 0.14},
+                {"pt": 0.3, "eta": 2.0, "phi": 0.0, "mass": 0.135},
+            ],
+        },
+    ])
+    dataset = object.__new__(ParticleTransformerDETRTrainingDataset)
+    assert ak.to_list(dataset._daughter_cut_mask(data, cfg)) == [
+        [False], [True, False], [True, True]
+    ]
+    assert ak.to_list(dataset._fit_row_mask(data, cfg)) == [False, False, True]
+    cfg.dataset.tau_daughter_charged_pt_cut = -1.0
+    cfg.dataset.tau_daughter_neutral_p_cut = -1.0
+    assert ak.to_list(dataset._fit_row_mask(data, cfg)) == [True, True, True]
+
+
 def run(main: str, dataset: str, module_cls, label: str, batch_size: int = 256):
     print(f"[{label}]")
     cfg = compose(main, dataset, batch_size)
@@ -165,6 +208,7 @@ if __name__ == "__main__":
     torch.manual_seed(0)
     check_tau_daughter_sorting()
     check_signed_candidate_sorting()
+    test_detr_daughter_cuts()
     run("main.yaml", "dataset.yaml", ParTDataModule, "ParT data module")
     run("main_ParTauDETR.yaml", "dataset_ParTauDETR.yaml", ParTauDETRDataModule, "DETR data module")
     print("\nAll dataloader tests passed.")
