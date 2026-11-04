@@ -9,7 +9,8 @@ import torch.nn as nn
 import torch.nn.functional as F
 from omegaconf import DictConfig, OmegaConf
 
-from mltau.models.ParTauDETR import ParTauDETR, TAU_ID_CLASS_NAMES
+from mltau.models.ParTauDETR import ParTauDETR
+from mltau.tools.tau_id import TauIDClass, tau_id_classes
 from mltau.tools.io.general import BatchInputs
 from mltau.tools.logging import set_to_set as s2s
 from mltau.tools.losses import TauLoss
@@ -897,7 +898,7 @@ class SetCriterion(nn.Module):
         device = pred_logits.device
 
         if target_tau_id is not None:
-            signal_mask = target_tau_id == 1
+            signal_mask = target_tau_id == TauIDClass.HADRONIC_TAU
         elif target_is_tau is not None:
             signal_mask = target_is_tau.bool()
         else:
@@ -1367,6 +1368,7 @@ class ParTauDETRModule(L.LightningModule):
         arch = cfg.model
         encoder_cfg = arch.encoder
         detr_cfg = arch.detr
+        self.tau_id_class_names, _ = tau_id_classes(cfg)
 
         num_charge_classes = int(arch.num_charge_classes)
         if num_charge_classes != 3:
@@ -1433,6 +1435,7 @@ class ParTauDETRModule(L.LightningModule):
             decoder_dropout=float(detr_cfg.decoder_dropout),
             append_global_token=bool(detr_cfg.append_global_token),
             tau_id_head=bool(detr_cfg.tau_id_head),
+            num_tau_id_classes=len(self.tau_id_class_names),
             head_dropout=float(detr_cfg.head_dropout),
             aux_loss=bool(detr_cfg.get("aux_loss", False)),
             for_inference=False,
@@ -1666,7 +1669,7 @@ class ParTauDETRModule(L.LightningModule):
         )
 
         if "tau_id" in targets:
-            target_is_tau = (targets["tau_id"] == 1).long()
+            target_is_tau = (targets["tau_id"] == TauIDClass.HADRONIC_TAU).long()
         elif "is_tau" in targets:
             target_is_tau = targets["is_tau"].long()
         else:
@@ -2112,7 +2115,7 @@ class ParTauDETRModule(L.LightningModule):
             return
         labels = targets["tau_id"].long()
         predictions = outputs["is_tau"].detach().argmax(dim=-1)
-        num_classes = len(TAU_ID_CLASS_NAMES)
+        num_classes = len(self.tau_id_class_names)
         counts = torch.bincount(labels, minlength=num_classes)
         weight_sums = torch.bincount(
             labels, weights=weights.detach().float(), minlength=num_classes
@@ -2121,7 +2124,7 @@ class ParTauDETRModule(L.LightningModule):
             f"{stage}_tau_id/accuracy", (predictions == labels).float().mean(),
             on_step=False, on_epoch=True, batch_size=labels.numel(), sync_dist=True,
         )
-        for class_index, class_name in enumerate(TAU_ID_CLASS_NAMES):
+        for class_index, class_name in enumerate(self.tau_id_class_names):
             for metric, values in (("count", counts), ("weight_sum", weight_sums)):
                 self.log(
                     f"{stage}_tau_id/{class_name}/{metric}", values[class_index].float(),
@@ -2132,8 +2135,8 @@ class ParTauDETRModule(L.LightningModule):
             confusion = torch.bincount(
                 labels * num_classes + predictions, minlength=num_classes**2
             ).reshape(num_classes, num_classes)
-            for truth_index, truth_name in enumerate(TAU_ID_CLASS_NAMES):
-                for pred_index, pred_name in enumerate(TAU_ID_CLASS_NAMES):
+            for truth_index, truth_name in enumerate(self.tau_id_class_names):
+                for pred_index, pred_name in enumerate(self.tau_id_class_names):
                     self.log(
                         f"val_tau_id/confusion/{truth_name}/{pred_name}",
                         confusion[truth_index, pred_index].float(),
@@ -2481,9 +2484,9 @@ class ParTauDETRModule(L.LightningModule):
             result["is_tau_logits"] = outputs["is_tau"]
             probabilities = torch.softmax(outputs["is_tau"].float(), dim=-1)
             result["tau_id_probs"] = probabilities
-            result["is_tau"] = probabilities[..., 1]
-            result["is_tau_electron"] = probabilities[..., 2]
-            result["is_tau_muon"] = probabilities[..., 3]
+            result["is_tau"] = probabilities[..., TauIDClass.HADRONIC_TAU]
+            result["is_tau_electron"] = probabilities[..., TauIDClass.TAU_ELECTRON]
+            result["is_tau_muon"] = probabilities[..., TauIDClass.TAU_MUON]
             result["pred_mask_objectness"] = pred_mask
             tagged = result["is_tau"] >= self.tau_id_threshold
             result["pred_mask"] = pred_mask & tagged[:, None]

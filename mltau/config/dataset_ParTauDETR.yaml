@@ -25,7 +25,7 @@ dataset:
     # 4-momentum remains inclusive when cuts are enabled.
     tau_daughter_charged_pt_cut: 0.1
     tau_daughter_neutral_p_cut: 0.5
-    data_dir: /scratch/persistent/karl/ml-tau/1027_ParTauDETR_dataset
+    data_dir: /scratch/persistent/karl/ml-tau/1103_ParTauDETR_dataset
 
     # Meson classes for daughter one-hot encoding. Mapping order defines class
     # indices and charges defines valid charge-head combinations. All unlisted
@@ -47,6 +47,16 @@ dataset:
     max_jets_per_sample:
         z: null
         qq: 10_000_000
+        mm: null
+        bhabha: null
+    # Class 0 is the combined background of the samples listed under
+    # background_classes.background (qq, mm and bhabha below). Hadronic tau,
+    # tau electron and tau muon remain classes 1, 2 and 3. Additional groups
+    # get classes 4 and up; move samples there to classify them separately.
+    # For example, background: [qq], leptonic_background: [mm, bhabha] gives
+    # five classes. background: [qq], mm: [mm], bhabha: [bhabha] gives six.
+    background_classes:
+        background: [qq, mm, bhabha]
     selection_seed: 42
 
     relative_sizes:

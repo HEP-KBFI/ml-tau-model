@@ -12,6 +12,7 @@ from mltau.models.ParTauDETR_module import ParTauDETRModule
 from mltau.tools.general import reinitialize_p4
 from mltau.tools.io.ParTauDETR_dataloader import ParticleTransformerDETRDataset
 from mltau.models.ParTauDETR import decode_kinematics as decode_kinematics_p4
+from mltau.tools.tau_id import TauIDClass
 
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 
@@ -142,7 +143,7 @@ def _predicted_components(outputs, reco_jet_p4s, mass_from_class: bool = False):
 
 
 def tau_id_probabilities(outputs):
-    """Probabilities ordered as background, hadronic tau, tau electron, tau muon."""
+    """Probabilities: background, hadronic tau, electron, muon, then other backgrounds."""
     if "is_tau" not in outputs:
         return None
     return torch.softmax(outputs["is_tau"].float(), dim=-1)
@@ -151,7 +152,7 @@ def tau_id_probabilities(outputs):
 def tau_scores(outputs):
     """p(hadronic tau) per jet, or None if the model has no ID head."""
     probabilities = tau_id_probabilities(outputs)
-    return None if probabilities is None else probabilities[..., 1]
+    return None if probabilities is None else probabilities[..., TauIDClass.HADRONIC_TAU]
 
 
 def get_predicted_particles(

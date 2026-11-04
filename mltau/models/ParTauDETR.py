@@ -6,8 +6,6 @@ from torch import nn
 
 from mltau.models.ParticleTransformer import ParticleTransformer
 
-TAU_ID_CLASS_NAMES = ("background", "hadronic_tau", "tau_electron", "tau_muon")
-
 
 def decode_kinematics(
     kinematics: torch.Tensor,
@@ -98,7 +96,8 @@ class ParTauDETR(ParticleTransformer):
       - pred_meson_class_logits: configured meson classification logits
 
     Jet-level head:
-      - is_tau: logits ordered as background, hadronic tau, tau electron, tau muon.
+      - is_tau: logits ordered as configured background class, hadronic tau,
+                tau electron, tau muon, then any additional background classes.
     """
 
     def __init__(
@@ -116,6 +115,7 @@ class ParTauDETR(ParticleTransformer):
         # jet-level readout head configuration
         head_dropout: float = 0.1,
         tau_id_head: bool = True,
+        num_tau_id_classes: int = 4,
         # encoder configuration (same as parent)
         pair_input_dim: int = 4,
         pair_extra_dim: int = 0,
@@ -217,7 +217,7 @@ class ParTauDETR(ParticleTransformer):
                 nn.Linear(embed_dim, head_hidden),
                 nn.GELU() if activation == "gelu" else nn.ReLU(),
                 nn.Dropout(head_dropout / 2),
-                nn.Linear(head_hidden, len(TAU_ID_CLASS_NAMES)),
+                nn.Linear(head_hidden, num_tau_id_classes),
             )
         else:
             self.tau_head = None

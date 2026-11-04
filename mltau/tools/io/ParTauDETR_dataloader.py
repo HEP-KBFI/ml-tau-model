@@ -10,7 +10,9 @@ from mltau.tools.io.ParT_dataloader import (
     impact_parameter_features,
     p4_field,
     sort_candidates_by_pt,
+    sample_name,
 )
+from mltau.tools.tau_id import TauIDClass, tau_id_classes
 from mltau.tools.io import input_scaling as scaling
 from mltau.tools.io.general import RowGroup
 from mltau.tools.meson_classes import (
@@ -35,7 +37,8 @@ class ParticleTransformerDETRDataset(ParticleTransformerDataset):
           [log(p_dau/p_jet), delta_theta(dau-jet), delta_phi(dau-jet), log(m_dau/m_jet)]
       - particles_charge_ohe: [N, T, 3] one-hot for charges [-1, 0, +1]
       - particles_meson_class_ohe: [N, T, C] one-hot over configured meson classes
-      - tau_id: [N], 0=background, 1=hadronic tau, 2=tau electron, 3=tau muon
+      - tau_id: [N], 0=first background group, 1=hadronic tau,
+        2=tau electron, 3=tau muon, 4+=other configured background groups
       - is_tau: [N], true only for hadronic taus (reconstruction supervision)
 
     where T = cfg.dataset.max_tau_daughters if provided, otherwise inferred from
@@ -161,7 +164,33 @@ class ParticleTransformerDETRDataset(ParticleTransformerDataset):
         )
         return ak.where(daughter_charge == 0, passes_neutral, passes_charged)
 
-    def build_tensors(self, data: ak.Array):
+    def _build_read_tensors(self, data, filename):
+        return self.build_tensors(data, sample=sample_name(filename))
+
+    def _tau_id_targets(self, data: ak.Array, sample: str | None):
+        daughter_pdgs = data.gen_jet_tau_vis_daughter_pdgs
+        electron_count = ak.to_numpy(ak.sum(abs(daughter_pdgs) == 11, axis=-1))
+        muon_count = ak.to_numpy(ak.sum(abs(daughter_pdgs) == 13, axis=-1))
+        if np.any(electron_count + muon_count > 1):
+            raise ValueError("Expected at most one electron or muon among truth tau daughters.")
+        tau_id = np.where(
+            ak.to_numpy(data.gen_jet_tau_decaymode) != -1,
+            TauIDClass.HADRONIC_TAU,
+            TauIDClass.BACKGROUND,
+        ).astype(np.int64)
+        tau_id[electron_count == 1] = TauIDClass.TAU_ELECTRON
+        tau_id[muon_count == 1] = TauIDClass.TAU_MUON
+        if sample is not None:
+            _, background_samples = tau_id_classes(self.cfg)
+            if sample != "z":
+                if sample not in background_samples:
+                    raise ValueError(f"Unconfigured tau-ID sample: {sample}")
+                if np.any(tau_id != TauIDClass.BACKGROUND):
+                    raise ValueError(f"Background sample {sample} contains tau truth labels.")
+                tau_id[:] = background_samples[sample]
+        return tau_id
+
+    def build_tensors(self, data: ak.Array, sample: str | None = None):
         if self.cfg.dataset.get("sort_by_pt", False):
             data = sort_candidates_by_pt(data)
         # -------------------------
@@ -314,14 +343,8 @@ class ParticleTransformerDETRDataset(ParticleTransformerDataset):
         daughter_p4 = data.gen_jet_tau_vis_daughter_p4s
         daughter_charge_jag = data.gen_jet_tau_vis_daughter_charges
 
-        electron_count = ak.to_numpy(ak.sum(abs(daughter_pdg_jag) == 11, axis=-1))
-        muon_count = ak.to_numpy(ak.sum(abs(daughter_pdg_jag) == 13, axis=-1))
-        if np.any(electron_count + muon_count > 1):
-            raise ValueError("Expected at most one electron or muon among truth tau daughters.")
-        tau_id = (ak.to_numpy(data.gen_jet_tau_decaymode) != -1).astype(np.int64)
-        tau_id[electron_count == 1] = 2
-        tau_id[muon_count == 1] = 3
-        is_hadronic_tau = tau_id == 1
+        tau_id = self._tau_id_targets(data, sample)
+        is_hadronic_tau = tau_id == TauIDClass.HADRONIC_TAU
 
         passes_cut = self._daughter_cut_mask(data)
         daughter_p4 = daughter_p4[passes_cut]
@@ -606,8 +629,8 @@ class ParticleTransformerDETRTrainingDataset(ParticleTransformerDETRDataset):
         )
         super().__init__(row_groups=retained_groups, cfg=cfg, **kwargs)
 
-    def build_tensors(self, data: ak.Array):
-        return super().build_tensors(data[self._fit_row_mask(data)])
+    def build_tensors(self, data: ak.Array, sample: str | None = None):
+        return super().build_tensors(data[self._fit_row_mask(data)], sample=sample)
 
 
 class ParTauDETRDataModule(ParTDataModule):
@@ -627,5 +650,19 @@ class ParTauDETRDataModule(ParTDataModule):
         super().__init__(cfg=cfg, debug_run=debug_run)
         if cfg.model.detr.tau_id_head:
             self.sample = "*"
+
+    def _resolve_input_paths(self, pattern: str, dataset_type: str) -> list:
+        paths = super()._resolve_input_paths(pattern, dataset_type)
+        if not self.cfg.model.detr.tau_id_head:
+            return paths
+        _, backgrounds = tau_id_classes(self.cfg)
+        wanted = {"z", *backgrounds}
+        selected = [path for path in paths if sample_name(path) in wanted]
+        missing = wanted - {sample_name(path) for path in selected}
+        if missing:
+            raise FileNotFoundError(
+                f"No {dataset_type} files for configured tau-ID samples: {sorted(missing)}"
+            )
+        return selected
 
 

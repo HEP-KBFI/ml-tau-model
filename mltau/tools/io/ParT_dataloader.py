@@ -736,9 +736,12 @@ class ParticleTransformerDataset(IterableDataset):
                 row_groups=row_group_indices,
                 columns=self._NEEDED_COLUMNS,
             )
-        tensors = self.build_tensors(data)
+        tensors = self._build_read_tensors(data, filename)
         del data
         return tensors
+
+    def _build_read_tensors(self, data, filename):
+        return self.build_tensors(data)
 
     @staticmethod
     def _concat_tensors(parts: list[tuple]):
