@@ -10,6 +10,7 @@ from scipy.optimize import linear_sum_assignment
 
 from mltau.models.ParTauDETR_module import ParTauDETRModule
 from mltau.tools.general import reinitialize_p4
+from mltau.tools.io.ParT_dataloader import sample_name
 from mltau.tools.io.ParTauDETR_dataloader import ParticleTransformerDETRDataset
 from mltau.models.ParTauDETR import decode_kinematics as decode_kinematics_p4
 from mltau.tools.meson_classes import CHARGED_PION_MASS_GEV, NEUTRAL_PION_MASS_GEV
@@ -392,11 +393,10 @@ def calculate_metrics(matches, target_meson_class, pred_meson_class):
     )
 
 
-def load_model(checkpoint_path, cfg):
+def load_model(checkpoint_path, cfg=None):
+    kwargs = {"cfg": cfg} if cfg is not None else {}
     model = ParTauDETRModule.load_from_checkpoint(
-        checkpoint_path=checkpoint_path,
-        map_location=DEVICE,
-        cfg=cfg,
+        checkpoint_path=checkpoint_path, map_location=DEVICE, **kwargs
     )
     model.to(DEVICE)
     model.eval()
@@ -407,10 +407,13 @@ def model_inference(checkpoint_path, data_path, cfg, model=None):
     if model is None:
         model = load_model(checkpoint_path, cfg)
     data_paths = [data_path] if isinstance(data_path, (str, bytes)) else data_path
+    samples = {sample_name(path) for path in data_paths}
+    if len(samples) != 1:
+        raise ValueError("model_inference requires input files from one sample at a time.")
     data = ak.concatenate([ak.from_parquet(path) for path in data_paths])
     print(f"Read {len(data):,} jets from {len(data_paths)} parquet files.", flush=True)
     ds = ParticleTransformerDETRDataset.for_arrays(cfg)
-    batch = ds.build_tensors(data)
+    batch = ds.build_tensors(data, sample=samples.pop())
 
     reco_jet_p4s = batch[6]
 
