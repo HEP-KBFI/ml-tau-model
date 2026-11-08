@@ -2130,16 +2130,19 @@ class ParTauDETRModule(L.LightningModule):
         weight_sums = torch.bincount(
             labels, weights=weights.detach().float(), minlength=num_classes
         )
+        num_jets = labels.numel()
         self.log(
             f"{stage}_tau_id/accuracy", (predictions == labels).float().mean(),
-            on_step=False, on_epoch=True, batch_size=labels.numel(), sync_dist=True,
+            on_step=False, on_epoch=True, batch_size=num_jets, sync_dist=True,
         )
         for class_index, class_name in enumerate(self.tau_id_class_names):
-            for metric, values in (("count", counts), ("weight_sum", weight_sums)):
+            for metric, fraction in (
+                ("fraction", counts[class_index].float() / num_jets),
+                ("weight_fraction", weight_sums[class_index] / weight_sums.sum().clamp_min(1e-8)),
+            ):
                 self.log(
-                    f"{stage}_tau_id/{class_name}/{metric}", values[class_index].float(),
-                    on_step=False, on_epoch=True, reduce_fx="sum", sync_dist=True,
-                    batch_size=labels.numel(),
+                    f"{stage}_tau_id/{class_name}/{metric}", fraction,
+                    on_step=False, on_epoch=True, batch_size=num_jets, sync_dist=True,
                 )
         if stage == "val":
             confusion = torch.bincount(
@@ -2149,9 +2152,9 @@ class ParTauDETRModule(L.LightningModule):
                 for pred_index, pred_name in enumerate(self.tau_id_class_names):
                     self.log(
                         f"val_tau_id/confusion/{truth_name}/{pred_name}",
-                        confusion[truth_index, pred_index].float(),
-                        on_step=False, on_epoch=True, reduce_fx="sum", sync_dist=True,
-                        batch_size=labels.numel(),
+                        confusion[truth_index, pred_index].float() / num_jets,
+                        on_step=False, on_epoch=True, sync_dist=True,
+                        batch_size=num_jets,
                     )
 
     def validation_step(self, batch, _batch_idx):
