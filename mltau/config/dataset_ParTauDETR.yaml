@@ -25,6 +25,8 @@ dataset:
     # 4-momentum remains inclusive when cuts are enabled.
     tau_daughter_charged_pt_cut: 0.1
     tau_daughter_neutral_p_cut: 0.5
+    # Apply cls_weight to the tau-ID loss; daughter reconstruction is unweighted.
+    use_cls_weights: true
     data_dir: /scratch/persistent/karl/ml-tau/1103_ParTauDETR_dataset
 
     # Meson classes for daughter one-hot encoding. Mapping order defines class

@@ -167,6 +167,11 @@ class ParticleTransformerDETRDataset(ParticleTransformerDataset):
     def _build_read_tensors(self, data, filename):
         return self.build_tensors(data, sample=sample_name(filename))
 
+    def _jet_weights(self, data: ak.Array) -> torch.Tensor:
+        if not self.cfg.dataset.get("use_cls_weights", True) or "cls_weight" not in data.fields:
+            return torch.ones(len(data), dtype=torch.float32)
+        return torch.from_numpy(ak.to_numpy(data.cls_weight).astype(np.float32))
+
     def _tau_id_targets(self, data: ak.Array, sample: str | None):
         daughter_pdgs = data.gen_jet_tau_vis_daughter_pdgs
         electron_count = ak.to_numpy(ak.sum(abs(daughter_pdgs) == 11, axis=-1))
@@ -329,12 +334,7 @@ class ParticleTransformerDETRDataset(ParticleTransformerDataset):
         cand_kinematics_np *= mask_np[:, None, :]
 
         # Optional per-jet training weight
-        if "cls_weight" not in data.fields:
-            weight_tensors = torch.ones(len(data), dtype=torch.float32)
-        else:
-            weight_tensors = torch.from_numpy(
-                ak.to_numpy(data.cls_weight).astype(np.float32)
-            )
+        weight_tensors = self._jet_weights(data)
 
         # -------------------------
         # DETR set targets
