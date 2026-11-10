@@ -11,6 +11,7 @@ from omegaconf import DictConfig, OmegaConf
 
 from mltau.models.ParTauDETR import ParTauDETR
 from mltau.tools.tau_id import TauIDClass, tau_id_classes
+from mltau.tools.io.ParTauDETR_dataloader import ParTauDETRDataModule
 from mltau.tools.io.general import BatchInputs
 from mltau.tools.logging import set_to_set as s2s
 from mltau.tools.losses import TauLoss
@@ -431,10 +432,12 @@ class SetCriterion(nn.Module):
         object_class_index: int = 0,
         eos_coef: float = 0.1,
         ignore_index: int = -100,
+        num_tau_id_classes: int = 4,
     ):
         super().__init__()
         self.matcher = matcher
         self.tau_loss = tau_loss
+        self.register_buffer("tau_id_class_weights", torch.ones(num_tau_id_classes), persistent=False)
         self.loss_objectness_weight = loss_objectness_weight
         self.loss_tau_id_weight = loss_tau_id_weight
         self.loss_kinematics_weight = loss_kinematics_weight
@@ -949,6 +952,7 @@ class SetCriterion(nn.Module):
                 tau_w = jet_weights.to(dtype=pred_logits.dtype, device=device)
             else:
                 tau_w = pred_logits.new_ones(batch_size)
+            tau_w = tau_w * self.tau_id_class_weights[target_tau_id].to(tau_w.dtype)
             loss_tau_id = self.tau_loss.compute_tagging_loss(
                 outputs["is_tau"], target_tau_id, tau_w
             )
@@ -1493,6 +1497,7 @@ class ParTauDETRModule(L.LightningModule):
             object_class_index=0,
             eos_coef=float(detr_cfg.loss.eos_coef),
             ignore_index=self.ignore_index,
+            num_tau_id_classes=len(self.tau_id_class_names),
         )
 
         # Starting value and fallback for the objectness threshold; the
@@ -1712,6 +1717,19 @@ class ParTauDETRModule(L.LightningModule):
             inputs.weight,
             inputs.gen_jet_tau_p4s,
             inputs.reco_jet_p4s,
+        )
+
+    def on_fit_start(self) -> None:
+        if (
+            not self.cfg.model.detr.tau_id_head
+            or not self.cfg.dataset.get("balance_tau_id_classes", True)
+        ):
+            return
+        datamodule = self.trainer.datamodule
+        if not isinstance(datamodule, ParTauDETRDataModule):
+            raise TypeError("Tau-ID balancing requires ParTauDETRDataModule.")
+        self.criterion.tau_id_class_weights.copy_(
+            torch.as_tensor(datamodule.tau_id_class_weights, device=self.device)
         )
 
     def training_step(self, batch, _batch_idx):
@@ -2127,6 +2145,7 @@ class ParTauDETRModule(L.LightningModule):
         predictions = outputs["is_tau"].detach().argmax(dim=-1)
         num_classes = len(self.tau_id_class_names)
         counts = torch.bincount(labels, minlength=num_classes)
+        weights = weights * self.criterion.tau_id_class_weights[labels]
         weight_sums = torch.bincount(
             labels, weights=weights.detach().float(), minlength=num_classes
         )

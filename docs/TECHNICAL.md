@@ -60,7 +60,7 @@ constituent PDGs are not used to label tau ancestry.
 
 The dataset's `is_tau` target means **hadronic tau**, not any tau decay. Leptonic
 and background jets have no active daughter targets and contribute only to
-weighted, label-smoothed ID cross-entropy. Matching, objectness, daughter losses,
+weighted ID cross-entropy (label smoothing is controlled by `model.tau_loss`). Matching, objectness, daughter losses,
 intermediate decoder losses and all parent penalties are hadronic-only and
 unweighted. The shared encoder still receives ID gradients from every class.
 Inference gates the daughter set using `is_tau >= model.detr.inference.tau_id_threshold`.
@@ -74,9 +74,18 @@ leptonic taus among negatives. Absent classes produce null AUC and empty curves.
 Reconstruction evaluation remains restricted to hadronic taus.
 
 Training parquet files must retain leptonic taus and their original truth
-daughters. Check class counts and weight sums before relying on leptonic scores;
-zero counts or zero effective weights cannot train those classes. Existing
-`cls_weight` values are preserved, not automatically rebalanced by decay class.
+daughters. With `dataset.balance_tau_id_classes: true`, the fit setup counts
+the selected, filtered training jets in each configured class and sums their
+existing `cls_weight` (or uses unit weights when disabled/missing). Each
+class receives a multiplier of `total_weight / (num_classes * class_weight_sum)`
+in the tau-ID loss only. The final per-jet weight is `cls_weight * multiplier`;
+the loss is normalized by the sum of final weights in each batch. This preserves
+the original theta/p weighting while equalizing the total effective weight per
+class across the training set. Startup prints jet counts, raw and weighted
+fractions, and multipliers; a class with no effective training weight is an
+error. Set `dataset.balance_tau_id_classes: false` to compare with the original
+loss. The `train_tau_id/*/weight_fraction` and `val_tau_id/*/weight_fraction`
+metrics include the class multipliers.
 
 Binary checkpoints cannot be resumed or evaluated directly with the enlarged
 head. For a fresh multiclass training run, use

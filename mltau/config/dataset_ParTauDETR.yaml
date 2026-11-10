@@ -27,6 +27,10 @@ dataset:
     tau_daughter_neutral_p_cut: 0.5
     # Apply cls_weight to the tau-ID loss; daughter reconstruction is unweighted.
     use_cls_weights: true
+    # Equalise the training-set sum of cls_weight across the configured tau-ID
+    # classes. Uses actual selected/filtered training jets, not branching ratios.
+    # Set false to retain the previous loss for a comparison run.
+    balance_tau_id_classes: true
     data_dir: /scratch/persistent/karl/ml-tau/1103_ParTauDETR_dataset
 
     # Meson classes for daughter one-hot encoding. Mapping order defines class
@@ -48,7 +52,7 @@ dataset:
     # the test set.
     max_jets_per_sample:
         z: null
-        qq: 10_000_000
+        qq: null
         mm: null
         bhabha: null
     # Class 0 is the combined background of the samples listed under

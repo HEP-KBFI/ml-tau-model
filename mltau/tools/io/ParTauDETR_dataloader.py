@@ -651,6 +651,70 @@ class ParTauDETRDataModule(ParTDataModule):
         if cfg.model.detr.tau_id_head:
             self.sample = "*"
 
+    def setup(self, stage: str) -> None:
+        super().setup(stage)
+        if (
+            stage != "fit" or not self.cfg.model.detr.tau_id_head
+            or not self.cfg.dataset.get("balance_tau_id_classes", True)
+        ):
+            return
+
+        import pyarrow.parquet as pq
+
+        class_names, _ = tau_id_classes(self.cfg)
+        self.tau_id_class_counts = np.zeros(len(class_names), dtype=np.int64)
+        self.tau_id_class_weight_sums = np.zeros(len(class_names), dtype=np.float64)
+        by_file = {}
+        for group in self.train_dataset.row_groups:
+            by_file.setdefault(group.filename, []).append(group)
+        for filename, groups in by_file.items():
+            with pq.ParquetFile(filename) as parquet:
+                columns = ["gen_jet_tau_decaymode", "gen_jet_tau_vis_daughter_pdgs"]
+                if (
+                    float(self.cfg.dataset.get("tau_daughter_charged_pt_cut", -1.0)) >= 0
+                    or float(self.cfg.dataset.get("tau_daughter_neutral_p_cut", -1.0)) >= 0
+                ):
+                    columns += [
+                        "gen_jet_tau_charge",
+                        "gen_jet_tau_vis_daughter_p4s",
+                        "gen_jet_tau_vis_daughter_charges",
+                    ]
+                if (
+                    self.cfg.dataset.get("use_cls_weights", True)
+                    and "cls_weight" in parquet.schema_arrow.names
+                ):
+                    columns.append("cls_weight")
+                for group in groups:
+                    data = ak.from_arrow(parquet.read_row_group(group.row_group, columns=columns))
+                    data = data[self.train_dataset._fit_row_mask(data)]
+                    labels = self.train_dataset._tau_id_targets(data, sample_name(filename))
+                    weights = (
+                        ak.to_numpy(data.cls_weight)
+                        if "cls_weight" in data.fields else np.ones(len(data))
+                    )
+                    self.tau_id_class_counts += np.bincount(labels, minlength=len(class_names))
+                    self.tau_id_class_weight_sums += np.bincount(
+                        labels, weights=weights, minlength=len(class_names)
+                    )
+
+        sums = self.tau_id_class_weight_sums
+        if not np.all(np.isfinite(sums)) or np.any(sums <= 0):
+            raise ValueError(
+                f"Every tau-ID class needs positive finite training weight: "
+                f"{dict(zip(class_names, sums.tolist()))}"
+            )
+        self.tau_id_class_weights = sums.sum() / (len(sums) * sums)
+        for name, count, weight_sum, multiplier in zip(
+            class_names, self.tau_id_class_counts, sums, self.tau_id_class_weights
+        ):
+            print(
+                f"[tau-ID balance] {name}: jets={count:,}, "
+                f"jet_fraction={count / self.tau_id_class_counts.sum():.6f}, "
+                f"weight_sum={weight_sum:.6g}, weight_fraction={weight_sum / sums.sum():.6f}, "
+                f"multiplier={multiplier:.6g}",
+                flush=True,
+            )
+
     def _resolve_input_paths(self, pattern: str, dataset_type: str) -> list:
         paths = super()._resolve_input_paths(pattern, dataset_type)
         if not self.cfg.model.detr.tau_id_head:
