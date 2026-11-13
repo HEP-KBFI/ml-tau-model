@@ -20,11 +20,13 @@ dataset:
     # model.detr.loss.eos_coef before changing this.
     max_tau_daughters: 5
     # Charged daughters: pT threshold; neutral daughters: total momentum threshold.
+    # All daughters: |cos(theta)| < threshold (cos(theta) = tanh(eta)).
     # Negative thresholds disable the respective cut. Fit-stage jets whose tau
     # charge or decay mode changes after cutting are excluded. The stored tau
     # 4-momentum remains inclusive when cuts are enabled.
     tau_daughter_charged_pt_cut: 0.1
     tau_daughter_neutral_p_cut: 0.5
+    tau_daughter_abs_cos_theta_cut: 0.99
     # Apply cls_weight to the tau-ID loss; daughter reconstruction is unweighted.
     use_cls_weights: true
     # Equalise the training-set sum of cls_weight across the configured tau-ID

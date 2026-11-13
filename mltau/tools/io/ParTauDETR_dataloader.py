@@ -157,12 +157,16 @@ class ParticleTransformerDETRDataset(ParticleTransformerDataset):
             return ak.ones_like(daughter_charge, dtype=np.bool_)
         charged_pt_cut = float(cfg.dataset.get("tau_daughter_charged_pt_cut", -1.0))
         neutral_p_cut = float(cfg.dataset.get("tau_daughter_neutral_p_cut", -1.0))
+        abs_cos_theta_cut = float(cfg.dataset.get("tau_daughter_abs_cos_theta_cut", -1.0))
         daughter_pt = p4_field(daughter_p4, "pt")
         passes_charged = (charged_pt_cut < 0) | (daughter_pt >= charged_pt_cut)
         passes_neutral = (neutral_p_cut < 0) | (
             daughter_pt * np.cosh(p4_field(daughter_p4, "eta")) >= neutral_p_cut
         )
-        return ak.where(daughter_charge == 0, passes_neutral, passes_charged)
+        passes_angle = (abs_cos_theta_cut < 0) | (
+            abs(np.tanh(p4_field(daughter_p4, "eta"))) < abs_cos_theta_cut
+        )
+        return ak.where(daughter_charge == 0, passes_neutral, passes_charged) & passes_angle
 
     def _build_read_tensors(self, data, filename):
         return self.build_tensors(data, sample=sample_name(filename))
@@ -578,6 +582,7 @@ class ParticleTransformerDETRTrainingDataset(ParticleTransformerDETRDataset):
         if (
             float(cfg.dataset.get("tau_daughter_charged_pt_cut", -1.0)) < 0
             and float(cfg.dataset.get("tau_daughter_neutral_p_cut", -1.0)) < 0
+            and float(cfg.dataset.get("tau_daughter_abs_cos_theta_cut", -1.0)) < 0
         ):
             return keep
         daughter_pdgs = data.gen_jet_tau_vis_daughter_pdgs
@@ -608,6 +613,7 @@ class ParticleTransformerDETRTrainingDataset(ParticleTransformerDETRDataset):
                     if (
                         float(cfg.dataset.get("tau_daughter_charged_pt_cut", -1.0)) >= 0
                         or float(cfg.dataset.get("tau_daughter_neutral_p_cut", -1.0)) >= 0
+                        or float(cfg.dataset.get("tau_daughter_abs_cos_theta_cut", -1.0)) >= 0
                     ):
                         columns += [
                             "gen_jet_tau_charge",
@@ -673,6 +679,7 @@ class ParTauDETRDataModule(ParTDataModule):
                 if (
                     float(self.cfg.dataset.get("tau_daughter_charged_pt_cut", -1.0)) >= 0
                     or float(self.cfg.dataset.get("tau_daughter_neutral_p_cut", -1.0)) >= 0
+                    or float(self.cfg.dataset.get("tau_daughter_abs_cos_theta_cut", -1.0)) >= 0
                 ):
                     columns += [
                         "gen_jet_tau_charge",
