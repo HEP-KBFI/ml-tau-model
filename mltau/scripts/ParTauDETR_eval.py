@@ -29,12 +29,14 @@ import numpy as np
 import torch
 
 from mltau.models.ParTauDETR_module import ParTauDETRModule
+from mltau.tools.tau_id import TauIDClass, tau_id_classes
+from mltau.tools.io.ParT_dataloader import sample_name
 from mltau.tools.evaluation.decode_ParTauDETR import (
     get_predicted_particles,
     get_true_particles,
     match_particles,
     sum_p4_components,
-    tau_scores,
+    tau_id_probabilities,
 )
 from mltau.tools.io.ParTauDETR_dataloader import ParticleTransformerDETRDataset
 
@@ -105,17 +107,21 @@ def run_model(model, ds, files, chunk, device, keep_reconstruction: bool):
     outs = {k: [] for k in out_keys}
     tgts = {k: [] for k in tgt_keys}
     refs = {k: [] for k in ("pt", "eta", "phi", "energy")}
-    scores, labels = [], []
+    scores, labels, id_probabilities, id_labels, sample_labels = [], [], [], [], []
     n_jets = 0
     with torch.no_grad():
         for path in files:
             data = ak.from_parquet(path)
             for start in range(0, len(data), chunk):
-                batch = to_device(ds.build_tensors(data[start : start + chunk]), device)
+                batch = to_device(
+                    ds.build_tensors(data[start : start + chunk], sample=sample_name(path)), device
+                )
                 outputs, targets, _w, _, _ = model.forward(batch)
-                score = tau_scores(outputs)
-                if score is not None:
-                    scores.append(score.cpu())
+                probabilities = tau_id_probabilities(outputs)
+                if probabilities is not None:
+                    id_probabilities.append(probabilities.cpu())
+                    scores.append(probabilities[:, TauIDClass.HADRONIC_TAU].cpu())
+                id_labels.append(targets["tau_id"].cpu())
                 labels.append(targets["is_tau"].float().cpu())
                 if keep_reconstruction:
                     for k in out_keys:
@@ -126,10 +132,14 @@ def run_model(model, ds, files, chunk, device, keep_reconstruction: bool):
                     for k in refs:
                         refs[k].append(torch.as_tensor(reco_jet_p4s[k]).cpu())
             n_jets += len(data)
+            sample_labels.append(np.full(len(data), sample_name(path)))
             print(f"  {os.path.basename(path)}: {n_jets:,} jets", flush=True)
     result = {
         "tau_score": torch.cat(scores).numpy() if scores else None,
         "is_tau": torch.cat(labels).numpy().astype(bool),
+        "tau_id": torch.cat(id_labels).numpy(),
+        "tau_id_probs": torch.cat(id_probabilities).numpy() if id_probabilities else None,
+        "sample_names": np.concatenate(sample_labels),
         "n_jets": n_jets,
     }
     if keep_reconstruction:
@@ -144,10 +154,18 @@ def tau_id_metrics(sig_scores: np.ndarray, bkg_scores: np.ndarray) -> dict:
     ROC of the tagging head: signal efficiency vs background misID rate.
 
     Unweighted jet counts (the training's cls_weight decorrelation weights are
-    not applied), signal = genuine taus, background = jets without one. The
+    not applied), with signal and background chosen by the caller. The
     misID at a fixed efficiency takes the score threshold at that signal
     quantile; its statistical precision is ~1/sqrt(misID * n_bkg).
     """
+    if sig_scores.size == 0 or bkg_scores.size == 0:
+        return {
+            "n_signal": int(sig_scores.size),
+            "n_background": int(bkg_scores.size),
+            "auc": None,
+            "at_efficiency": {},
+            "roc_curve": {"efficiency": [], "misid": []},
+        }
     thresholds = np.quantile(sig_scores, 1.0 - np.asarray(ROC_EFFICIENCIES))
     at_efficiency = {}
     for eff, thr in zip(ROC_EFFICIENCIES, thresholds):
@@ -184,6 +202,33 @@ def tau_id_metrics(sig_scores: np.ndarray, bkg_scores: np.ndarray) -> dict:
             "efficiency": effs.round(4).tolist(),
             "misid": curve_misid.tolist(),
         },
+    }
+
+
+def multiclass_tau_id_metrics(
+    probabilities: np.ndarray, labels: np.ndarray, class_names: tuple[str, ...]
+) -> dict:
+    """Unweighted confusion (truth rows) and one-vs-rest/background ROC metrics."""
+    num_classes = len(class_names)
+    predictions = probabilities.argmax(axis=-1)
+    confusion = np.bincount(
+        labels * num_classes + predictions, minlength=num_classes**2
+    ).reshape(num_classes, num_classes)
+    per_class = {}
+    background = (labels == TauIDClass.BACKGROUND) | (labels >= len(TauIDClass))
+    for class_index, class_name in enumerate(class_names):
+        selected = labels == class_index
+        scores = probabilities[:, class_index]
+        metrics = {"vs_rest": tau_id_metrics(scores[selected], scores[~selected])}
+        if TauIDClass.HADRONIC_TAU <= class_index <= TauIDClass.TAU_MUON:
+            metrics["vs_background"] = tau_id_metrics(scores[selected], scores[background])
+        per_class[class_name] = metrics
+    return {
+        "class_names": list(class_names),
+        "class_counts": confusion.sum(axis=1).tolist(),
+        "confusion_matrix": confusion.tolist(),
+        "accuracy": float((predictions == labels).mean()) if labels.size else None,
+        "per_class": per_class,
     }
 
 
@@ -298,7 +343,11 @@ def main():
         help="test-file directory; default: the checkpoint's dataset.data_dir",
     )
     ap.add_argument("--signal-sample", default="z")
-    ap.add_argument("--background-sample", default="qq")
+    ap.add_argument("--background-sample", default=None)
+    ap.add_argument(
+        "--background-samples", nargs="+", default=None,
+        help="Background samples to evaluate; default: all configured samples",
+    )
     ap.add_argument(
         "--signal-files", type=int, default=1,
         help="signal test files to read (~100k jets each); 0 = all",
@@ -324,6 +373,7 @@ def main():
     model = ParTauDETRModule.load_from_checkpoint(args.checkpoint, map_location=device)
     model.eval()
     cfg = model.cfg
+    class_names, configured_backgrounds = tau_id_classes(cfg)
     data_dir = os.path.expanduser(args.data_dir or str(cfg.dataset.data_dir))
 
     threshold = (
@@ -364,28 +414,56 @@ def main():
     }
 
     if args.background_files >= 0 and sig["tau_score"] is not None:
-        bkg_files = read_files(
-            os.path.join(data_dir, f"{args.background_sample}_test*.parquet"),
-            args.background_files or None,
+        background_samples = args.background_samples or (
+            [args.background_sample] if args.background_sample else list(configured_backgrounds)
         )
+        unknown = set(background_samples) - configured_backgrounds.keys()
+        if unknown:
+            raise ValueError(f"Unconfigured background samples: {sorted(unknown)}")
+        bkg_files = [
+            path
+            for sample in background_samples
+            for path in read_files(
+                os.path.join(data_dir, f"{sample}_test*.parquet"),
+                args.background_files or None,
+            )
+        ]
         print(f"background: {len(bkg_files)} file(s)", flush=True)
         bkg = run_model(model, ds, bkg_files, args.chunk, device, keep_reconstruction=False)
-        sig_scores = sig["tau_score"][sig["is_tau"]]
-        bkg_scores = np.concatenate(
-            [bkg["tau_score"][~bkg["is_tau"]], sig["tau_score"][~sig["is_tau"]]]
-        )
+        probabilities = np.concatenate([sig["tau_id_probs"], bkg["tau_id_probs"]])
+        labels = np.concatenate([sig["tau_id"], bkg["tau_id"]])
         results["background_files"] = [os.path.basename(f) for f in bkg_files]
-        results["tau_id"] = tau_id_metrics(sig_scores, bkg_scores)
+        results["tau_id_multiclass"] = multiclass_tau_id_metrics(
+            probabilities, labels, class_names
+        )
+        results["tau_id"] = results["tau_id_multiclass"]["per_class"]["hadronic_tau"]["vs_background"]
+        results["tau_id_vs_rest"] = results["tau_id_multiclass"]["per_class"]["hadronic_tau"]["vs_rest"]
+        results["tau_id_by_sample"] = {
+            sample: tau_id_metrics(
+                sig["tau_score"][sig["is_tau"]],
+                bkg["tau_score"][bkg["sample_names"] == sample],
+            )
+            for sample in background_samples
+        }
     elif sig["tau_score"] is None:
         print("model has no tauID head: tau-ID skipped", flush=True)
 
     os.makedirs(os.path.dirname(os.path.abspath(args.out)), exist_ok=True)
     with open(args.out, "w") as f:
         json.dump(results, f, indent=2)
-    summary = {k: v for k, v in results.items() if k != "tau_id"}
-    if "tau_id" in results:
-        summary["tau_id"] = {
-            k: v for k, v in results["tau_id"].items() if k != "roc_curve"
+    summary = {
+        key: value for key, value in results.items()
+        if key not in ("tau_id", "tau_id_vs_rest", "tau_id_multiclass")
+    }
+    for metric in ("tau_id", "tau_id_vs_rest"):
+        if metric in results:
+            summary[metric] = {
+                key: value for key, value in results[metric].items() if key != "roc_curve"
+            }
+    if "tau_id_multiclass" in results:
+        summary["tau_id_multiclass"] = {
+            key: value for key, value in results["tau_id_multiclass"].items()
+            if key != "per_class"
         }
     print(json.dumps(summary, indent=2), flush=True)
 

@@ -55,30 +55,10 @@ def cand_feature_names(cfg: DictConfig) -> list[str]:
 
     The names also encode each feature's DEFINITION: _check_feature_definitions
     refuses a scaler whose saved names differ, because its constants belong to
-    differently defined inputs. Here that is the impact-parameter significance
-    transform (dataset.impact_parameter_features.significance_transform);
-    "none" keeps the plain names, so scalers fitted before it existed still
-    load. Datasets with other definitions override
+    differently defined inputs. Datasets with other definitions override
     `ParticleTransformerDataset.cand_feature_names`.
     """
-    ip_cfg = cfg.dataset.get("impact_parameter_features", None) or {}
-    suffix = significance_name_suffix(
-        ip_cfg.get("significance_transform", "none"),
-        float(ip_cfg.get("tanh_scale", 5.0)),
-    )
-    names = [str(n) for n in _CAND_FEATURE_NAMES]
-    names[14] += suffix
-    names[16] += suffix
-    return names
-
-
-def significance_name_suffix(transform: str, tanh_scale: float) -> str:
-    """Name suffix of a significance feature for a significance transform."""
-    if transform == "none":
-        return ""
-    if transform == "tanh":
-        return f"_tanh{tanh_scale:g}"
-    return f"_{transform}"
+    return [str(name) for name in _CAND_FEATURE_NAMES]
 
 
 def scaling_enabled(cfg: DictConfig) -> bool:

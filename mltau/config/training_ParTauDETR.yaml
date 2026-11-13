@@ -1,0 +1,9 @@
+# ParTauDETR-specific overrides of training.yaml.
+training:
+    lr: 0.0002
+    trainer:
+        max_epochs: 120
+    # Standardise the continuous candidate inputs (see training.yaml). The
+    # signed impact-parameter significances reach |s| ~ 1e4 unscaled.
+    input_scaling:
+        enabled: false

@@ -3,20 +3,14 @@ dataset:
     num_features: 17
     # Lifetime input features: [signed dz, dz significance, signed dxy, dxy
     # significance], with significance = IP / IP_error and all four 0 for
-    # neutral candidates. significance_transform compresses the significance
-    # tail, keeping its sign: none (IP / IP_error) | log (sign(s) * log(1 +
-    # |s|)) | tanh (tanh(s / tanh_scale)). Earlier definitions, for checkpoints
-    # trained with them: raw_error (the plain IP_error) or
-    # use_log_significance=true (log(abs(IP) / IP_error), overrides
-    # significance_transform). A positive transform_scale replaces each signed
-    # IP with 2 * arctan(transform_scale * IP) / pi; zero or a negative value
-    # leaves it unchanged. For example:
-    #   dataset.impact_parameter_features.significance_transform=log
+    # neutral candidates. use_log_significance=true instead uses
+    # log(abs(IP) / IP_error), for checkpoints trained with that definition.
+    # A positive transform_scale replaces each signed IP with
+    # 2 * arctan(transform_scale * IP) / pi; zero or a negative value leaves
+    # it unchanged. For example:
     #   dataset.impact_parameter_features.transform_scale=30
     impact_parameter_features:
-        significance_transform: none # none | log | tanh | raw_error
-        tanh_scale: 5.0
-        use_log_significance: false
+        use_log_significance:  true
         transform_scale: 0.0
     # Target slots per jet, and (by interpolation) the number of decoder
     # queries. Measured over all 5.3M signal jets of the 0915 production with
@@ -25,16 +19,21 @@ dataset:
     # not a requirement. Fewer queries make each one count more; see
     # model.detr.loss.eos_coef before changing this.
     max_tau_daughters: 5
-     # Negative value disables the pT cut
-     # NB! When enabling the cut, the charge, DM and 4-momentum that is
-     # obtained by aggregating generator-level constituents passing the pT
-     # cut might differ from the charge, DM and 4-momentum of the visible
-     # generator-level tau that's stored in the dataset. The correct solution
-     # would be to rederive the target charge, DM and 4-momentum of the visible
-     # generator-level tau after the pT cut. Note that this is only an issue if
-     # the pT cut is enabled and weight_parent_* weights are positive.
-    tau_daughter_pt_cut: -1.0
-    data_dir: /scratch/persistent/karl/ml-tau/1002_ParTauDETR_dataset/
+    # Charged daughters: pT threshold; neutral daughters: total momentum threshold.
+    # All daughters: |cos(theta)| < threshold (cos(theta) = tanh(eta)).
+    # Negative thresholds disable the respective cut. Fit-stage jets whose tau
+    # charge or decay mode changes after cutting are excluded. The stored tau
+    # 4-momentum remains inclusive when cuts are enabled.
+    tau_daughter_charged_pt_cut: 0.1
+    tau_daughter_neutral_p_cut: 0.5
+    tau_daughter_abs_cos_theta_cut: 0.99
+    # Apply cls_weight to the tau-ID loss; daughter reconstruction is unweighted.
+    use_cls_weights: true
+    # Equalise the training-set sum of cls_weight across the configured tau-ID
+    # classes. Uses actual selected/filtered training jets, not branching ratios.
+    # Set false to retain the previous loss for a comparison run.
+    balance_tau_id_classes: true
+    data_dir: /scratch/persistent/karl/ml-tau/1103_ParTauDETR_dataset
 
     # Meson classes for daughter one-hot encoding. Mapping order defines class
     # indices and charges defines valid charge-head combinations. All unlisted
@@ -55,7 +54,17 @@ dataset:
     # the test set.
     max_jets_per_sample:
         z: null
-        qq: 10_000_000
+        qq: null
+        mm: null
+        bhabha: null
+    # Class 0 is the combined background of the samples listed under
+    # background_classes.background (qq, mm and bhabha below). Hadronic tau,
+    # tau electron and tau muon remain classes 1, 2 and 3. Additional groups
+    # get classes 4 and up; move samples there to classify them separately.
+    # For example, background: [qq], leptonic_background: [mm, bhabha] gives
+    # five classes. background: [qq], mm: [mm], bhabha: [bhabha] gives six.
+    background_classes:
+        background: [qq, mm, bhabha]
     selection_seed: 42
 
     relative_sizes:
