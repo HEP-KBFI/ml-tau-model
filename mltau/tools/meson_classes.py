@@ -3,6 +3,11 @@ from dataclasses import dataclass
 
 import numpy as np
 
+CHARGED_PION_MASS_GEV = 0.13957
+NEUTRAL_PION_MASS_GEV = 0.13498
+CHARGED_HADRON_PDG = 211
+NEUTRAL_HADRON_PDG = 130
+
 
 @dataclass(frozen=True)
 class MesonClass:

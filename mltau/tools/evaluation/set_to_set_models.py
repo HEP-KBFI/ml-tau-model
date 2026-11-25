@@ -12,7 +12,11 @@ import numpy as np
 from ntupelizer.tools.tau_decaymode import RARE_DECAY_MODE_EXT, classify_decay_modes
 
 from mltau.tools.general import reinitialize_p4
-from mltau.tools.meson_classes import get_meson_classes
+from mltau.tools.meson_classes import (
+    CHARGED_HADRON_PDG,
+    NEUTRAL_HADRON_PDG,
+    get_meson_classes,
+)
 
 # The set model predicts meson CLASSES, not species. For the decay mode a class
 # is represented by one hadron that stands for it: any charged hadron for a
@@ -20,10 +24,6 @@ from mltau.tools.meson_classes import get_meson_classes
 # representative ids the ntupelizer writes into gen_jet_tau_vis_daughter_pdgs
 # (map_pdgid_to_candid), and ml-tau-data classifies them by property, so a
 # class and a stored daughter go through the identical code path.
-CHARGED_HADRON_PDG = 211
-NEUTRAL_HADRON_PDG = 130
-
-
 def meson_class_representative_pdgs(tau_daughter_pdg_ids) -> list[int]:
     """One representative |PDG| per configured meson class, in class order."""
     representatives = []

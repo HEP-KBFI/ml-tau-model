@@ -10,13 +10,17 @@ from mltau.tools.io.ParT_dataloader import (
     impact_parameter_features,
     p4_field,
     sort_candidates_by_pt,
+    sample_name,
 )
+from mltau.tools.tau_id import TauIDClass, tau_id_classes
 from mltau.tools.io import input_scaling as scaling
+from mltau.tools.io.general import RowGroup
 from mltau.tools.meson_classes import (
     get_meson_class_groups,
     pdg_to_meson_class_indices,
 )
 
+from ntupelizer.tools.tau_decaymode import MIXED_DECAY_MODE, classify_decay_modes
 
 class ParticleTransformerDETRDataset(ParticleTransformerDataset):
     """
@@ -29,10 +33,13 @@ class ParticleTransformerDETRDataset(ParticleTransformerDataset):
 
     Targets are replaced with daughter-level set targets:
       - particles_mask: [N, T] (True for valid daughter)
-      - particles_kinematics: [N, T, 5] =
-          [log(pt_dau/pt_jet), delta_eta(dau-jet), sin(delta_phi), cos(delta_phi), log(m_dau/m_jet)]
+      - particles_kinematics: [N, T, 4] =
+          [log(p_dau/p_jet), delta_theta(dau-jet), delta_phi(dau-jet), log(m_dau/m_jet)]
       - particles_charge_ohe: [N, T, 3] one-hot for charges [-1, 0, +1]
       - particles_meson_class_ohe: [N, T, C] one-hot over configured meson classes
+      - tau_id: [N], 0=first background group, 1=hadronic tau,
+        2=tau electron, 3=tau muon, 4+=other configured background groups
+      - is_tau: [N], true only for hadronic taus (reconstruction supervision)
 
     where T = cfg.dataset.max_tau_daughters if provided, otherwise inferred from
     the currently loaded row-group.
@@ -56,8 +63,6 @@ class ParticleTransformerDETRDataset(ParticleTransformerDataset):
             ip_suffix += f"_arctan{transform_scale:g}"
         if ip_cfg.get("use_log_significance", False):
             error_names = ("cand_dz_log_abs_significance", "cand_dxy_log_abs_significance")
-        elif ip_cfg.get("significance_transform", "none") == "raw_error":
-            error_names = ("cand_dz_error", "cand_dxy_error")
         else:
             error_names = (names[14], names[16])
         names[13] = "cand_dz" + ip_suffix
@@ -144,7 +149,57 @@ class ParticleTransformerDETRDataset(ParticleTransformerDataset):
             raw_pdg, self.cfg.dataset.tau_daughter_pdg_ids
         )
 
-    def build_tensors(self, data: ak.Array):
+    def _daughter_cut_mask(self, data: ak.Array, cfg=None):
+        cfg = self.cfg if cfg is None else cfg
+        daughter_p4 = data.gen_jet_tau_vis_daughter_p4s
+        daughter_charge = data.gen_jet_tau_vis_daughter_charges
+        if not daughter_p4.fields:
+            return ak.ones_like(daughter_charge, dtype=np.bool_)
+        charged_pt_cut = float(cfg.dataset.get("tau_daughter_charged_pt_cut", -1.0))
+        neutral_p_cut = float(cfg.dataset.get("tau_daughter_neutral_p_cut", -1.0))
+        abs_cos_theta_cut = float(cfg.dataset.get("tau_daughter_abs_cos_theta_cut", -1.0))
+        daughter_pt = p4_field(daughter_p4, "pt")
+        passes_charged = (charged_pt_cut < 0) | (daughter_pt >= charged_pt_cut)
+        passes_neutral = (neutral_p_cut < 0) | (
+            daughter_pt * np.cosh(p4_field(daughter_p4, "eta")) >= neutral_p_cut
+        )
+        passes_angle = (abs_cos_theta_cut < 0) | (
+            abs(np.tanh(p4_field(daughter_p4, "eta"))) < abs_cos_theta_cut
+        )
+        return ak.where(daughter_charge == 0, passes_neutral, passes_charged) & passes_angle
+
+    def _build_read_tensors(self, data, filename):
+        return self.build_tensors(data, sample=sample_name(filename))
+
+    def _jet_weights(self, data: ak.Array) -> torch.Tensor:
+        if not self.cfg.dataset.get("use_cls_weights", True) or "cls_weight" not in data.fields:
+            return torch.ones(len(data), dtype=torch.float32)
+        return torch.from_numpy(ak.to_numpy(data.cls_weight).astype(np.float32))
+
+    def _tau_id_targets(self, data: ak.Array, sample: str | None):
+        daughter_pdgs = data.gen_jet_tau_vis_daughter_pdgs
+        electron_count = ak.to_numpy(ak.sum(abs(daughter_pdgs) == 11, axis=-1))
+        muon_count = ak.to_numpy(ak.sum(abs(daughter_pdgs) == 13, axis=-1))
+        if np.any(electron_count + muon_count > 1):
+            raise ValueError("Expected at most one electron or muon among truth tau daughters.")
+        tau_id = np.where(
+            ak.to_numpy(data.gen_jet_tau_decaymode) != -1,
+            TauIDClass.HADRONIC_TAU,
+            TauIDClass.BACKGROUND,
+        ).astype(np.int64)
+        tau_id[electron_count == 1] = TauIDClass.TAU_ELECTRON
+        tau_id[muon_count == 1] = TauIDClass.TAU_MUON
+        if sample is not None:
+            _, background_samples = tau_id_classes(self.cfg)
+            if sample != "z":
+                if sample not in background_samples:
+                    raise ValueError(f"Unconfigured tau-ID sample: {sample}")
+                if np.any(tau_id != TauIDClass.BACKGROUND):
+                    raise ValueError(f"Background sample {sample} contains tau truth labels.")
+                tau_id[:] = background_samples[sample]
+        return tau_id
+
+    def build_tensors(self, data: ak.Array, sample: str | None = None):
         if self.cfg.dataset.get("sort_by_pt", False):
             data = sort_candidates_by_pt(data)
         # -------------------------
@@ -175,14 +230,8 @@ class ParticleTransformerDETRDataset(ParticleTransformerDataset):
             track_parameter[neutral_mask] = 0.0
 
         # Second and fourth lifetime features: the significance d / sigma_d by
-        # default (optionally log- or tanh-compressed, see
-        # ParT_dataloader.impact_parameter_features); "raw_error" and
-        # use_log_significance reproduce the earlier definitions, for
-        # checkpoints trained with them.
+        # default, or the earlier log(abs(d) / sigma_d) definition.
         impact_parameter_cfg = self.cfg.dataset.impact_parameter_features
-        significance_transform = impact_parameter_cfg.get(
-            "significance_transform", "none"
-        )
         if impact_parameter_cfg.get("use_log_significance", False):
             cand_dz_err[charged_mask] = np.log(
                 np.maximum(
@@ -198,15 +247,13 @@ class ParticleTransformerDETRDataset(ParticleTransformerDataset):
                     eps,
                 )
             )
-        elif significance_transform != "raw_error":
+        else:
             cand_dz, cand_dz_err, cand_dxy, cand_dxy_err = impact_parameter_features(
                 cand_dz,
                 cand_dz_err,
                 cand_dxy,
                 cand_dxy_err,
                 charge=cand_charge,
-                transform=significance_transform,
-                tanh_scale=float(impact_parameter_cfg.get("tanh_scale", 5.0)),
             )
 
         scale = float(impact_parameter_cfg.transform_scale)
@@ -291,12 +338,7 @@ class ParticleTransformerDETRDataset(ParticleTransformerDataset):
         cand_kinematics_np *= mask_np[:, None, :]
 
         # Optional per-jet training weight
-        if "cls_weight" not in data.fields:
-            weight_tensors = torch.ones(len(data), dtype=torch.float32)
-        else:
-            weight_tensors = torch.from_numpy(
-                ak.to_numpy(data.cls_weight).astype(np.float32)
-            )
+        weight_tensors = self._jet_weights(data)
 
         # -------------------------
         # DETR set targets
@@ -305,13 +347,13 @@ class ParticleTransformerDETRDataset(ParticleTransformerDataset):
         daughter_p4 = data.gen_jet_tau_vis_daughter_p4s
         daughter_charge_jag = data.gen_jet_tau_vis_daughter_charges
 
-        daughter_pt_cut = float(self.cfg.dataset.get("tau_daughter_pt_cut", -1.0))
-        if daughter_pt_cut >= 0.0 and len(daughter_p4.fields) > 0:
-            daughter_pt = self._get_record_field(daughter_p4, ["pt", "rho"])
-            passes_pt_cut = daughter_pt >= daughter_pt_cut
-            daughter_p4 = daughter_p4[passes_pt_cut]
-            daughter_pdg_jag = daughter_pdg_jag[passes_pt_cut]
-            daughter_charge_jag = daughter_charge_jag[passes_pt_cut]
+        tau_id = self._tau_id_targets(data, sample)
+        is_hadronic_tau = tau_id == TauIDClass.HADRONIC_TAU
+
+        passes_cut = self._daughter_cut_mask(data)
+        daughter_p4 = daughter_p4[passes_cut]
+        daughter_pdg_jag = daughter_pdg_jag[passes_cut]
+        daughter_charge_jag = daughter_charge_jag[passes_cut]
 
         daughter_pdg_abs = abs(daughter_pdg_jag)
         supported_ids = [
@@ -320,6 +362,8 @@ class ParticleTransformerDETRDataset(ParticleTransformerDataset):
         supported_pdg = daughter_pdg_abs == supported_ids[0]
         for pdg_id in supported_ids[1:]:
             supported_pdg = supported_pdg | (daughter_pdg_abs == pdg_id)
+
+        supported_pdg = supported_pdg & is_hadronic_tau[:, None]
 
         daughter_p4 = daughter_p4[supported_pdg]
         daughter_pdg_jag = daughter_pdg_jag[supported_pdg]
@@ -399,7 +443,7 @@ class ParticleTransformerDETRDataset(ParticleTransformerDataset):
 
             # Daughter kinematic targets in the same spirit as ParT kinematics_tensor.
             _LOG_CLAMP = 5.0
-            jet_pt_2d = np.maximum(jet_pt[:, None], eps)
+            jet_p_2d = np.maximum((jet_pt * np.cosh(jet_eta))[:, None], eps)
             jet_eta_2d = jet_eta[:, None]
             jet_phi_2d = jet_phi[:, None]
             jet_mass = np.sqrt(
@@ -407,13 +451,22 @@ class ParticleTransformerDETRDataset(ParticleTransformerDataset):
             )
             jet_mass_2d = np.maximum(jet_mass[:, None], eps)
 
-            daughter_deta = dau_eta - jet_eta_2d
+            daughter_theta = 2.0 * np.arctan(np.exp(-dau_eta))
+            jet_theta_2d = 2.0 * np.arctan(np.exp(-jet_eta_2d))
+            daughter_dtheta = np.clip(
+                daughter_theta - jet_theta_2d, -np.pi / 2.0, np.pi / 2.0
+            )
             daughter_dphi_raw = dau_phi - jet_phi_2d
             daughter_dphi = np.arctan2(
                 np.sin(daughter_dphi_raw), np.cos(daughter_dphi_raw)
             )
-            daughter_log_pt_ratio = np.clip(
-                np.log(np.maximum(dau_pt / jet_pt_2d, eps)), -_LOG_CLAMP, _LOG_CLAMP
+            daughter_dphi = np.clip(
+                daughter_dphi, -np.pi / 2.0, np.pi / 2.0
+            )
+            daughter_log_p_ratio = np.clip(
+                np.log(np.maximum(dau_pt * np.cosh(dau_eta) / jet_p_2d, eps)),
+                -_LOG_CLAMP,
+                _LOG_CLAMP,
             )
             daughter_mass = np.sqrt(
                 np.maximum(dau_energy**2 - (dau_pt * np.cosh(dau_eta)) ** 2, 0.0)
@@ -426,10 +479,9 @@ class ParticleTransformerDETRDataset(ParticleTransformerDataset):
 
             daughter_kinematics_np = np.stack(
                 [
-                    daughter_log_pt_ratio,
-                    daughter_deta,
-                    np.sin(daughter_dphi),
-                    np.cos(daughter_dphi),
+                    daughter_log_p_ratio,
+                    daughter_dtheta,
+                    daughter_dphi,
                     daughter_log_mass_ratio,
                 ],
                 axis=-1,
@@ -451,7 +503,7 @@ class ParticleTransformerDETRDataset(ParticleTransformerDataset):
             n_slots = max(int(max_tau_daughters), 0)
             daughter_mask_np = np.zeros((n_jets, n_slots), dtype=bool)
             daughter_p4_np = np.zeros((n_jets, n_slots, 4), dtype=np.float32)
-            daughter_kinematics_np = np.zeros((n_jets, n_slots, 5), dtype=np.float32)
+            daughter_kinematics_np = np.zeros((n_jets, n_slots, 4), dtype=np.float32)
             daughter_charge = np.zeros((n_jets, n_slots), dtype=np.int64)
             daughter_pdg = np.zeros((n_jets, n_slots), dtype=np.int64)
 
@@ -484,11 +536,8 @@ class ParticleTransformerDETRDataset(ParticleTransformerDataset):
             "particles_kinematics": torch.from_numpy(daughter_kinematics_np).float(),
             "particles_charge_ohe": torch.from_numpy(charge_ohe).float(),
             "particles_meson_class_ohe": torch.from_numpy(meson_class_ohe).float(),
-            # Jet-level tau-tagging label, following ParticleTransformerDataset:
-            # -1 -> no genuine tau (background), >= 0 -> genuine tau (signal).
-            "is_tau": torch.from_numpy(
-                (ak.to_numpy(data.gen_jet_tau_decaymode) != -1).astype(np.int64)
-            ),
+            "tau_id": torch.from_numpy(tau_id),
+            "is_tau": torch.from_numpy(is_hadronic_tau.astype(np.int64)),
             "gen_jet_tau_charge": torch.from_numpy(
                 ak.to_numpy(data.gen_jet_tau_charge).astype(np.int64)
             ),
@@ -524,11 +573,70 @@ class ParticleTransformerDETRDataset(ParticleTransformerDataset):
         ))
 
 
+class ParticleTransformerDETRTrainingDataset(ParticleTransformerDETRDataset):
+    """Exclude mixed modes and post-cut charge/decay-mode changes from fit data."""
 
+    def _fit_row_mask(self, data: ak.Array, cfg=None):
+        cfg = self.cfg if cfg is None else cfg
+        keep = data.gen_jet_tau_decaymode != MIXED_DECAY_MODE
+        if (
+            float(cfg.dataset.get("tau_daughter_charged_pt_cut", -1.0)) < 0
+            and float(cfg.dataset.get("tau_daughter_neutral_p_cut", -1.0)) < 0
+            and float(cfg.dataset.get("tau_daughter_abs_cos_theta_cut", -1.0)) < 0
+        ):
+            return keep
+        daughter_pdgs = data.gen_jet_tau_vis_daughter_pdgs
+        daughter_charges = data.gen_jet_tau_vis_daughter_charges
+        passes_cut = self._daughter_cut_mask(data, cfg)
+        original_modes = classify_decay_modes(daughter_pdgs)
+        retained_modes = classify_decay_modes(daughter_pdgs[passes_cut])
+        retained_charge = ak.sum(daughter_charges[passes_cut], axis=-1)
+        signal = data.gen_jet_tau_decaymode != -1
+        return keep & (~signal | (
+            (original_modes == retained_modes)
+            & (retained_charge == data.gen_jet_tau_charge)
+        ))
 
+    def __init__(self, row_groups, cfg, **kwargs):
+        import pyarrow.parquet as pq
 
+        by_file = {}
+        for group in row_groups:
+            by_file.setdefault(group.filename, []).append(group)
 
+        retained_groups = []
+        excluded_rows = 0
+        for filename, groups in by_file.items():
+            with pq.ParquetFile(filename) as parquet:
+                for group in groups:
+                    columns = ["gen_jet_tau_decaymode"]
+                    if (
+                        float(cfg.dataset.get("tau_daughter_charged_pt_cut", -1.0)) >= 0
+                        or float(cfg.dataset.get("tau_daughter_neutral_p_cut", -1.0)) >= 0
+                        or float(cfg.dataset.get("tau_daughter_abs_cos_theta_cut", -1.0)) >= 0
+                    ):
+                        columns += [
+                            "gen_jet_tau_charge",
+                            "gen_jet_tau_vis_daughter_p4s",
+                            "gen_jet_tau_vis_daughter_pdgs",
+                            "gen_jet_tau_vis_daughter_charges",
+                        ]
+                    data = ak.from_arrow(parquet.read_row_group(group.row_group, columns=columns))
+                    retained_rows = int(ak.sum(self._fit_row_mask(data, cfg)))
+                    excluded_rows += len(data) - retained_rows
+                    if retained_rows:
+                        retained_groups.append(
+                            RowGroup(filename, group.row_group, retained_rows)
+                        )
 
+        print(
+            f"[dataset] Excluded {excluded_rows:,} mixed-mode or cut-inconsistent jets from fit-stage dataset.",
+            flush=True,
+        )
+        super().__init__(row_groups=retained_groups, cfg=cfg, **kwargs)
+
+    def build_tensors(self, data: ak.Array, sample: str | None = None):
+        return super().build_tensors(data[self._fit_row_mask(data)], sample=sample)
 
 
 class ParTauDETRDataModule(ParTDataModule):
@@ -536,18 +644,96 @@ class ParTauDETRDataModule(ParTDataModule):
     DataModule variant using ParticleTransformerDETRDataset.
 
     File discovery, the train/val split, the scaler fit and the stratified
-    batch composition are all the base class's; only the dataset class and the
-    sample selection differ.
+    batch composition are all the base class's. Training, validation and scaler
+    fitting exclude mixed leptonic/hadronic modes and taus whose charge or
+    decay mode changes under daughter cuts; testing and inference retain all modes.
     """
 
     dataset_cls = ParticleTransformerDETRDataset
+    training_dataset_cls = ParticleTransformerDETRTrainingDataset
 
     def __init__(self, cfg: DictConfig, debug_run: bool = False):
         super().__init__(cfg=cfg, debug_run=debug_run)
-        # Tau tagging is a binary signal-vs-background task, so we need the
-        # background samples in addition to the signal samples. The base class
-        # otherwise defaults to signal-only (`sample = "z"`) for set-to-set.
         if cfg.model.detr.tau_id_head:
             self.sample = "*"
+
+    def setup(self, stage: str) -> None:
+        super().setup(stage)
+        if (
+            stage != "fit" or not self.cfg.model.detr.tau_id_head
+            or not self.cfg.dataset.get("balance_tau_id_classes", True)
+        ):
+            return
+
+        import pyarrow.parquet as pq
+
+        class_names, _ = tau_id_classes(self.cfg)
+        self.tau_id_class_counts = np.zeros(len(class_names), dtype=np.int64)
+        self.tau_id_class_weight_sums = np.zeros(len(class_names), dtype=np.float64)
+        by_file = {}
+        for group in self.train_dataset.row_groups:
+            by_file.setdefault(group.filename, []).append(group)
+        for filename, groups in by_file.items():
+            with pq.ParquetFile(filename) as parquet:
+                columns = ["gen_jet_tau_decaymode", "gen_jet_tau_vis_daughter_pdgs"]
+                if (
+                    float(self.cfg.dataset.get("tau_daughter_charged_pt_cut", -1.0)) >= 0
+                    or float(self.cfg.dataset.get("tau_daughter_neutral_p_cut", -1.0)) >= 0
+                    or float(self.cfg.dataset.get("tau_daughter_abs_cos_theta_cut", -1.0)) >= 0
+                ):
+                    columns += [
+                        "gen_jet_tau_charge",
+                        "gen_jet_tau_vis_daughter_p4s",
+                        "gen_jet_tau_vis_daughter_charges",
+                    ]
+                if (
+                    self.cfg.dataset.get("use_cls_weights", True)
+                    and "cls_weight" in parquet.schema_arrow.names
+                ):
+                    columns.append("cls_weight")
+                for group in groups:
+                    data = ak.from_arrow(parquet.read_row_group(group.row_group, columns=columns))
+                    data = data[self.train_dataset._fit_row_mask(data)]
+                    labels = self.train_dataset._tau_id_targets(data, sample_name(filename))
+                    weights = (
+                        ak.to_numpy(data.cls_weight)
+                        if "cls_weight" in data.fields else np.ones(len(data))
+                    )
+                    self.tau_id_class_counts += np.bincount(labels, minlength=len(class_names))
+                    self.tau_id_class_weight_sums += np.bincount(
+                        labels, weights=weights, minlength=len(class_names)
+                    )
+
+        sums = self.tau_id_class_weight_sums
+        if not np.all(np.isfinite(sums)) or np.any(sums <= 0):
+            raise ValueError(
+                f"Every tau-ID class needs positive finite training weight: "
+                f"{dict(zip(class_names, sums.tolist()))}"
+            )
+        self.tau_id_class_weights = sums.sum() / (len(sums) * sums)
+        for name, count, weight_sum, multiplier in zip(
+            class_names, self.tau_id_class_counts, sums, self.tau_id_class_weights
+        ):
+            print(
+                f"[tau-ID balance] {name}: jets={count:,}, "
+                f"jet_fraction={count / self.tau_id_class_counts.sum():.6f}, "
+                f"weight_sum={weight_sum:.6g}, weight_fraction={weight_sum / sums.sum():.6f}, "
+                f"multiplier={multiplier:.6g}",
+                flush=True,
+            )
+
+    def _resolve_input_paths(self, pattern: str, dataset_type: str) -> list:
+        paths = super()._resolve_input_paths(pattern, dataset_type)
+        if not self.cfg.model.detr.tau_id_head:
+            return paths
+        _, backgrounds = tau_id_classes(self.cfg)
+        wanted = {"z", *backgrounds}
+        selected = [path for path in paths if sample_name(path) in wanted]
+        missing = wanted - {sample_name(path) for path in selected}
+        if missing:
+            raise FileNotFoundError(
+                f"No {dataset_type} files for configured tau-ID samples: {sorted(missing)}"
+            )
+        return selected
 
 

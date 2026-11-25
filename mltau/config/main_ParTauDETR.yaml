@@ -52,6 +52,10 @@ logging:
         workspace: null
 
 model:
+    # Optional checkpoint path: reuse compatible network weights, but reset the
+    # ID output layer for multiclass training. Optimizer, scheduler and threshold
+    # calibration start fresh; this is not a resume. null trains from scratch.
+    warm_start_checkpoint: null
     # Always equal to dataset.max_tau_daughters, by interpolation. The matcher
     # hands out min(num_queries, n_targets) pairs, so with fewer queries than
     # target slots the surplus targets are unreachable and never supervised,
@@ -61,7 +65,7 @@ model:
     # the objectness class balance -- see loss.eos_coef.
     num_queries: ${dataset.max_tau_daughters}
     num_charge_classes: 3
-    num_kinematics_components: 5
+    num_kinematics_components: 4
     # The PDG head width is derived from dataset.tau_daughter_pdg_ids, which is
     # the same list the dataloader one-hot encodes against. Do not duplicate it.
 
@@ -90,33 +94,32 @@ model:
         # intermediate decoder layer's queries go through the shared heads and
         # get the full matched set loss, weighted by loss.weight_aux. Training
         # mode only; inference always uses the final layer alone.
-        aux_loss: true
+        aux_loss: false
         matcher:
             cost_objectness: 1.0
             cost_kinematics_l1: 2.0
             cost_charge: 1.0
             cost_meson_class_ce: 1.0
-            # Per-component weights of the kinematics matching cost, over
-            # [log_pt_ratio, delta_eta, sin_dphi, cos_dphi, log_mass_ratio].
+            # Per-component weights over
+            # [log_p_ratio, delta_theta, delta_phi, log_mass_ratio].
             # These decide WHICH daughter a query is trained towards, so what
             # matters is not that every component counts equally but that the
             # assignment stays stable while the model is still wrong. Tau
-            # daughters are collimated (measured on z_train: sigma =
-            # [0.875, 0.077, 0.071, 0.028, 1.064]), so while the angular error is
-            # of order sigma, position cannot tell two daughters apart and pt
+            # daughters are collimated (angular sigma on z_train =
+            # [0.0372, 0.0749]), so while the angular error is
+            # of order sigma, position cannot tell two daughters apart and momentum
             # and identity -- learned first -- have to carry the decision.
             # Angles at 1/sigma (20) drowned them out: on synthetic daughters
             # with 1-sigma noise the intended assignment was recovered 71% of
             # the time and 46% of assignments changed between two noise draws,
             # against 93% / 11% for the first model's unweighted cost. With 5
             # and the clipped class cost below: 94% / 10% early, 99.4% / 0.9%
-            # late. sin_dphi and cos_dphi MUST share a weight (together they
-            # encode the angle). log_mass_ratio stays low: only ~5% of its
+            # late. log_mass_ratio stays low: only ~5% of its
             # variance is the daughter's own, the rest is the jet mass shared by
             # every query in the jet, so it says little about WHICH daughter.
             # 0 with loss.mass_from_meson_class: the mass channel is then
             # untrained and must not steer the assignment either.
-            kinematics_component_weights: [1.0, 5.0, 5.0, 5.0, 0.0]
+            kinematics_component_weights: [1.0, 5.0, 5.0, 0.2]
             # How the charge and PDG terms enter the MATCHING cost (not the
             # loss). "clipped_nll" is -log p(true class) clamped at
             # classification_cost_clip: sharp enough that identity decides a tie
@@ -151,13 +154,13 @@ model:
             # (5.74 -> 5.00%) at unchanged decay mode / charge / F1. Needs
             # aux_loss alongside: alone, sub-threshold queries leak into the
             # soft sum in training and the hard-threshold tau lands ~4% low.
-            weight_soft_parent_kinematics: 2.0
-            weight_soft_parent_charge: 0.5
+            weight_soft_parent_kinematics: 0.0
+            weight_soft_parent_charge: 1.0
             weight_soft_parent_decay_mode: 1.0
             # Weight of the summed per-intermediate-layer set losses when
             # model.detr.aux_loss is true. DETR uses 1.0; here 1.0 (and 0.3 at
             # lr 3e-4 without the soft-parent terms) diverged near peak LR.
-            weight_aux: 0.3
+            weight_aux: 0.0
             # Decode daughter mass from the predicted meson class (pi+- or pi0
             # mass) instead of the regressed log-mass channel, wherever the
             # criterion turns kinematics into p4 (parent constraints). Paired
@@ -165,7 +168,7 @@ model:
             # matcher component weight: the mass channel then carries no loss,
             # and its (untrained) output never reaches a four-momentum. Decode
             # offline with decode_ParTauDETR's mass_from_class=True to match.
-            mass_from_meson_class: true
+            mass_from_meson_class: false
             parent_objectness_temperature: 0.1
             # Loss weight of the "no object" class of the objectness head; the
             # object class has weight 1. With n_obj real daughters among Q
@@ -209,46 +212,30 @@ model:
         # "error in units of the spread of its own target" and the weights below
         # can all be 1.
         #
-        # Measured on the daughter targets of z_train (47k daughters):
-        #   log_pt_ratio  sigma 0.877
-        #   delta_eta     sigma 0.072
-        #   sin_dphi      sigma 0.070   (the chord is ~|dphi| for collimated daughters)
-        #   log_mass_ratio sigma 1.046
         # Recompute these if the target parameterisation or the sample changes;
         # they are properties of the data, not tuning knobs. To reproduce the numbers:
         # ./run.sh python mltau/scripts/measure_kinematics_scales.py --model DETR
         kinematics_scales:
-            log_pt: 0.877
-            delta_eta: 0.072
-            phi_chord: 0.070
-            log_mass: 1.046
+            log_p: 0.869
+            delta_theta: 0.0359
+            delta_phi: 0.0717
+            log_mass: 1.01
         # With the residuals scaled, equal weights give each component an equal
         # share. log_mass is the one worth reconsidering rather than reweighting:
         # only 4.8% of the variance of log(m_dau/m_jet) comes from the daughter's
         # identity, the other 95% is the jet mass, which every query in the jet
         # would be re-deriving. See the note in the loss docstring.
         kinematics_weights:
-            log_pt: 1.0
-            delta_eta: 1.0
-            phi_chord: 1.0
+            log_p: 1.0
+            delta_theta: 1.0
+            delta_phi: 1.0
             # 0 with detr.loss.mass_from_meson_class (see there).
-            log_mass: 0.0
+            log_mass: 1.0
 
-# ParTauDETR-specific overrides of training.yaml (hence _self_ last below).
-training:
-    # With the signed angular / impact-parameter inputs, peak LR 3e-4 diverged
-    # in 4 runs once the combined losses above were on; 2e-4 was stable over
-    # two seeds and a 120-epoch run.
-    lr: 0.0002
-    # Standardise the continuous candidate inputs (see training.yaml). The
-    # signed impact-parameter significances reach |s| ~ 1e4 unscaled.
-    input_scaling:
-        enabled: true
-
-# `_self_` last so the `training:` block above wins over training.yaml. No
-# other key here overlaps with the files below.
+# Load the shared training settings before the ParTauDETR-specific overrides.
 defaults:
     - metrics/metrics
     - dataset_ParTauDETR
     - training
+    - training_ParTauDETR
     - _self_

@@ -15,10 +15,8 @@ jet-level tau is built from the set the way physics says it is:
     tau p4     = sum of the daughters' four-momenta
     decay mode = ml-tau-data's classification of the daughters' PDG ids
 
-and then expressed in the same parameterisation the regression heads use
-(log pt ratio, delta eta, sin/cos delta phi, log mass ratio, all relative to the
-reco jet), which is what `log_all_kinematics_metrics` already knows how to
-decode.
+and then adapted to the five-component parameterisation expected by the
+existing `log_all_kinematics_metrics` helper.
 
 The decay mode is the one place that does NOT reuse the MultiParTau path. Its
 DecayModeEvaluator takes a probability vector over 6 reduced classes, which a
@@ -181,7 +179,7 @@ def decay_modes(pdg: np.ndarray, valid: np.ndarray) -> dict:
     }
 
 
-def daughters_to_jet_level(kin, charge, pdg, valid, reco_jet):
+def daughters_to_jet_level(kin, charge, pdg, valid, reco_jet, fixed_mass=None):
     """
     Collapse a set of daughters into per-jet quantities.
 
@@ -190,45 +188,66 @@ def daughters_to_jet_level(kin, charge, pdg, valid, reco_jet):
     latter so that `log_all_kinematics_metrics` can be reused unchanged.
 
     Args:
-        kin:    [B, S, 5] daughter kinematics in the training parameterisation
+        kin:    [B, S, 4] daughter kinematics with log-p and delta-phi, or legacy
+                [B, S, 5] kinematics with sin/cos delta-phi
         charge: [B, S] integer charge in {-1, 0, +1}
         pdg:    [B, S] absolute PDG id
         valid:  [B, S] bool, which slots count
         reco_jet: dict of [B] tensors with pt, eta, phi, energy
+        fixed_mass: optional [B, S] daughter masses (for class-based decoding)
     """
     eps = 1e-6
     pt_jet = reco_jet["pt"]
     eta_jet = reco_jet["eta"]
     phi_jet = reco_jet["phi"]
 
-    pt = torch.exp(kin[..., 0]) * pt_jet[:, None]
-    eta = kin[..., 1] + eta_jet[:, None]
-    phi = phi_jet[:, None] + torch.atan2(kin[..., 2], kin[..., 3])
+    if kin.shape[-1] == 4:
+        momentum = torch.exp(kin[..., 0]) * (pt_jet * torch.cosh(eta_jet))[:, None]
+        theta_jet = 2.0 * torch.atan(torch.exp(-eta_jet))
+        theta = (theta_jet[:, None] + kin[..., 1]).clamp(
+            1e-6, np.pi - 1e-6
+        )
+        pt = momentum * torch.sin(theta)
+        daughter_pz = momentum * torch.cos(theta)
+        daughter_d_phi = kin[..., 2]
+    elif kin.shape[-1] == 5:
+        pt = torch.exp(kin[..., 0]) * pt_jet[:, None]
+        eta = kin[..., 1] + eta_jet[:, None]
+        momentum = pt * torch.cosh(eta)
+        daughter_pz = pt * torch.sinh(eta)
+        daughter_d_phi = torch.atan2(kin[..., 2], kin[..., 3])
+    else:
+        raise ValueError(
+            f"Expected 4 or 5 daughter kinematics channels, got {kin.shape[-1]}"
+        )
+    phi = phi_jet[:, None] + daughter_d_phi
 
     mask = valid.to(pt.dtype)
     px = (pt * torch.cos(phi) * mask).sum(-1)
     py = (pt * torch.sin(phi) * mask).sum(-1)
-    pz = (pt * torch.sinh(eta) * mask).sum(-1)
-    # Daughters are treated as massless in the sum: at these momenta a pion's
-    # mass is ~0.01% of its energy, and using the predicted log-mass instead
-    # would make the tau energy depend on the least determined component of the
-    # target. The tau mass is then still non-zero, as it comes from the opening
-    # angles between the daughters.
-    energy = (pt * torch.cosh(eta) * mask).sum(-1)
+    pz = (daughter_pz * mask).sum(-1)
+    mass_jet = torch.sqrt(
+        torch.clamp(
+            reco_jet["energy"] ** 2 - (pt_jet * torch.cosh(eta_jet)) ** 2, min=0.0
+        )
+    ).clamp_min(eps)
+    mass_index = 3 if kin.shape[-1] == 4 else 4
+    daughter_mass = (
+        fixed_mass
+        if fixed_mass is not None
+        else torch.exp(kin[..., mass_index]) * mass_jet[:, None]
+    )
+    energy = (
+        torch.sqrt(momentum**2 + daughter_mass**2) * mask
+    ).sum(-1)
 
     pt_tau = torch.sqrt(px**2 + py**2 + eps)
     eta_tau = torch.asinh(pz / pt_tau)
     phi_tau = torch.atan2(py, px)
     mass_tau = torch.sqrt(torch.clamp(energy**2 - (px**2 + py**2 + pz**2), min=0.0))
 
-    mass_jet = torch.sqrt(
-        torch.clamp(
-            reco_jet["energy"] ** 2 - (pt_jet * torch.cosh(eta_jet)) ** 2, min=0.0
-        )
-    ).clamp_min(eps)
-
     d_phi = phi_tau - phi_jet
-    # Same five components, same order, as the daughter regression target.
+    # Legacy five-component vector consumed by the shared metric logger.
     kin5 = torch.stack(
         [
             torch.log(torch.clamp(pt_tau / pt_jet.clamp_min(eps), min=eps)),
